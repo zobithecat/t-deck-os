@@ -41,8 +41,10 @@ esptool v5는 USB-Serial-JTAG로 다운로드 모드에 **자동 진입**한다 
 ## 로드맵
 - [x] 부팅 + 디스플레이 + 터치 + 런처 골격
 - [x] 트랙볼 인코더 내비게이션 + 키보드(I2C 0x55) 입력
-- [ ] 앱 화면 (Settings / Files / About)
-- [ ] 상태바 실데이터 (배터리 / 시계 / Wi-Fi)
+- [x] 앱 화면 (About / Settings 밝기 슬라이더 / Back 내비)
+- [x] 상태바 실데이터 (배터리 % / NTP 시계 KST / WiFi·BT 아이콘)
+- [x] WiFi 스캔·접속 (비번 입력 + NTP) + Bluetooth LE 스캔
+- [ ] 폴리시 (키보드 백라이트 / 스크롤 / 테마)
 - [ ] LoRa(SX1262) 메시징
 
 ## 출처

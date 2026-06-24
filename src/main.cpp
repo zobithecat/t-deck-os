@@ -11,6 +11,11 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <string.h>
+#include <time.h>
+#include <WiFi.h>
+#include <BLEDevice.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
 #include <TFT_eSPI.h>
 #include <lvgl.h>
 #include "TouchDrvGT911.hpp"
@@ -27,10 +32,21 @@ static lv_obj_t     *g_title;       // status-bar title label
 static lv_obj_t     *g_home_btns[8];
 static int           g_home_btn_cnt;
 static int           g_focus_idx;   // last-opened launcher row (for focus restore)
+static lv_obj_t     *g_status;      // status-bar right label (battery / clock / icons)
+static bool          g_wifi_on;
+static bool          g_bt_on;
+static lv_obj_t     *g_wifi_list;
+static lv_obj_t     *g_wifi_status;
+static lv_timer_t   *g_wifi_scan_timer;
+static lv_obj_t     *g_bt_list;
+static lv_obj_t     *g_bt_status;
+static lv_timer_t   *g_bt_scan_timer;
+static bool          g_ble_inited;
 
 static void go_home();
 static void open_app(const char *name);
 static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g);
+static void back_event_cb(lv_event_t *e);
 
 // ---------------------------------------------------------------------------
 // Backlight — the T-Deck dims the LED via a 16-step charge pump on BOARD_BL_PIN
@@ -220,7 +236,8 @@ static void build_launcher_ui()
     lv_obj_align(title, LV_ALIGN_LEFT_MID, 0, 0);
 
     lv_obj_t *status = lv_label_create(bar);
-    lv_label_set_text(status, LV_SYMBOL_BATTERY_FULL "  12:00");
+    g_status = status;
+    lv_label_set_text(status, LV_SYMBOL_BATTERY_FULL " --%");
     lv_obj_set_style_text_color(status, lv_color_white(), 0);
     lv_obj_align(status, LV_ALIGN_RIGHT_MID, 0, 0);
 
@@ -238,6 +255,7 @@ static void build_launcher_ui()
         { LV_SYMBOL_GPS,      "Meshtastic / LoRa" },
         { LV_SYMBOL_BELL,     "Messages"          },
         { LV_SYMBOL_WIFI,     "Wi-Fi"             },
+        { LV_SYMBOL_BLUETOOTH,"Bluetooth"         },
         { LV_SYMBOL_SD_CARD,  "Files"             },
         { LV_SYMBOL_SETTINGS, "Settings"          },
         { LV_SYMBOL_LIST,     "About"             },
@@ -267,6 +285,185 @@ static void build_launcher_ui()
 // App screens: selecting a launcher row swaps the content area for an app view
 // (status bar + bottom line stay put). A focused "Back" returns home.
 // ---------------------------------------------------------------------------
+// --- Wi-Fi connect flow ------------------------------------------------------
+static char        g_scan_ssid[15][33];
+static bool        g_scan_open[15];
+static char        g_connect_ssid[33];
+static bool        g_connect_open;
+static lv_obj_t   *g_pass_ta;
+static lv_obj_t   *g_wifi_msg;
+static lv_timer_t *g_wifi_conn_timer;
+
+static void wifi_conn_poll(lv_timer_t *t)
+{
+    static int tries = 0;
+    if (WiFi.status() == WL_CONNECTED) {
+        lv_timer_del(t); g_wifi_conn_timer = NULL; tries = 0;
+        g_wifi_on = true;
+        configTime(9 * 3600, 0, "pool.ntp.org", "time.google.com");   // KST + NTP
+        if (g_wifi_msg)
+            lv_label_set_text_fmt(g_wifi_msg, LV_SYMBOL_OK " Connected\n%s",
+                                  WiFi.localIP().toString().c_str());
+        return;
+    }
+    if (++tries > 30) {                       // ~15 s timeout
+        lv_timer_del(t); g_wifi_conn_timer = NULL; tries = 0;
+        WiFi.disconnect();
+        if (g_wifi_msg) lv_label_set_text(g_wifi_msg, LV_SYMBOL_WARNING " Failed (check password)");
+    }
+}
+
+static void wifi_begin_connect()
+{
+    const char *pass = g_pass_ta ? lv_textarea_get_text(g_pass_ta) : "";
+    if (g_wifi_msg) lv_label_set_text(g_wifi_msg, "Connecting...");
+    WiFi.begin(g_connect_ssid, pass);
+    if (!g_wifi_conn_timer) g_wifi_conn_timer = lv_timer_create(wifi_conn_poll, 500, NULL);
+}
+
+static void wifi_connect_clicked(lv_event_t *e) { wifi_begin_connect(); }
+static void wifi_ta_ready_cb(lv_event_t *e)     { wifi_begin_connect(); }
+
+// Selecting a network -> swap the scan list for a connect form (SSID + password)
+static void open_wifi_connect(int idx)
+{
+    strncpy(g_connect_ssid, g_scan_ssid[idx], sizeof(g_connect_ssid) - 1);
+    g_connect_ssid[sizeof(g_connect_ssid) - 1] = '\0';
+    g_connect_open = g_scan_open[idx];
+
+    lv_obj_clean(g_app_view);          // drop the scan list/status
+    g_wifi_list = NULL; g_wifi_status = NULL;
+    lv_group_t *g = lv_group_get_default();
+    lv_group_remove_all_objs(g);
+
+    lv_obj_t *back = lv_btn_create(g_app_view);
+    lv_obj_t *bl = lv_label_create(back); lv_label_set_text(bl, LV_SYMBOL_LEFT " Back");
+    lv_obj_add_event_cb(back, back_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_group_add_obj(g, back);
+
+    lv_obj_t *l = lv_label_create(g_app_view);
+    lv_obj_set_style_text_color(l, lv_color_white(), 0);
+    lv_label_set_text_fmt(l, "Connect: %s", g_connect_ssid);
+
+    g_pass_ta = NULL;
+    if (!g_connect_open) {
+        g_pass_ta = lv_textarea_create(g_app_view);
+        lv_textarea_set_one_line(g_pass_ta, true);
+        lv_textarea_set_password_mode(g_pass_ta, true);
+        lv_textarea_set_placeholder_text(g_pass_ta, "password");
+        lv_obj_set_width(g_pass_ta, lv_pct(100));
+        lv_obj_add_event_cb(g_pass_ta, wifi_ta_ready_cb, LV_EVENT_READY, NULL);
+        lv_group_add_obj(g, g_pass_ta);
+    }
+
+    lv_obj_t *con = lv_btn_create(g_app_view);
+    lv_obj_t *cl = lv_label_create(con); lv_label_set_text(cl, LV_SYMBOL_OK " Connect");
+    lv_obj_add_event_cb(con, wifi_connect_clicked, LV_EVENT_CLICKED, NULL);
+    lv_group_add_obj(g, con);
+
+    g_wifi_msg = lv_label_create(g_app_view);
+    lv_obj_set_style_text_color(g_wifi_msg, lv_color_hex(0xAAAAAA), 0);
+    lv_label_set_text(g_wifi_msg, "");
+
+    lv_group_focus_obj(g_pass_ta ? g_pass_ta : con);
+    lv_label_set_text(g_toast, g_connect_open ? LV_SYMBOL_OK " Focus Connect & press"
+                                              : LV_SYMBOL_KEYBOARD " Type pass, Enter to connect");
+}
+
+static void wifi_net_clicked(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+    open_wifi_connect(idx);
+}
+
+// Poll the async Wi-Fi scan; populate the list once it finishes.
+static void wifi_scan_poll(lv_timer_t *t)
+{
+    static int retries = 0;
+    int n = WiFi.scanComplete();
+    if (n == WIFI_SCAN_RUNNING) return;
+    if (n <= 0) {                                  // failed/empty: radio may not be ready yet
+        if (retries++ < 2) { WiFi.scanDelete(); WiFi.scanNetworks(true); return; }
+        retries = 0;
+        lv_timer_del(t);
+        g_wifi_scan_timer = NULL;
+        if (g_wifi_status) lv_label_set_text(g_wifi_status, "No networks - press Rescan");
+        return;
+    }
+    retries = 0;
+    lv_timer_del(t);
+    g_wifi_scan_timer = NULL;
+
+    if (n > 15) n = 15;
+    lv_label_set_text_fmt(g_wifi_status, "%d networks", n);
+    lv_group_t *grp = lv_group_get_default();
+    for (int i = 0; i < n; i++) {
+        strncpy(g_scan_ssid[i], WiFi.SSID(i).c_str(), sizeof(g_scan_ssid[i]) - 1);
+        g_scan_ssid[i][sizeof(g_scan_ssid[i]) - 1] = '\0';
+        g_scan_open[i] = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s  %ddBm%s",
+                 g_scan_ssid[i], WiFi.RSSI(i), g_scan_open[i] ? "" : " *");
+        lv_obj_t *btn = lv_list_add_btn(g_wifi_list, LV_SYMBOL_WIFI, buf);
+        lv_obj_set_style_text_color(btn, lv_color_white(), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x111111), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x1565C0), LV_STATE_FOCUSED);
+        lv_obj_set_user_data(btn, (void *)(intptr_t)i);
+        lv_obj_add_event_cb(btn, wifi_net_clicked, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(grp, btn);
+    }
+    WiFi.scanDelete();
+}
+
+static void wifi_start_scan()
+{
+    if (g_wifi_scan_timer) { lv_timer_del(g_wifi_scan_timer); g_wifi_scan_timer = NULL; }
+    if (g_wifi_list)   lv_obj_clean(g_wifi_list);
+    if (g_wifi_status) lv_label_set_text(g_wifi_status, "Scanning...");
+    WiFi.scanDelete();
+    WiFi.scanNetworks(true);
+    g_wifi_scan_timer = lv_timer_create(wifi_scan_poll, 300, NULL);
+}
+
+static void wifi_rescan_clicked(lv_event_t *e) { wifi_start_scan(); }
+
+// --- Bluetooth LE scan -------------------------------------------------------
+static void ble_scan_run(lv_timer_t *t)
+{
+    lv_timer_del(t);
+    g_bt_scan_timer = NULL;
+    if (!g_bt_list) return;
+    BLEScan *s = BLEDevice::getScan();
+    s->setActiveScan(true);
+    BLEScanResults res = s->start(3, false);           // 3 s blocking scan
+    if (!g_bt_list) { s->clearResults(); return; }      // user left during scan
+    int n = res.getCount();
+    lv_label_set_text_fmt(g_bt_status, "%d devices", n);
+    lv_group_t *grp = lv_group_get_default();
+    for (int i = 0; i < n && i < 15; i++) {
+        BLEAdvertisedDevice d = res.getDevice(i);
+        std::string nm = d.haveName() ? d.getName() : d.getAddress().toString();
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s  %ddBm", nm.c_str(), d.getRSSI());
+        lv_obj_t *btn = lv_list_add_btn(g_bt_list, LV_SYMBOL_BLUETOOTH, buf);
+        lv_obj_set_style_text_color(btn, lv_color_white(), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x111111), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x1565C0), LV_STATE_FOCUSED);
+        lv_group_add_obj(grp, btn);
+    }
+    s->clearResults();
+}
+
+static void ble_start_scan()
+{
+    if (g_bt_scan_timer) { lv_timer_del(g_bt_scan_timer); g_bt_scan_timer = NULL; }
+    if (g_bt_list)   lv_obj_clean(g_bt_list);
+    if (g_bt_status) lv_label_set_text(g_bt_status, "Scanning... (3s)");
+    g_bt_scan_timer = lv_timer_create(ble_scan_run, 80, NULL);
+}
+
+static void ble_rescan_clicked(lv_event_t *e) { ble_start_scan(); }
+
 static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
 {
     if (strcmp(name, "About") == 0) {
@@ -299,6 +496,50 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
             setBrightness((uint8_t)lv_slider_get_value(lv_event_get_target(e)));
         }, LV_EVENT_VALUE_CHANGED, NULL);
         lv_group_add_obj(g, slider);
+    } else if (strcmp(name, "Wi-Fi") == 0) {
+        WiFi.mode(WIFI_STA);
+        WiFi.disconnect();
+
+        g_wifi_status = lv_label_create(parent);
+        lv_obj_set_style_text_color(g_wifi_status, lv_color_white(), 0);
+        lv_label_set_text(g_wifi_status, "Scanning...");
+
+        lv_obj_t *rescan = lv_btn_create(parent);
+        lv_obj_t *rl = lv_label_create(rescan);
+        lv_label_set_text(rl, LV_SYMBOL_REFRESH " Rescan");
+        lv_obj_add_event_cb(rescan, wifi_rescan_clicked, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, rescan);
+
+        g_wifi_list = lv_list_create(parent);
+        lv_obj_set_width(g_wifi_list, lv_pct(100));
+        lv_obj_set_flex_grow(g_wifi_list, 1);
+        lv_obj_set_style_bg_color(g_wifi_list, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_border_width(g_wifi_list, 0, 0);
+        lv_obj_set_style_pad_all(g_wifi_list, 0, 0);
+
+        wifi_start_scan();
+    } else if (strcmp(name, "Bluetooth") == 0) {
+        if (!g_ble_inited) { BLEDevice::init("T-Deck OS"); g_ble_inited = true; }
+        g_bt_on = true;
+
+        g_bt_status = lv_label_create(parent);
+        lv_obj_set_style_text_color(g_bt_status, lv_color_white(), 0);
+        lv_label_set_text(g_bt_status, "Scanning... (3s)");
+
+        lv_obj_t *rescan = lv_btn_create(parent);
+        lv_obj_t *rl = lv_label_create(rescan);
+        lv_label_set_text(rl, LV_SYMBOL_REFRESH " Rescan");
+        lv_obj_add_event_cb(rescan, ble_rescan_clicked, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, rescan);
+
+        g_bt_list = lv_list_create(parent);
+        lv_obj_set_width(g_bt_list, lv_pct(100));
+        lv_obj_set_flex_grow(g_bt_list, 1);
+        lv_obj_set_style_bg_color(g_bt_list, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_border_width(g_bt_list, 0, 0);
+        lv_obj_set_style_pad_all(g_bt_list, 0, 0);
+
+        ble_start_scan();
     } else {
         lv_obj_t *l = lv_label_create(parent);
         lv_obj_set_style_text_color(l, lv_color_hex(0xAAAAAA), 0);
@@ -308,7 +549,16 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
 
 static void go_home()
 {
+    if (g_wifi_scan_timer) { lv_timer_del(g_wifi_scan_timer); g_wifi_scan_timer = NULL; }
+    if (g_wifi_conn_timer) { lv_timer_del(g_wifi_conn_timer); g_wifi_conn_timer = NULL; }
+    if (g_bt_scan_timer)   { lv_timer_del(g_bt_scan_timer);   g_bt_scan_timer = NULL; }
     if (g_app_view) { lv_obj_del(g_app_view); g_app_view = NULL; }
+    g_wifi_list = NULL;
+    g_wifi_status = NULL;
+    g_pass_ta = NULL;
+    g_wifi_msg = NULL;
+    g_bt_list = NULL;
+    g_bt_status = NULL;
     lv_obj_clear_flag(g_home_list, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(g_title, "T-Deck OS");
 
@@ -355,6 +605,43 @@ static void open_app(const char *name)
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Status bar refresh: battery %, clock (NTP wall-clock if synced, else uptime),
+// and Wi-Fi / BT icons. Runs once a second via an LVGL timer.
+// ---------------------------------------------------------------------------
+static void status_update_cb(lv_timer_t *t)
+{
+    uint32_t mv  = analogReadMilliVolts(BOARD_BAT_ADC) * 2;   // 2:1 divider to GPIO4
+    int      pct = (int)(((int)mv - 3300) * 100 / (4200 - 3300));
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+
+    const char *bat = LV_SYMBOL_BATTERY_EMPTY;
+    if      (pct > 80) bat = LV_SYMBOL_BATTERY_FULL;
+    else if (pct > 55) bat = LV_SYMBOL_BATTERY_3;
+    else if (pct > 30) bat = LV_SYMBOL_BATTERY_2;
+    else if (pct > 10) bat = LV_SYMBOL_BATTERY_1;
+
+    char tbuf[8];
+    time_t now = time(NULL);
+    if (now > 1700000000) {                    // NTP-synced wall clock
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        snprintf(tbuf, sizeof(tbuf), "%02d:%02d", tmv.tm_hour, tmv.tm_min);
+    } else {                                    // fall back to uptime m:ss
+        uint32_t s = millis() / 1000;
+        snprintf(tbuf, sizeof(tbuf), "%u:%02u", (unsigned)(s / 60), (unsigned)(s % 60));
+    }
+
+    char line[48];
+    snprintf(line, sizeof(line), "%s%s%s %d%% %s",
+             g_wifi_on ? LV_SYMBOL_WIFI " "      : "",
+             g_bt_on   ? LV_SYMBOL_BLUETOOTH " " : "",
+             bat, pct, tbuf);
+    lv_label_set_text(g_status, line);
+    lv_obj_align(g_status, LV_ALIGN_RIGHT_MID, 0, 0);
+}
+
 void setup()
 {
     Serial.begin(115200);
@@ -401,6 +688,7 @@ void setup()
     build_launcher_ui();
     setup_trackball_indev();
     setup_keyboard_indev();
+    lv_timer_create(status_update_cb, 1000, NULL);
 
     pinMode(BOARD_BL_PIN, OUTPUT);
     setBrightness(16);
