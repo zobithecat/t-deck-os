@@ -16,10 +16,18 @@
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include <Preferences.h>
 #include <TFT_eSPI.h>
 #include <lvgl.h>
 #include "TouchDrvGT911.hpp"
 #include "pins.h"
+
+// --- Theme palette (dark) ---
+#define COL_BG       0x0A0E14   // screen background
+#define COL_SURFACE  0x161B26   // cards / status bar
+#define COL_ACCENT   0x3B82F6   // focus / highlights
+#define COL_TEXT     0xE6EDF3   // primary text
+#define COL_MUTED    0x7D8590   // secondary text
 
 static TFT_eSPI      tft;
 static TouchDrvGT911 touch;
@@ -29,7 +37,7 @@ static lv_obj_t     *g_toast;       // bottom status / selection-feedback line
 static lv_obj_t     *g_home_list;   // launcher app list
 static lv_obj_t     *g_app_view;    // current app screen (NULL when home)
 static lv_obj_t     *g_title;       // status-bar title label
-static lv_obj_t     *g_home_btns[8];
+static lv_obj_t     *g_home_btns[16];
 static int           g_home_btn_cnt;
 static int           g_focus_idx;   // last-opened launcher row (for focus restore)
 static lv_obj_t     *g_status;      // status-bar right label (battery / clock / icons)
@@ -42,6 +50,8 @@ static lv_obj_t     *g_bt_list;
 static lv_obj_t     *g_bt_status;
 static lv_timer_t   *g_bt_scan_timer;
 static bool          g_ble_inited;
+static lv_obj_t     *g_term_log;
+static lv_obj_t     *g_term_input;
 
 static void go_home();
 static void open_app(const char *name);
@@ -217,7 +227,7 @@ static void setupLvgl()
 static void build_launcher_ui()
 {
     lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(COL_BG), 0);
 
     // --- Status bar ---
     lv_obj_t *bar = lv_obj_create(scr);
@@ -227,18 +237,19 @@ static void build_launcher_ui()
     lv_obj_set_style_radius(bar, 0, 0);
     lv_obj_set_style_border_width(bar, 0, 0);
     lv_obj_set_style_pad_all(bar, 4, 0);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(0x1565C0), 0);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(COL_SURFACE), 0);
 
     lv_obj_t *title = lv_label_create(bar);
     g_title = title;
     lv_label_set_text(title, "T-Deck OS");
-    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(COL_ACCENT), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
     lv_obj_align(title, LV_ALIGN_LEFT_MID, 0, 0);
 
     lv_obj_t *status = lv_label_create(bar);
     g_status = status;
     lv_label_set_text(status, LV_SYMBOL_BATTERY_FULL " --%");
-    lv_obj_set_style_text_color(status, lv_color_white(), 0);
+    lv_obj_set_style_text_color(status, lv_color_hex(COL_TEXT), 0);
     lv_obj_align(status, LV_ALIGN_RIGHT_MID, 0, 0);
 
     // --- App list ---
@@ -246,38 +257,44 @@ static void build_launcher_ui()
     g_home_list = list;
     lv_obj_set_size(list, 320, 240 - 26 - 22);
     lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 26);
-    lv_obj_set_style_bg_color(list, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_color(list, lv_color_hex(COL_BG), 0);
     lv_obj_set_style_border_width(list, 0, 0);
     lv_obj_set_style_pad_all(list, 0, 0);
+    lv_obj_set_style_pad_row(list, 4, 0);
 
-    struct AppEntry { const char *icon; const char *name; };
+    struct AppEntry { const char *icon; const char *name; uint32_t color; };
     static const AppEntry apps[] = {
-        { LV_SYMBOL_GPS,      "Meshtastic / LoRa" },
-        { LV_SYMBOL_BELL,     "Messages"          },
-        { LV_SYMBOL_WIFI,     "Wi-Fi"             },
-        { LV_SYMBOL_BLUETOOTH,"Bluetooth"         },
-        { LV_SYMBOL_SD_CARD,  "Files"             },
-        { LV_SYMBOL_SETTINGS, "Settings"          },
-        { LV_SYMBOL_LIST,     "About"             },
+        { LV_SYMBOL_KEYBOARD, "Terminal",          0x4ADE80 },
+        { LV_SYMBOL_GPS,      "Meshtastic / LoRa", 0x34D399 },
+        { LV_SYMBOL_BELL,     "Messages",          0xFBBF24 },
+        { LV_SYMBOL_WIFI,     "Wi-Fi",             0x3B82F6 },
+        { LV_SYMBOL_BLUETOOTH,"Bluetooth",         0x60A5FA },
+        { LV_SYMBOL_SD_CARD,  "Files",             0xA78BFA },
+        { LV_SYMBOL_SETTINGS, "Settings",          0x9CA3AF },
+        { LV_SYMBOL_LIST,     "About",             0x2DD4BF },
     };
 
     lv_group_t *g = lv_group_get_default();
     g_home_btn_cnt = 0;
     for (const auto &a : apps) {
         lv_obj_t *btn = lv_list_add_btn(list, a.icon, a.name);
-        lv_obj_set_style_text_color(btn, lv_color_white(), 0);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x111111), 0);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x1565C0), LV_STATE_FOCUSED);
+        lv_obj_set_style_text_color(btn, lv_color_hex(COL_TEXT), 0);
+        lv_obj_set_style_text_font(btn, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(COL_SURFACE), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(COL_ACCENT), LV_STATE_FOCUSED);
+        lv_obj_set_style_radius(btn, 8, 0);
         lv_obj_set_user_data(btn, (void *)a.name);
         lv_obj_add_event_cb(btn, app_event_cb, LV_EVENT_CLICKED, NULL);
         lv_group_add_obj(g, btn);   // trackball/keyboard focus navigation
-        if (g_home_btn_cnt < 8) g_home_btns[g_home_btn_cnt++] = btn;
+        lv_obj_t *ic = lv_obj_get_child(btn, 0);   // icon label -> per-app color
+        if (ic) lv_obj_set_style_text_color(ic, lv_color_hex(a.color), 0);
+        if (g_home_btn_cnt < 16) g_home_btns[g_home_btn_cnt++] = btn;
     }
 
     // --- Soft-key hint / selection feedback ---
     g_toast = lv_label_create(scr);
     lv_label_set_text(g_toast, LV_SYMBOL_OK " Select     " LV_SYMBOL_UP LV_SYMBOL_DOWN " Move (trackball)");
-    lv_obj_set_style_text_color(g_toast, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_color(g_toast, lv_color_hex(COL_MUTED), 0);
     lv_obj_align(g_toast, LV_ALIGN_BOTTOM_MID, 0, -4);
 }
 
@@ -293,6 +310,38 @@ static bool        g_connect_open;
 static lv_obj_t   *g_pass_ta;
 static lv_obj_t   *g_wifi_msg;
 static lv_timer_t *g_wifi_conn_timer;
+static char        g_connect_pass[64];
+static lv_timer_t *g_wifi_autoconn_timer;
+
+static void prefs_save_wifi(const char *ssid, const char *pass)
+{
+    Preferences p;
+    p.begin("tdeckos", false);
+    p.putString("ssid", ssid);
+    p.putString("pass", pass);
+    p.end();
+}
+
+static void prefs_save_bt(bool on)
+{
+    Preferences p;
+    p.begin("tdeckos", false);
+    p.putBool("bt", on);
+    p.end();
+}
+
+// Background poll for the boot-time auto-reconnect (doesn't block startup).
+static void wifi_autoconn_poll(lv_timer_t *t)
+{
+    static int tries = 0;
+    if (WiFi.status() == WL_CONNECTED) {
+        lv_timer_del(t); g_wifi_autoconn_timer = NULL; tries = 0;
+        g_wifi_on = true;
+        configTime(9 * 3600, 0, "pool.ntp.org", "time.google.com");
+        return;
+    }
+    if (++tries > 40) { lv_timer_del(t); g_wifi_autoconn_timer = NULL; tries = 0; }  // ~20s
+}
 
 static void wifi_conn_poll(lv_timer_t *t)
 {
@@ -300,6 +349,7 @@ static void wifi_conn_poll(lv_timer_t *t)
     if (WiFi.status() == WL_CONNECTED) {
         lv_timer_del(t); g_wifi_conn_timer = NULL; tries = 0;
         g_wifi_on = true;
+        prefs_save_wifi(g_connect_ssid, g_connect_pass);              // remember for next boot
         configTime(9 * 3600, 0, "pool.ntp.org", "time.google.com");   // KST + NTP
         if (g_wifi_msg)
             lv_label_set_text_fmt(g_wifi_msg, LV_SYMBOL_OK " Connected\n%s",
@@ -316,8 +366,10 @@ static void wifi_conn_poll(lv_timer_t *t)
 static void wifi_begin_connect()
 {
     const char *pass = g_pass_ta ? lv_textarea_get_text(g_pass_ta) : "";
+    strncpy(g_connect_pass, pass, sizeof(g_connect_pass) - 1);
+    g_connect_pass[sizeof(g_connect_pass) - 1] = '\0';
     if (g_wifi_msg) lv_label_set_text(g_wifi_msg, "Connecting...");
-    WiFi.begin(g_connect_ssid, pass);
+    WiFi.begin(g_connect_ssid, g_connect_pass);
     if (!g_wifi_conn_timer) g_wifi_conn_timer = lv_timer_create(wifi_conn_poll, 500, NULL);
 }
 
@@ -464,6 +516,67 @@ static void ble_start_scan()
 
 static void ble_rescan_clicked(lv_event_t *e) { ble_start_scan(); }
 
+// --- Terminal app ------------------------------------------------------------
+static void go_home_async(void *p) { go_home(); }   // defer: safe to delete view after event
+
+static void term_print(const char *s)
+{
+    if (!g_term_log) return;
+    lv_textarea_add_text(g_term_log, s);
+    lv_textarea_set_cursor_pos(g_term_log, LV_TEXTAREA_CURSOR_LAST);   // scroll to bottom
+}
+
+static void term_exec(const char *cmd)
+{
+    char buf[160];
+    term_print("> "); term_print(cmd); term_print("\n");
+    if (!strlen(cmd)) return;
+    if (!strcmp(cmd, "exit") || !strcmp(cmd, "back")) { lv_async_call(go_home_async, NULL); return; }
+    if (!strcmp(cmd, "help"))
+        term_print("cmds: help sysinfo wifi bt ip uptime free echo clear forget exit\n");
+    else if (!strcmp(cmd, "sysinfo")) {
+        snprintf(buf, sizeof(buf), "%s rev%d  %dMHz  flash %dMB  psram %dKB free\n",
+                 ESP.getChipModel(), ESP.getChipRevision(), (int)getCpuFrequencyMhz(),
+                 (int)(ESP.getFlashChipSize() / 1048576), (int)(ESP.getFreePsram() / 1024));
+        term_print(buf);
+    } else if (!strcmp(cmd, "wifi")) {
+        if (WiFi.status() == WL_CONNECTED)
+            snprintf(buf, sizeof(buf), "connected %s  %s\n",
+                     WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+        else
+            snprintf(buf, sizeof(buf), "not connected\n");
+        term_print(buf);
+    } else if (!strcmp(cmd, "bt")) {
+        term_print(g_ble_inited ? "BLE initialized\n" : "BLE off\n");
+    } else if (!strcmp(cmd, "ip")) {
+        snprintf(buf, sizeof(buf), "%s\n", WiFi.localIP().toString().c_str());
+        term_print(buf);
+    } else if (!strcmp(cmd, "uptime")) {
+        snprintf(buf, sizeof(buf), "%lu s\n", (unsigned long)(millis() / 1000));
+        term_print(buf);
+    } else if (!strcmp(cmd, "free")) {
+        snprintf(buf, sizeof(buf), "heap %dKB  psram %dKB\n",
+                 (int)(ESP.getFreeHeap() / 1024), (int)(ESP.getFreePsram() / 1024));
+        term_print(buf);
+    } else if (!strncmp(cmd, "echo ", 5)) {
+        term_print(cmd + 5); term_print("\n");
+    } else if (!strcmp(cmd, "clear")) {
+        lv_textarea_set_text(g_term_log, "");
+    } else if (!strcmp(cmd, "forget")) {
+        Preferences p; p.begin("tdeckos", false); p.remove("ssid"); p.remove("pass"); p.end();
+        WiFi.disconnect(); g_wifi_on = false;
+        term_print("wifi credentials forgotten\n");
+    } else {
+        term_print("unknown: "); term_print(cmd); term_print("\n");
+    }
+}
+
+static void term_input_ready(lv_event_t *e)
+{
+    term_exec(lv_textarea_get_text(g_term_input));
+    lv_textarea_set_text(g_term_input, "");
+}
+
 static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
 {
     if (strcmp(name, "About") == 0) {
@@ -521,6 +634,7 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
     } else if (strcmp(name, "Bluetooth") == 0) {
         if (!g_ble_inited) { BLEDevice::init("T-Deck OS"); g_ble_inited = true; }
         g_bt_on = true;
+        prefs_save_bt(true);
 
         g_bt_status = lv_label_create(parent);
         lv_obj_set_style_text_color(g_bt_status, lv_color_white(), 0);
@@ -540,6 +654,24 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lv_obj_set_style_pad_all(g_bt_list, 0, 0);
 
         ble_start_scan();
+    } else if (strcmp(name, "Terminal") == 0) {
+        g_term_log = lv_textarea_create(parent);
+        lv_obj_set_width(g_term_log, lv_pct(100));
+        lv_obj_set_flex_grow(g_term_log, 1);
+        lv_obj_set_style_text_font(g_term_log, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_bg_color(g_term_log, lv_color_hex(COL_BG), 0);
+        lv_obj_set_style_text_color(g_term_log, lv_color_hex(0x4ADE80), 0);   // terminal green
+        lv_textarea_set_text(g_term_log, "T-Deck OS shell\ntype 'help'  -  'exit' to quit\n");
+
+        g_term_input = lv_textarea_create(parent);
+        lv_textarea_set_one_line(g_term_input, true);
+        lv_textarea_set_placeholder_text(g_term_input, "command");
+        lv_obj_set_width(g_term_input, lv_pct(100));
+        lv_obj_add_event_cb(g_term_input, term_input_ready, LV_EVENT_READY, NULL);
+        lv_group_add_obj(g, g_term_input);
+
+        lv_group_focus_obj(g_term_input);
+        lv_label_set_text(g_toast, LV_SYMBOL_KEYBOARD " Enter runs  -  'exit' or touch Back");
     } else {
         lv_obj_t *l = lv_label_create(parent);
         lv_obj_set_style_text_color(l, lv_color_hex(0xAAAAAA), 0);
@@ -559,6 +691,8 @@ static void go_home()
     g_wifi_msg = NULL;
     g_bt_list = NULL;
     g_bt_status = NULL;
+    g_term_log = NULL;
+    g_term_input = NULL;
     lv_obj_clear_flag(g_home_list, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(g_title, "T-Deck OS");
 
@@ -583,7 +717,7 @@ static void open_app(const char *name)
     g_app_view = lv_obj_create(lv_scr_act());
     lv_obj_set_size(g_app_view, 320, 240 - 26 - 22);
     lv_obj_align(g_app_view, LV_ALIGN_TOP_MID, 0, 26);
-    lv_obj_set_style_bg_color(g_app_view, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_color(g_app_view, lv_color_hex(COL_BG), 0);
     lv_obj_set_style_border_width(g_app_view, 0, 0);
     lv_obj_set_style_pad_all(g_app_view, 8, 0);
     lv_obj_set_flex_flow(g_app_view, LV_FLEX_FLOW_COLUMN);
@@ -642,6 +776,28 @@ static void status_update_cb(lv_timer_t *t)
     lv_obj_align(g_status, LV_ALIGN_RIGHT_MID, 0, 0);
 }
 
+// Restore saved Wi-Fi (auto-reconnect) and BT state from NVS on boot.
+static void boot_restore()
+{
+    Preferences p;
+    p.begin("tdeckos", true);
+    String ssid = p.getString("ssid", "");
+    String pass = p.getString("pass", "");
+    bool   bt   = p.getBool("bt", false);
+    p.end();
+
+    if (ssid.length()) {
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(ssid.c_str(), pass.c_str());
+        g_wifi_autoconn_timer = lv_timer_create(wifi_autoconn_poll, 500, NULL);
+    }
+    if (bt && !g_ble_inited) {
+        BLEDevice::init("T-Deck OS");
+        g_ble_inited = true;
+        g_bt_on = true;
+    }
+}
+
 void setup()
 {
     Serial.begin(115200);
@@ -689,6 +845,7 @@ void setup()
     setup_trackball_indev();
     setup_keyboard_indev();
     lv_timer_create(status_update_cb, 1000, NULL);
+    boot_restore();   // auto-reconnect saved Wi-Fi + restore BT state
 
     pinMode(BOARD_BL_PIN, OUTPUT);
     setBrightness(16);
