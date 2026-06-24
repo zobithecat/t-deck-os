@@ -19,6 +19,7 @@
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 #include <Preferences.h>
+#include <driver/i2s.h>
 #include <TFT_eSPI.h>
 #include <lvgl.h>
 #include "TouchDrvGT911.hpp"
@@ -58,6 +59,7 @@ static lv_obj_t     *g_notes_ta;
 static lv_obj_t     *g_url_input;
 static lv_obj_t     *g_browser_out;
 static lv_timer_t   *g_browser_timer;
+static bool          g_audio_inited;
 
 static void go_home();
 static void open_app(const char *name);
@@ -284,6 +286,7 @@ static void build_launcher_ui()
         { LV_SYMBOL_KEYBOARD, "Terminal",          0x4ADE80 },
         { LV_SYMBOL_EDIT,     "Notes",             0xFB923C },
         { LV_SYMBOL_HOME,     "Browser",           0x22D3EE },
+        { LV_SYMBOL_AUDIO,    "Speaker",           0xF472B6 },
         { LV_SYMBOL_GPS,      "Meshtastic / LoRa", 0x34D399 },
         { LV_SYMBOL_BELL,     "Messages",          0xFBBF24 },
         { LV_SYMBOL_WIFI,     "Wi-Fi",             0x3B82F6 },
@@ -670,6 +673,69 @@ static void browser_go(lv_event_t *e)
     if (!g_browser_timer) g_browser_timer = lv_timer_create(browser_fetch, 60, NULL);
 }
 
+// --- Speaker test (I2S to the on-board MAX98357A amp) ------------------------
+static void audio_init()
+{
+    if (g_audio_inited) return;
+    i2s_config_t cfg = {};
+    cfg.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+    cfg.sample_rate          = 16000;
+    cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT;
+    cfg.channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT;
+    cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+    cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
+    cfg.dma_buf_count        = 8;
+    cfg.dma_buf_len          = 64;
+    cfg.tx_desc_auto_clear   = true;     // output silence on underrun (no stuck tone)
+    i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL);
+
+    i2s_pin_config_t pins = {};
+    pins.bck_io_num   = BOARD_I2S_BCK;
+    pins.ws_io_num    = BOARD_I2S_WS;
+    pins.data_out_num = BOARD_I2S_DOUT;
+    pins.data_in_num  = I2S_PIN_NO_CHANGE;
+    i2s_set_pin(I2S_NUM_0, &pins);
+    g_audio_inited = true;
+}
+
+static void play_tone(int freq, int ms)
+{
+    const int sr = 16000;
+    int total = (int)((long)sr * ms / 1000);
+    static double phase = 0;
+    double step = TWO_PI * freq / sr;
+    int16_t buf[256];
+    int done = 0;
+    while (done < total) {
+        int n = (total - done < 256) ? (total - done) : 256;
+        for (int i = 0; i < n; i++) {
+            buf[i] = (int16_t)(sin(phase) * 12000.0);
+            phase += step;
+            if (phase >= TWO_PI) phase -= TWO_PI;
+        }
+        size_t bw;
+        i2s_write(I2S_NUM_0, buf, n * sizeof(int16_t), &bw, portMAX_DELAY);
+        done += n;
+    }
+    int16_t z[128] = {0};                 // short trailing silence so the note ends cleanly
+    size_t bw;
+    i2s_write(I2S_NUM_0, z, sizeof(z), &bw, portMAX_DELAY);
+}
+
+static void speaker_play_cb(lv_event_t *e)
+{
+    int id = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+    if (id == 0) {
+        play_tone(1000, 250);
+    } else if (id == 1) {
+        for (int f = 400; f <= 2200; f += 80) play_tone(f, 22);
+    } else {
+        const int notes[] = { 523, 587, 659, 698, 784, 880 };
+        for (int i = 0; i < 6; i++) play_tone(notes[i], 160);
+    }
+    i2s_zero_dma_buffer(I2S_NUM_0);      // flush so no tone lingers after playback
+}
+
 static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
 {
     if (strcmp(name, "About") == 0) {
@@ -815,6 +881,23 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
 
         lv_group_focus_obj(g_url_input);
         lv_label_set_text(g_toast, LV_SYMBOL_KEYBOARD " URL + Enter  -  touch Back");
+    } else if (strcmp(name, "Speaker") == 0) {
+        audio_init();
+        lv_obj_t *lbl = lv_label_create(parent);
+        lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+        lv_label_set_text(lbl, "Speaker test (I2S amp)");
+
+        const char *names[] = { "Beep 1kHz", "Sweep", "Melody" };
+        for (int i = 0; i < 3; i++) {
+            lv_obj_t *bt = lv_btn_create(parent);
+            lv_obj_set_width(bt, lv_pct(100));
+            lv_obj_t *l = lv_label_create(bt);
+            lv_label_set_text(l, names[i]);
+            lv_obj_set_user_data(bt, (void *)(intptr_t)i);
+            lv_obj_add_event_cb(bt, speaker_play_cb, LV_EVENT_CLICKED, NULL);
+            lv_group_add_obj(g, bt);
+        }
+        lv_label_set_text(g_toast, LV_SYMBOL_AUDIO " tap to play (brief freeze)");
     } else {
         lv_obj_t *l = lv_label_create(parent);
         lv_obj_set_style_text_color(l, lv_color_hex(0xAAAAAA), 0);

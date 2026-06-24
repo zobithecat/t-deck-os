@@ -49,6 +49,7 @@ esptool v5는 USB-Serial-JTAG로 다운로드 모드에 **자동 진입**한다 
 - [x] NVS 영속화 (WiFi 자동 재접속 +NTP, BT 상태)
 - [x] Notes 앱 (NVS 저장) + 클럼지 웹브라우저 (HTTP(S) 텍스트, 태그 스트립)
 - [x] 키보드 백라이트 제어 (I2C 0x55, Settings 슬라이더, NVS)
+- [x] Speaker 테스트 앱 (I2S 톤: Beep / Sweep / Melody)
 - [ ] LoRa(SX1262) 메시징 — 안테나 없어 파킹
 
 ## 출처
