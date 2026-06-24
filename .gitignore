@@ -1,0 +1,17 @@
+# PlatformIO build output
+.pio/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local secrets (Wi-Fi etc.)
+.env
+
+# Claude Code / oh-my-claudecode local state (machine-specific, not shared)
+.claude/settings.local.json
+.omc/
+
+# NOTE: boards/ and lib/ are intentionally committed (vendored deps needed to build).
