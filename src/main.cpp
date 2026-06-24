@@ -13,6 +13,8 @@
 #include <string.h>
 #include <time.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
@@ -52,6 +54,10 @@ static lv_timer_t   *g_bt_scan_timer;
 static bool          g_ble_inited;
 static lv_obj_t     *g_term_log;
 static lv_obj_t     *g_term_input;
+static lv_obj_t     *g_notes_ta;
+static lv_obj_t     *g_url_input;
+static lv_obj_t     *g_browser_out;
+static lv_timer_t   *g_browser_timer;
 
 static void go_home();
 static void open_app(const char *name);
@@ -72,6 +78,17 @@ static void setBrightness(uint8_t value)
     int num  = (steps + to - from) % steps;
     for (int i = 0; i < num; i++) { digitalWrite(BOARD_BL_PIN, 0); digitalWrite(BOARD_BL_PIN, 1); }
     level = value;
+}
+
+// Keyboard (ESP32-C3 @ I2C 0x55) backlight. Requires C3 firmware >= 2024-12-25;
+// older firmware ignores the command (use Alt+B on the keyboard instead).
+static uint8_t g_kb_bright = 127;
+static void setKeyboardBrightness(uint8_t value)
+{
+    Wire.beginTransmission(0x55);
+    Wire.write(0x01);          // LILYGO_KB_BRIGHTNESS_CMD
+    Wire.write(value);
+    Wire.endTransmission();
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +282,8 @@ static void build_launcher_ui()
     struct AppEntry { const char *icon; const char *name; uint32_t color; };
     static const AppEntry apps[] = {
         { LV_SYMBOL_KEYBOARD, "Terminal",          0x4ADE80 },
+        { LV_SYMBOL_EDIT,     "Notes",             0xFB923C },
+        { LV_SYMBOL_HOME,     "Browser",           0x22D3EE },
         { LV_SYMBOL_GPS,      "Meshtastic / LoRa", 0x34D399 },
         { LV_SYMBOL_BELL,     "Messages",          0xFBBF24 },
         { LV_SYMBOL_WIFI,     "Wi-Fi",             0x3B82F6 },
@@ -577,6 +596,80 @@ static void term_input_ready(lv_event_t *e)
     lv_textarea_set_text(g_term_input, "");
 }
 
+// --- Clumsy web browser (text only) ------------------------------------------
+static void browser_fetch(lv_timer_t *t)
+{
+    lv_timer_del(t);
+    g_browser_timer = NULL;
+    if (!g_browser_out || !g_url_input) return;
+    if (WiFi.status() != WL_CONNECTED) {
+        lv_textarea_set_text(g_browser_out, "WiFi not connected - open Wi-Fi app first");
+        return;
+    }
+    String url = lv_textarea_get_text(g_url_input);
+    url.trim();
+    if (!url.length()) return;
+    if (!url.startsWith("http")) url = "https://" + url;
+
+    HTTPClient http;
+    http.setTimeout(6000);
+    http.setUserAgent("TDeckOS/0.1");
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    WiFiClientSecure sec;
+    WiFiClient plain;
+    bool ok;
+    if (url.startsWith("https")) { sec.setInsecure(); ok = http.begin(sec, url); }
+    else                         { ok = http.begin(plain, url); }
+    if (!ok) { lv_textarea_set_text(g_browser_out, "bad url"); return; }
+
+    int code = http.GET();
+    if (code <= 0) {
+        lv_textarea_set_text(g_browser_out, (String("http error ") + code).c_str());
+        http.end();
+        return;
+    }
+
+    String body;
+    body.reserve(13000);
+    WiFiClient *st = http.getStreamPtr();
+    uint32_t t0 = millis();
+    while (st && http.connected() && body.length() < 12000 && millis() - t0 < 6000) {
+        while (st->available() && body.length() < 12000) body += (char)st->read();
+        delay(1);
+    }
+    http.end();
+
+    // crude tag strip + script/style block skip
+    String out;
+    out.reserve(7000);
+    int n = body.length();
+    bool in_tag = false, in_skip = false;
+    for (int i = 0; i < n && out.length() < 6000; i++) {
+        char c = body[i];
+        if (!in_tag && c == '<') {
+            in_tag = true;
+            String w = body.substring(i + 1, (i + 8 < n ? i + 8 : n));
+            w.toLowerCase();
+            if (w.startsWith("script") || w.startsWith("style"))        in_skip = true;
+            else if (w.startsWith("/script") || w.startsWith("/style")) in_skip = false;
+            continue;
+        }
+        if (in_tag) { if (c == '>') in_tag = false; continue; }
+        if (in_skip) continue;
+        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+        out += c;
+    }
+    if (!out.length()) out = String("(no text) http ") + code;
+    lv_textarea_set_text(g_browser_out, out.c_str());
+    lv_obj_scroll_to_y(g_browser_out, 0, LV_ANIM_OFF);
+}
+
+static void browser_go(lv_event_t *e)
+{
+    if (g_browser_out) lv_textarea_set_text(g_browser_out, "Loading...");
+    if (!g_browser_timer) g_browser_timer = lv_timer_create(browser_fetch, 60, NULL);
+}
+
 static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
 {
     if (strcmp(name, "About") == 0) {
@@ -609,6 +702,21 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
             setBrightness((uint8_t)lv_slider_get_value(lv_event_get_target(e)));
         }, LV_EVENT_VALUE_CHANGED, NULL);
         lv_group_add_obj(g, slider);
+
+        lv_obj_t *klbl = lv_label_create(parent);
+        lv_label_set_text(klbl, "Keyboard backlight");
+        lv_obj_set_style_text_color(klbl, lv_color_white(), 0);
+        lv_obj_t *kslider = lv_slider_create(parent);
+        lv_obj_set_width(kslider, 260);
+        lv_slider_set_range(kslider, 0, 255);
+        lv_slider_set_value(kslider, g_kb_bright, LV_ANIM_OFF);
+        lv_obj_add_event_cb(kslider, [](lv_event_t *e) {
+            uint8_t v = (uint8_t)lv_slider_get_value(lv_event_get_target(e));
+            g_kb_bright = v;
+            setKeyboardBrightness(v);
+            Preferences p; p.begin("tdeckos", false); p.putUChar("kbl", v); p.end();
+        }, LV_EVENT_VALUE_CHANGED, NULL);
+        lv_group_add_obj(g, kslider);
     } else if (strcmp(name, "Wi-Fi") == 0) {
         WiFi.mode(WIFI_STA);
         WiFi.disconnect();
@@ -672,6 +780,41 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
 
         lv_group_focus_obj(g_term_input);
         lv_label_set_text(g_toast, LV_SYMBOL_KEYBOARD " Enter runs  -  'exit' or touch Back");
+    } else if (strcmp(name, "Notes") == 0) {
+        g_notes_ta = lv_textarea_create(parent);
+        lv_obj_set_width(g_notes_ta, lv_pct(100));
+        lv_obj_set_flex_grow(g_notes_ta, 1);
+        lv_textarea_set_placeholder_text(g_notes_ta, "type your note...");
+        Preferences p;
+        p.begin("tdeckos", true);
+        String note = p.getString("note", "");
+        p.end();
+        if (note.length()) lv_textarea_set_text(g_notes_ta, note.c_str());
+        lv_group_add_obj(g, g_notes_ta);
+        lv_group_focus_obj(g_notes_ta);
+        lv_label_set_text(g_toast, LV_SYMBOL_KEYBOARD " type  -  auto-saves on Back");
+    } else if (strcmp(name, "Browser") == 0) {
+        g_url_input = lv_textarea_create(parent);
+        lv_textarea_set_one_line(g_url_input, true);
+        lv_textarea_set_placeholder_text(g_url_input, "url (e.g. example.com)");
+        lv_obj_set_width(g_url_input, lv_pct(100));
+        lv_obj_add_event_cb(g_url_input, browser_go, LV_EVENT_READY, NULL);
+        lv_group_add_obj(g, g_url_input);
+
+        lv_obj_t *go = lv_btn_create(parent);
+        lv_obj_t *gl = lv_label_create(go);
+        lv_label_set_text(gl, LV_SYMBOL_RIGHT " Go");
+        lv_obj_add_event_cb(go, browser_go, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, go);
+
+        g_browser_out = lv_textarea_create(parent);
+        lv_obj_set_width(g_browser_out, lv_pct(100));
+        lv_obj_set_flex_grow(g_browser_out, 1);
+        lv_obj_set_style_text_font(g_browser_out, &lv_font_montserrat_12, 0);
+        lv_textarea_set_text(g_browser_out, "type a URL, Enter or Go\n(very clumsy: text only)");
+
+        lv_group_focus_obj(g_url_input);
+        lv_label_set_text(g_toast, LV_SYMBOL_KEYBOARD " URL + Enter  -  touch Back");
     } else {
         lv_obj_t *l = lv_label_create(parent);
         lv_obj_set_style_text_color(l, lv_color_hex(0xAAAAAA), 0);
@@ -684,6 +827,13 @@ static void go_home()
     if (g_wifi_scan_timer) { lv_timer_del(g_wifi_scan_timer); g_wifi_scan_timer = NULL; }
     if (g_wifi_conn_timer) { lv_timer_del(g_wifi_conn_timer); g_wifi_conn_timer = NULL; }
     if (g_bt_scan_timer)   { lv_timer_del(g_bt_scan_timer);   g_bt_scan_timer = NULL; }
+    if (g_browser_timer)   { lv_timer_del(g_browser_timer);   g_browser_timer = NULL; }
+    if (g_notes_ta) {                                  // auto-save notes on leave
+        Preferences p;
+        p.begin("tdeckos", false);
+        p.putString("note", lv_textarea_get_text(g_notes_ta));
+        p.end();
+    }
     if (g_app_view) { lv_obj_del(g_app_view); g_app_view = NULL; }
     g_wifi_list = NULL;
     g_wifi_status = NULL;
@@ -693,6 +843,9 @@ static void go_home()
     g_bt_status = NULL;
     g_term_log = NULL;
     g_term_input = NULL;
+    g_notes_ta = NULL;
+    g_url_input = NULL;
+    g_browser_out = NULL;
     lv_obj_clear_flag(g_home_list, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(g_title, "T-Deck OS");
 
@@ -784,7 +937,10 @@ static void boot_restore()
     String ssid = p.getString("ssid", "");
     String pass = p.getString("pass", "");
     bool   bt   = p.getBool("bt", false);
+    g_kb_bright = p.getUChar("kbl", 127);
     p.end();
+
+    setKeyboardBrightness(g_kb_bright);   // keyboard backlight on at boot
 
     if (ssid.length()) {
         WiFi.mode(WIFI_STA);

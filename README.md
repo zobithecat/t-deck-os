@@ -47,8 +47,9 @@ esptool v5는 USB-Serial-JTAG로 다운로드 모드에 **자동 진입**한다 
 - [x] 다크 테마 + 앱별 컬러 아이콘 (폴리시)
 - [x] Terminal 앱 (help/sysinfo/wifi/bt/ip/uptime/free/echo/clear/forget/exit)
 - [x] NVS 영속화 (WiFi 자동 재접속 +NTP, BT 상태)
-- [ ] Notes 앱 + 클럼지 웹브라우저
-- [ ] LoRa(SX1262) 메시징
+- [x] Notes 앱 (NVS 저장) + 클럼지 웹브라우저 (HTTP(S) 텍스트, 태그 스트립)
+- [x] 키보드 백라이트 제어 (I2C 0x55, Settings 슬라이더, NVS)
+- [ ] LoRa(SX1262) 메시징 — 안테나 없어 파킹
 
 ## 출처
 부팅 시퀀스·핀맵·라이브러리는 LilyGO 공식 repo 기반:
