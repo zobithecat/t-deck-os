@@ -80,6 +80,11 @@ static lv_obj_t     *g_kr_btn;          // Kor/Eng toggle button
 static lv_obj_t     *g_sd_list;
 static lv_obj_t     *g_sd_status;
 static bool          g_sd_ok;
+static lv_obj_t     *g_rng_rssi, *g_rng_stats, *g_rng_log;   // LoRa range test
+static lv_timer_t   *g_rng_poll, *g_rng_tx;
+static uint32_t      g_rng_seq;
+static int           g_rng_rx, g_rng_miss, g_rng_rmin, g_rng_rmax, g_rng_rcount;
+static long          g_rng_rsum, g_rng_last_seq;
 static String        g_sd_path = "/";
 static char          g_sd_names[50][96];
 static bool          g_sd_isdir[50];
@@ -159,6 +164,7 @@ static void touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 // within TB_REVERSE_MS are dropped as cross-talk; vertical has accel (Settings).
 #define TB_REVERSE_MS  60
 static lv_obj_t *g_edit_slider = NULL;   // slider engaged for left/right adjust
+static lv_obj_t *g_sd_view_ta  = NULL;   // file-viewer textarea: trackball scrolls it by line
 
 static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
@@ -217,7 +223,16 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
             last_ms  = now;
         }
     }
-    data->enc_diff = g_edit_slider ? 0 : diff;
+    // In the file viewer, vertical scrolls the text one line at a time instead
+    // of moving focus (the viewer's group holds only the Back button). Direction
+    // comes from the glitch-suppressed `diff`; magnitude is fixed at one line.
+    if (g_sd_view_ta && diff != 0) {
+        lv_coord_t lh = lv_font_get_line_height(&font_kr16);
+        lv_obj_scroll_by(g_sd_view_ta, 0, diff > 0 ? -lh : lh, LV_ANIM_OFF);
+        data->enc_diff = 0;
+    } else {
+        data->enc_diff = g_edit_slider ? 0 : diff;
+    }
 
     // ---- horizontal -> adjust the engaged slider only ----
     int8_t hdir = 0;
@@ -337,6 +352,12 @@ static void setupLvgl()
     disp_drv.full_refresh = 1;
     lv_disp_drv_register(&disp_drv);
 
+    // Global font: Korean + Latin + LVGL icons in one font, so Hangul renders
+    // everywhere (not just the LoRa box). Keep the existing dark theme.
+    lv_disp_t *d = lv_disp_get_default();
+    lv_disp_set_theme(d, lv_theme_default_init(d, lv_palette_main(LV_PALETTE_BLUE),
+                                               lv_palette_main(LV_PALETTE_GREY), true, &font_kr16));
+
     static lv_indev_drv_t indev_touch;
     lv_indev_drv_init(&indev_touch);
     indev_touch.type    = LV_INDEV_TYPE_POINTER;
@@ -392,6 +413,7 @@ static void build_launcher_ui()
         { LV_SYMBOL_HOME,     "Browser",           0x22D3EE },
         { LV_SYMBOL_AUDIO,    "Speaker",           0xF472B6 },
         { LV_SYMBOL_GPS,      "LoRa",              0x34D399 },
+        { LV_SYMBOL_UP,       "Range",             0xFBBF24 },
         { LV_SYMBOL_BELL,     "Messages",          0xFBBF24 },
         { LV_SYMBOL_WIFI,     "Wi-Fi",             0x3B82F6 },
         { LV_SYMBOL_BLUETOOTH,"Bluetooth",         0x60A5FA },
@@ -1043,8 +1065,13 @@ static bool sd_init()
     return g_sd_ok;
 }
 
+static char g_sd_pending[96];
 static void sd_show_dir();
+static void sd_open_browser();
+static void sd_view_file(const char *path);
 static void sd_show_dir_async(void *p) { sd_show_dir(); }
+static void sd_open_browser_async(void *p) { sd_open_browser(); }
+static void sd_view_async(void *p) { sd_view_file(g_sd_pending); }
 
 static void sd_entry_clicked(lv_event_t *e)
 {
@@ -1059,14 +1086,10 @@ static void sd_entry_clicked(lv_event_t *e)
     if (g_sd_isdir[idx]) {                               // enter folder
         g_sd_path = g_sd_names[idx];
         lv_async_call(sd_show_dir_async, NULL);
-    } else {                                             // file -> show size
-        File f = SD.open(g_sd_names[idx]);
-        if (f) {
-            String b = String(g_sd_names[idx]);
-            b = b.substring(b.lastIndexOf('/') + 1);
-            lv_label_set_text_fmt(g_sd_status, "%s  -  %u bytes", b.c_str(), (unsigned)f.size());
-            f.close();
-        }
+    } else {                                             // file -> open text viewer
+        strncpy(g_sd_pending, g_sd_names[idx], sizeof(g_sd_pending) - 1);
+        g_sd_pending[sizeof(g_sd_pending) - 1] = '\0';
+        lv_async_call(sd_view_async, NULL);
     }
 }
 
@@ -1122,6 +1145,175 @@ static void sd_show_dir()
     }
     dir.close();
     if (g_sd_count == 0) lv_label_set_text_fmt(g_sd_status, "%s  (empty)", g_sd_path.c_str());
+}
+
+// Build the status label + directory list into g_app_view. A Back button is
+// assumed to already exist in the view + group (open_app or sd_open_browser).
+static void sd_build_list()
+{
+    g_sd_status = lv_label_create(g_app_view);
+    lv_obj_set_style_text_color(g_sd_status, lv_color_white(), 0);
+    lv_label_set_text(g_sd_status, "mounting SD...");
+
+    g_sd_list = lv_list_create(g_app_view);
+    lv_obj_set_width(g_sd_list, lv_pct(100));
+    lv_obj_set_flex_grow(g_sd_list, 1);
+    lv_obj_set_style_bg_color(g_sd_list, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_border_width(g_sd_list, 0, 0);
+    lv_obj_set_style_pad_all(g_sd_list, 0, 0);
+
+    if (!sd_init()) lv_label_set_text(g_sd_status, "SD mount failed (no card?)");
+    else            sd_show_dir();
+
+    if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_SD_CARD " browse  -  tap file to read");
+}
+
+// Return to the file list from the text viewer: rebuild Back + list fresh.
+static void sd_open_browser()
+{
+    g_sd_view_ta = NULL;
+    lv_obj_clean(g_app_view);
+    lv_group_t *g = lv_group_get_default();
+    lv_group_remove_all_objs(g);
+
+    lv_obj_t *back = lv_btn_create(g_app_view);
+    lv_obj_t *bl = lv_label_create(back); lv_label_set_text(bl, LV_SYMBOL_LEFT " Back");
+    lv_obj_add_event_cb(back, back_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_group_add_obj(g, back);
+
+    sd_build_list();
+    lv_group_focus_obj(back);
+}
+
+static void sd_view_back_cb(lv_event_t *e) { lv_async_call(sd_open_browser_async, NULL); }
+
+// Text/log viewer: read up to 8 KB of a file into a scrollable textarea so the
+// SD logs (range_log.csv, notes, etc.) are actually readable on-device.
+static void sd_view_file(const char *path)
+{
+    lv_obj_clean(g_app_view);
+    g_sd_list = NULL; g_sd_status = NULL;
+    lv_group_t *g = lv_group_get_default();
+    lv_group_remove_all_objs(g);
+
+    lv_obj_t *back = lv_btn_create(g_app_view);
+    lv_obj_t *bl = lv_label_create(back); lv_label_set_text(bl, LV_SYMBOL_LEFT " Files");
+    lv_obj_add_event_cb(back, sd_view_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_group_add_obj(g, back);
+
+    const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
+    lv_obj_t *nm = lv_label_create(g_app_view);
+    lv_obj_set_width(nm, lv_pct(100));
+    lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_color(nm, lv_color_hex(COL_MUTED), 0);
+    lv_label_set_text(nm, bn);
+
+    lv_obj_t *ta = lv_textarea_create(g_app_view);
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_flex_grow(ta, 1);
+    lv_obj_set_style_text_font(ta, &font_kr16, 0);
+
+    File f = SD.open(path);
+    if (!f) {
+        lv_textarea_set_text(ta, "(cannot open)");
+    } else {
+        String s;
+        s.reserve(8200);
+        while (f.available() && s.length() < 8000) s += (char)f.read();
+        bool more = f.available();
+        f.close();
+        if (more) s += "\n...(truncated at 8KB)";
+        lv_textarea_set_text(ta, s.length() ? s.c_str() : "(empty file)");
+    }
+    g_sd_view_ta = ta;
+    lv_group_focus_obj(back);
+    if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_LEFT " Files  -  roll up/down to scroll");
+}
+
+// --- LoRa range / link-quality test ------------------------------------------
+static void range_log_sd(const String &line)
+{
+    if (!sd_init()) return;
+    File f = SD.open("/range_log.csv", FILE_APPEND);
+    if (f) { f.println(line); f.close(); }
+}
+
+static void range_update_stats()
+{
+    int total = g_rng_rx + g_rng_miss;
+    int loss  = total ? (g_rng_miss * 100 / total) : 0;
+    int avg   = g_rng_rcount ? (int)(g_rng_rsum / g_rng_rcount) : 0;
+    if (g_rng_stats)
+        lv_label_set_text_fmt(g_rng_stats, "rx %d  miss %d  loss %d%%\nrssi  %d / %d / %d  (min/avg/max)",
+                              g_rng_rx, g_rng_miss, loss,
+                              g_rng_rcount ? g_rng_rmin : 0, avg, g_rng_rcount ? g_rng_rmax : 0);
+}
+
+static void range_poll_cb(lv_timer_t *t)
+{
+    if (!g_lora_rx_flag) return;
+    g_lora_rx_flag = false;
+    String pkt;
+    if (lora_radio.readData(pkt) != RADIOLIB_ERR_NONE || !pkt.length()) { lora_radio.startReceive(); return; }
+    int   rssi = (int)lora_radio.getRSSI();
+    float snr  = lora_radio.getSNR();
+    lora_radio.startReceive();
+
+    if (g_rng_rcount == 0) { g_rng_rmin = g_rng_rmax = rssi; }
+    else { if (rssi < g_rng_rmin) g_rng_rmin = rssi; if (rssi > g_rng_rmax) g_rng_rmax = rssi; }
+    g_rng_rsum += rssi; g_rng_rcount++; g_rng_rx++;
+
+    String first = pkt;
+    int nl = pkt.indexOf('\n'); if (nl >= 0) first = pkt.substring(0, nl);
+    first.trim();
+    long seq = -1;
+    if (first.startsWith("PING\t") || first.startsWith("PONG\t")) {  // numbered -> gap detection
+        int p2 = first.indexOf('\t', 5);
+        seq = (p2 > 0 ? first.substring(5, p2) : first.substring(5)).toInt();
+        if (g_rng_last_seq >= 0 && seq > g_rng_last_seq + 1)
+            g_rng_miss += (int)(seq - g_rng_last_seq - 1);
+        g_rng_last_seq = seq;
+    }
+
+    if (g_rng_rssi) lv_label_set_text_fmt(g_rng_rssi, "RSSI %d dBm   SNR %.1f", rssi, snr);
+    if (g_rng_log) {
+        char ln[64];
+        if (seq >= 0) snprintf(ln, sizeof(ln), "#%ld  %d dBm  %.1f\n", seq, rssi, snr);
+        else          snprintf(ln, sizeof(ln), "%s  %d dBm\n", first.c_str(), rssi);
+        lv_textarea_add_text(g_rng_log, ln);
+        lv_textarea_set_cursor_pos(g_rng_log, LV_TEXTAREA_CURSOR_LAST);
+    }
+    range_update_stats();
+
+    const char *typ = first.startsWith("PONG") ? "PONG" :
+                      first.startsWith("PING") ? "PING" :
+                      first.startsWith("HB")   ? "HB"   : "OTHER";
+    char csv[80];
+    snprintf(csv, sizeof(csv), "%lu,%s,%ld,%d,%.1f", (unsigned long)(millis() / 1000),
+             typ, seq, rssi, snr);
+    range_log_sd(String(csv));
+}
+
+static void range_tx_cb(lv_timer_t *t)
+{
+    char buf[40];
+    snprintf(buf, sizeof(buf), "PING\t%lu\t%s\n", (unsigned long)g_rng_seq, LORA_SENDER_ID);
+    lora_radio.transmit(buf);                               // blocking ~1-2 s at SF12
+    lora_radio.startReceive();
+    if (g_rng_log) {
+        char ln[32]; snprintf(ln, sizeof(ln), "TX #%lu\n", (unsigned long)g_rng_seq);
+        lv_textarea_add_text(g_rng_log, ln);
+        lv_textarea_set_cursor_pos(g_rng_log, LV_TEXTAREA_CURSOR_LAST);
+    }
+    g_rng_seq++;
+}
+
+static void range_tx_toggle_cb(lv_event_t *e)
+{
+    if (g_rng_tx) { lv_timer_del(g_rng_tx); g_rng_tx = NULL; }
+    else          { g_rng_tx = lv_timer_create(range_tx_cb, 5000, NULL); }
+    lv_obj_t *l = lv_obj_get_child(lv_event_get_target(e), 0);
+    if (l) lv_label_set_text(l, g_rng_tx ? "TX beacon: ON" : "TX beacon: off");
 }
 
 static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
@@ -1233,7 +1425,7 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         g_term_log = lv_textarea_create(parent);
         lv_obj_set_width(g_term_log, lv_pct(100));
         lv_obj_set_flex_grow(g_term_log, 1);
-        lv_obj_set_style_text_font(g_term_log, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_font(g_term_log, &font_kr16, 0);
         lv_obj_set_style_bg_color(g_term_log, lv_color_hex(COL_BG), 0);
         lv_obj_set_style_text_color(g_term_log, lv_color_hex(0x4ADE80), 0);   // terminal green
         lv_textarea_set_text(g_term_log, "T-Deck OS shell\ntype 'help'  -  'exit' to quit\n");
@@ -1277,7 +1469,7 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         g_browser_out = lv_textarea_create(parent);
         lv_obj_set_width(g_browser_out, lv_pct(100));
         lv_obj_set_flex_grow(g_browser_out, 1);
-        lv_obj_set_style_text_font(g_browser_out, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_font(g_browser_out, &font_kr16, 0);
         lv_textarea_set_text(g_browser_out, "type a URL, Enter or Go\n(very clumsy: text only)");
 
         lv_group_focus_obj(g_url_input);
@@ -1351,23 +1543,37 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         if (!g_lora_timer) g_lora_timer = lv_timer_create(lora_poll, 50, NULL);
         lv_group_focus_obj(g_lora_input);
         lv_label_set_text(g_toast, LV_SYMBOL_KEYBOARD " type+Enter to send  -  Kor/Eng btn");
+    } else if (strcmp(name, "Range") == 0) {
+        lora_init();
+        g_rng_rx = g_rng_miss = g_rng_rcount = 0;
+        g_rng_rsum = 0; g_rng_last_seq = -1; g_rng_seq = 0;
+
+        g_rng_rssi = lv_label_create(parent);
+        lv_obj_set_style_text_font(g_rng_rssi, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(g_rng_rssi, lv_color_hex(0x4ADE80), 0);
+        lv_label_set_text(g_rng_rssi, g_lora_ok ? "RSSI --   SNR --" : "radio init failed");
+
+        g_rng_stats = lv_label_create(parent);
+        lv_obj_set_style_text_color(g_rng_stats, lv_color_white(), 0);
+        lv_label_set_text(g_rng_stats, "rx 0  miss 0  loss 0%");
+
+        g_rng_log = lv_textarea_create(parent);
+        lv_obj_set_width(g_rng_log, lv_pct(100));
+        lv_obj_set_flex_grow(g_rng_log, 1);
+        lv_obj_set_style_text_font(g_rng_log, &font_kr16, 0);
+        lv_textarea_set_text(g_rng_log, "listening - log: /range_log.csv\n");
+
+        lv_obj_t *txb = lv_btn_create(parent);
+        lv_obj_t *tl = lv_label_create(txb);
+        lv_label_set_text(tl, "TX beacon: off");
+        lv_obj_add_event_cb(txb, range_tx_toggle_cb, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, txb);
+
+        if (!g_rng_poll) g_rng_poll = lv_timer_create(range_poll_cb, 50, NULL);
+        lv_label_set_text(g_toast, LV_SYMBOL_UP " RSSI / loss test  -  log to SD");
     } else if (strcmp(name, "Files") == 0) {
-        g_sd_status = lv_label_create(parent);
-        lv_obj_set_style_text_color(g_sd_status, lv_color_white(), 0);
-        lv_label_set_text(g_sd_status, "mounting SD...");
         g_sd_path = "/";
-
-        g_sd_list = lv_list_create(parent);
-        lv_obj_set_width(g_sd_list, lv_pct(100));
-        lv_obj_set_flex_grow(g_sd_list, 1);
-        lv_obj_set_style_bg_color(g_sd_list, lv_color_hex(COL_BG), 0);
-        lv_obj_set_style_border_width(g_sd_list, 0, 0);
-        lv_obj_set_style_pad_all(g_sd_list, 0, 0);
-
-        if (!sd_init()) lv_label_set_text(g_sd_status, "SD mount failed (no card?)");
-        else            sd_show_dir();
-
-        lv_label_set_text(g_toast, LV_SYMBOL_SD_CARD " browse  -  touch Back");
+        sd_build_list();
     } else {
         lv_obj_t *l = lv_label_create(parent);
         lv_obj_set_style_text_color(l, lv_color_hex(0xAAAAAA), 0);
@@ -1382,6 +1588,8 @@ static void go_home()
     if (g_bt_scan_timer)   { lv_timer_del(g_bt_scan_timer);   g_bt_scan_timer = NULL; }
     if (g_browser_timer)   { lv_timer_del(g_browser_timer);   g_browser_timer = NULL; }
     if (g_lora_timer)      { lv_timer_del(g_lora_timer);      g_lora_timer = NULL; }
+    if (g_rng_poll)        { lv_timer_del(g_rng_poll);        g_rng_poll = NULL; }
+    if (g_rng_tx)          { lv_timer_del(g_rng_tx);          g_rng_tx = NULL; }
     if (g_notes_ta) {                                  // auto-save notes on leave
         Preferences p;
         p.begin("tdeckos", false);
@@ -1405,6 +1613,8 @@ static void go_home()
     g_kr_btn = NULL;
     g_sd_list = NULL;
     g_sd_status = NULL;
+    g_sd_view_ta = NULL;
+    g_rng_rssi = NULL; g_rng_stats = NULL; g_rng_log = NULL;
     g_edit_slider = NULL;
     lv_obj_clear_flag(g_home_list, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(g_title, "T-Deck OS");
