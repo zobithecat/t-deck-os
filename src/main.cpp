@@ -21,10 +21,13 @@
 #include <Preferences.h>
 #include <driver/i2s.h>
 #include <RadioLib.h>
+#include <SD.h>
 #include <TFT_eSPI.h>
 #include <lvgl.h>
 #include "TouchDrvGT911.hpp"
 #include "pins.h"
+#include "hangul_ime.h"
+#include "keymap_dubeolsik.h"
 
 // --- Theme palette (dark) ---
 #define COL_BG       0x0A0E14   // screen background
@@ -39,6 +42,7 @@ static TFT_eSPI      tft;
 static TouchDrvGT911 touch;
 static int16_t       tp_x[5], tp_y[5];
 static lv_indev_t   *enc_indev;     // trackball (encoder)
+static int           g_tb_accel = 2;     // trackball scroll accel level 0..5 (Settings / NVS)
 static lv_obj_t     *g_toast;       // bottom status / selection-feedback line
 static lv_obj_t     *g_home_list;   // launcher app list
 static lv_obj_t     *g_app_view;    // current app screen (NULL when home)
@@ -69,11 +73,23 @@ static bool          g_lora_ok = false;
 static lv_obj_t     *g_lora_log;
 static lv_obj_t     *g_lora_input;
 static lv_timer_t   *g_lora_timer;
+static HangulIME     g_ime;             // 두벌식 한글 입력기
+static bool          g_kr_mode = false; // LoRa input: Korean vs English
+static String        g_lora_compose;    // committed Korean text (preview appended on display)
+static lv_obj_t     *g_kr_btn;          // Kor/Eng toggle button
+static lv_obj_t     *g_sd_list;
+static lv_obj_t     *g_sd_status;
+static bool          g_sd_ok;
+static String        g_sd_path = "/";
+static char          g_sd_names[50][96];
+static bool          g_sd_isdir[50];
+static int           g_sd_count;
 
 static void go_home();
 static void open_app(const char *name);
 static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g);
 static void back_event_cb(lv_event_t *e);
+static bool lora_kr_handle_key(uint32_t key);   // Korean IME for the LoRa input
 
 // ---------------------------------------------------------------------------
 // Backlight — the T-Deck dims the LED via a 16-step charge pump on BOARD_BL_PIN
@@ -136,23 +152,93 @@ static void touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 // Polled per read (one focus step per roll "tick"); any roll direction nudges
 // the vertical list, which feels forgiving on this tiny ball.
 // ---------------------------------------------------------------------------
+// Trackball:  up/down = focus navigation; center press on a slider engages it
+// (accent outline), then left/right adjusts its value; press again to release.
+// While engaged, up/down navigation is locked so you stay on the slider.
+// Axes kept separate (mixing caused "jumps backward"); quick opposite pulses
+// within TB_REVERSE_MS are dropped as cross-talk; vertical has accel (Settings).
+#define TB_REVERSE_MS  60
+static lv_obj_t *g_edit_slider = NULL;   // slider engaged for left/right adjust
+
 static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
-    static bool last_up = true, last_down = true, last_left = true, last_right = true;
-    int16_t diff = 0;
+    static bool     last_up = true, last_down = true, last_left = true, last_right = true;
+    static bool     last_pressed = false;
+    static int8_t   last_dir = 0,  last_hdir = 0;
+    static uint32_t last_ms  = 0,  last_hms  = 0;
 
+    lv_obj_t *foc = lv_group_get_focused(lv_group_get_default());
+    bool foc_slider = foc && lv_obj_check_type(foc, &lv_slider_class);
+
+    if (g_edit_slider && foc != g_edit_slider) {           // focus left -> auto-release
+        lv_obj_set_style_outline_width(g_edit_slider, 0, 0);
+        g_edit_slider = NULL;
+    }
+
+    // ---- center press: engage/release a slider, or activate a button ----
+    bool pressed    = (digitalRead(BOARD_BOOT_PIN) == LOW);
+    bool press_edge = pressed && !last_pressed;
+    last_pressed = pressed;
+
+    if (press_edge && foc_slider) {
+        if (g_edit_slider == foc) {                        // release
+            lv_obj_set_style_outline_width(foc, 0, 0);
+            g_edit_slider = NULL;
+            if (g_toast) lv_label_set_text(g_toast, "press ball to adjust slider");
+        } else {                                           // engage
+            g_edit_slider = foc;
+            lv_obj_set_style_outline_width(foc, 2, 0);
+            lv_obj_set_style_outline_color(foc, lv_color_hex(COL_ACCENT), 0);
+            lv_obj_set_style_outline_pad(foc, 2, 0);
+            if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_LEFT " " LV_SYMBOL_RIGHT " adjust  -  press to exit");
+        }
+        data->state = LV_INDEV_STATE_RELEASED;             // consume the press
+    } else {
+        data->state = (pressed && !foc_slider) ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+    }
+
+    // ---- vertical -> focus navigation (locked while a slider is engaged) ----
+    int8_t dir = 0;
     bool up = digitalRead(BOARD_TBOX_G01);
-    if (up != last_up)       { last_up = up;       diff -= 1; }
-    bool left = digitalRead(BOARD_TBOX_G04);
-    if (left != last_left)   { last_left = left;   diff -= 1; }
+    if (up != last_up)     { last_up = up;     dir = -1; }
     bool down = digitalRead(BOARD_TBOX_G03);
-    if (down != last_down)   { last_down = down;   diff += 1; }
-    bool right = digitalRead(BOARD_TBOX_G02);
-    if (right != last_right) { last_right = right; diff += 1; }
+    if (down != last_down) { last_down = down; dir = (dir != 0) ? 0 : +1; }
 
-    data->enc_diff = diff;
-    data->state = (digitalRead(BOARD_BOOT_PIN) == LOW) ? LV_INDEV_STATE_PRESSED
-                                                       : LV_INDEV_STATE_RELEASED;
+    int16_t diff = 0;
+    if (dir != 0) {
+        uint32_t now = millis();
+        uint32_t dt  = now - last_ms;
+        if (!(dir == -last_dir && dt < TB_REVERSE_MS)) {
+            int step = 1;
+            if (g_tb_accel > 0 && dt < 100)
+                step += (int)((long)g_tb_accel * (100 - (long)dt) / 100);
+            diff     = dir * step;
+            last_dir = dir;
+            last_ms  = now;
+        }
+    }
+    data->enc_diff = g_edit_slider ? 0 : diff;
+
+    // ---- horizontal -> adjust the engaged slider only ----
+    int8_t hdir = 0;
+    bool right = digitalRead(BOARD_TBOX_G02);
+    if (right != last_right) { last_right = right; hdir = +1; }
+    bool left = digitalRead(BOARD_TBOX_G04);
+    if (left != last_left)   { last_left = left;   hdir = (hdir != 0) ? 0 : -1; }
+
+    if (hdir != 0 && g_edit_slider) {
+        uint32_t now = millis();
+        if (!(hdir == -last_hdir && (now - last_hms) < TB_REVERSE_MS)) {
+            int32_t mn = lv_slider_get_min_value(g_edit_slider);
+            int32_t mx = lv_slider_get_max_value(g_edit_slider);
+            int32_t range = mx - mn;
+            int32_t hstep = (range > 25) ? range / 25 : 1;
+            lv_slider_set_value(g_edit_slider, lv_slider_get_value(g_edit_slider) + hdir * hstep, LV_ANIM_OFF);
+            lv_event_send(g_edit_slider, LV_EVENT_VALUE_CHANGED, NULL);
+            last_hdir = hdir;
+            last_hms  = now;
+        }
+    }
 }
 
 static void setup_trackball_indev()
@@ -193,6 +279,15 @@ static void keypad_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     static uint32_t last_key = 0;
     uint32_t key = keyboard_get_key();
     if (key != 0) {
+        // Korean IME: typing into the LoRa input in Korean mode goes through the
+        // jamo composer instead of inserting raw characters.
+        if (g_kr_mode && g_lora_input &&
+            lv_group_get_focused(lv_group_get_default()) == g_lora_input) {
+            lora_kr_handle_key(key);
+            data->key   = 0;
+            data->state = LV_INDEV_STATE_RELEASED;
+            return;
+        }
         if (key >= 32 && key < 127) {                     // printable -> echo + pass through
             if (g_toast) lv_label_set_text_fmt(g_toast, LV_SYMBOL_KEYBOARD " '%c'", (char)key);
         } else {
@@ -699,6 +794,7 @@ static void audio_init()
     i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL);
 
     i2s_pin_config_t pins = {};
+    pins.mck_io_num   = I2S_PIN_NO_CHANGE;   // ! don't route MCLK to GPIO0 (= trackball center)
     pins.bck_io_num   = BOARD_I2S_BCK;
     pins.ws_io_num    = BOARD_I2S_WS;
     pins.data_out_num = BOARD_I2S_DOUT;
@@ -869,8 +965,163 @@ static void lora_send(const char *text)
 static void lora_send_cb(lv_event_t *e)
 {
     if (!g_lora_input) return;
-    lora_send(lv_textarea_get_text(g_lora_input));
+    String msg;
+    if (g_kr_mode) {
+        g_lora_compose += g_ime.commit_all();
+        msg = g_lora_compose;
+        g_lora_compose = "";
+        g_ime.reset();
+    } else {
+        msg = lv_textarea_get_text(g_lora_input);
+    }
     lv_textarea_set_text(g_lora_input, "");
+    lora_send(msg.c_str());
+}
+
+// --- Korean input (두벌식 IME) for the LoRa message box ----------------------
+static void remove_last_utf8(String &s)
+{
+    int n = s.length();
+    if (n == 0) return;
+    do { n--; } while (n > 0 && ((uint8_t)s.charAt(n) & 0xC0) == 0x80);
+    s.remove(n);
+}
+
+static void lora_kr_update()
+{
+    if (g_lora_input) lv_textarea_set_text(g_lora_input, (g_lora_compose + g_ime.preview()).c_str());
+}
+
+static bool lora_kr_handle_key(uint32_t key)
+{
+    if ((key >= 'a' && key <= 'z') || (key >= 'A' && key <= 'Z')) {
+        bool shift = (key >= 'A' && key <= 'Z');
+        char q = shift ? (char)(key - 'A' + 'a') : (char)key;
+        uint16_t j = dubeolsik_lookup(q, shift);
+        if (j) g_lora_compose += g_ime.input_jamo(j);
+        lora_kr_update();
+        return true;
+    }
+    if (key == 8) {                                  // backspace: decompose, then delete
+        HangulIME::BackspaceResult r = g_ime.backspace();
+        if (r.remove_buffer_char) remove_last_utf8(g_lora_compose);
+        lora_kr_update();
+        return true;
+    }
+    if (key == 13) {                                 // enter -> commit + send
+        g_lora_compose += g_ime.commit_all();
+        String msg = g_lora_compose;
+        g_lora_compose = "";
+        g_ime.reset();
+        if (g_lora_input) lv_textarea_set_text(g_lora_input, "");
+        lora_send(msg.c_str());
+        return true;
+    }
+    g_lora_compose += g_ime.commit_all();            // any other key -> commit, then raw
+    if (key >= 32 && key < 127) g_lora_compose += (char)key;
+    lora_kr_update();
+    return true;
+}
+
+static void kr_toggle_cb(lv_event_t *e)
+{
+    g_lora_compose += g_ime.commit_all();            // commit in-progress syllable on switch
+    g_kr_mode = !g_kr_mode;
+    if (g_kr_btn) {
+        lv_obj_t *l = lv_obj_get_child(g_kr_btn, 0);
+        if (l) lv_label_set_text(l, g_kr_mode ? "Kor" : "Eng");
+    }
+    lora_kr_update();
+    if (g_lora_input) lv_group_focus_obj(g_lora_input);   // back to input, ready to type
+}
+
+// --- SD card file browser ----------------------------------------------------
+static bool sd_init()
+{
+    if (g_sd_ok) return true;
+    g_sd_ok = SD.begin(BOARD_SDCARD_CS, SPI, 800000U);   // shared SPI, 800 kHz
+    return g_sd_ok;
+}
+
+static void sd_show_dir();
+static void sd_show_dir_async(void *p) { sd_show_dir(); }
+
+static void sd_entry_clicked(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+    if (idx == -1) {                                     // ".." -> parent
+        int slash = g_sd_path.lastIndexOf('/');
+        g_sd_path = (slash <= 0) ? "/" : g_sd_path.substring(0, slash);
+        lv_async_call(sd_show_dir_async, NULL);
+        return;
+    }
+    if (idx < 0 || idx >= g_sd_count) return;
+    if (g_sd_isdir[idx]) {                               // enter folder
+        g_sd_path = g_sd_names[idx];
+        lv_async_call(sd_show_dir_async, NULL);
+    } else {                                             // file -> show size
+        File f = SD.open(g_sd_names[idx]);
+        if (f) {
+            String b = String(g_sd_names[idx]);
+            b = b.substring(b.lastIndexOf('/') + 1);
+            lv_label_set_text_fmt(g_sd_status, "%s  -  %u bytes", b.c_str(), (unsigned)f.size());
+            f.close();
+        }
+    }
+}
+
+static void sd_show_dir()
+{
+    if (!g_sd_list) return;
+    lv_obj_clean(g_sd_list);
+    g_sd_count = 0;
+    lv_group_t *grp = lv_group_get_default();
+    lv_label_set_text_fmt(g_sd_status, LV_SYMBOL_DIRECTORY " %s", g_sd_path.c_str());
+
+    if (g_sd_path != "/") {
+        lv_obj_t *up = lv_list_add_btn(g_sd_list, LV_SYMBOL_UP, "..");
+        lv_obj_set_style_text_color(up, lv_color_hex(COL_TEXT), 0);
+        lv_obj_set_style_bg_color(up, lv_color_hex(COL_SURFACE), 0);
+        lv_obj_set_style_bg_color(up, lv_color_hex(COL_ACCENT), LV_STATE_FOCUSED);
+        lv_obj_set_user_data(up, (void *)(intptr_t)(-1));
+        lv_obj_add_event_cb(up, sd_entry_clicked, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(grp, up);
+    }
+
+    File dir = SD.open(g_sd_path.c_str());
+    if (!dir || !dir.isDirectory()) {
+        if (dir) dir.close();
+        lv_label_set_text(g_sd_status, "cannot open dir");
+        return;
+    }
+    File entry = dir.openNextFile();
+    while (entry && g_sd_count < 50) {
+        String full = entry.name();
+        if (!full.startsWith("/"))
+            full = (g_sd_path == "/" ? String("/") : g_sd_path + "/") + full;
+        bool isdir = entry.isDirectory();
+        strncpy(g_sd_names[g_sd_count], full.c_str(), sizeof(g_sd_names[0]) - 1);
+        g_sd_names[g_sd_count][sizeof(g_sd_names[0]) - 1] = '\0';
+        g_sd_isdir[g_sd_count] = isdir;
+
+        String disp = full.substring(full.lastIndexOf('/') + 1);
+        char row[80];
+        if (isdir) snprintf(row, sizeof(row), "%s", disp.c_str());
+        else       snprintf(row, sizeof(row), "%s  (%u)", disp.c_str(), (unsigned)entry.size());
+        lv_obj_t *btn = lv_list_add_btn(g_sd_list, isdir ? LV_SYMBOL_DIRECTORY : LV_SYMBOL_FILE, row);
+        lv_obj_set_style_text_color(btn, lv_color_hex(COL_TEXT), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(COL_SURFACE), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(COL_ACCENT), LV_STATE_FOCUSED);
+        lv_obj_set_user_data(btn, (void *)(intptr_t)g_sd_count);
+        lv_obj_add_event_cb(btn, sd_entry_clicked, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(grp, btn);
+
+        g_sd_count++;
+        entry.close();
+        entry = dir.openNextFile();
+    }
+    dir.close();
+    if (g_sd_count == 0) lv_label_set_text_fmt(g_sd_status, "%s  (empty)", g_sd_path.c_str());
 }
 
 static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
@@ -920,6 +1171,19 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
             Preferences p; p.begin("tdeckos", false); p.putUChar("kbl", v); p.end();
         }, LV_EVENT_VALUE_CHANGED, NULL);
         lv_group_add_obj(g, kslider);
+
+        lv_obj_t *tlbl = lv_label_create(parent);
+        lv_label_set_text(tlbl, "Trackball accel  (0 = off)");
+        lv_obj_set_style_text_color(tlbl, lv_color_white(), 0);
+        lv_obj_t *tslider = lv_slider_create(parent);
+        lv_obj_set_width(tslider, 260);
+        lv_slider_set_range(tslider, 0, 5);
+        lv_slider_set_value(tslider, g_tb_accel, LV_ANIM_OFF);
+        lv_obj_add_event_cb(tslider, [](lv_event_t *e) {
+            g_tb_accel = (int)lv_slider_get_value(lv_event_get_target(e));
+            Preferences p; p.begin("tdeckos", false); p.putUChar("tbaccel", (uint8_t)g_tb_accel); p.end();
+        }, LV_EVENT_VALUE_CHANGED, NULL);
+        lv_group_add_obj(g, tslider);
     } else if (strcmp(name, "Wi-Fi") == 0) {
         WiFi.mode(WIFI_STA);
         WiFi.disconnect();
@@ -1051,23 +1315,59 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
             lv_textarea_set_text(g_lora_log, hdr);
         }
 
-        g_lora_input = lv_textarea_create(parent);
+        // bottom row: [ input (grow) | Kor | send-icon ] so the log keeps its height
+        lv_obj_t *row = lv_obj_create(parent);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_set_style_pad_column(row, 4, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+        g_lora_input = lv_textarea_create(row);
+        lv_obj_set_flex_grow(g_lora_input, 1);
         lv_textarea_set_one_line(g_lora_input, true);
         lv_textarea_set_placeholder_text(g_lora_input, "message");
-        lv_obj_set_width(g_lora_input, lv_pct(100));
         lv_obj_set_style_text_font(g_lora_input, &font_kr16, 0);
         lv_obj_add_event_cb(g_lora_input, lora_send_cb, LV_EVENT_READY, NULL);
         lv_group_add_obj(g, g_lora_input);
 
-        lv_obj_t *send = lv_btn_create(parent);
+        g_kr_btn = lv_btn_create(row);
+        lv_obj_t *kl = lv_label_create(g_kr_btn);
+        lv_label_set_text(kl, g_kr_mode ? "Kor" : "Eng");
+        lv_obj_add_event_cb(g_kr_btn, kr_toggle_cb, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, g_kr_btn);
+
+        lv_obj_t *send = lv_btn_create(row);
         lv_obj_t *sl = lv_label_create(send);
-        lv_label_set_text(sl, LV_SYMBOL_UPLOAD " Send");
+        lv_label_set_text(sl, LV_SYMBOL_UPLOAD);
         lv_obj_add_event_cb(send, lora_send_cb, LV_EVENT_CLICKED, NULL);
         lv_group_add_obj(g, send);
 
+        g_lora_compose = "";
+        g_ime.reset();
         if (!g_lora_timer) g_lora_timer = lv_timer_create(lora_poll, 50, NULL);
         lv_group_focus_obj(g_lora_input);
-        lv_label_set_text(g_toast, LV_SYMBOL_KEYBOARD " msg + Enter to send  -  touch Back");
+        lv_label_set_text(g_toast, LV_SYMBOL_KEYBOARD " type+Enter to send  -  Kor/Eng btn");
+    } else if (strcmp(name, "Files") == 0) {
+        g_sd_status = lv_label_create(parent);
+        lv_obj_set_style_text_color(g_sd_status, lv_color_white(), 0);
+        lv_label_set_text(g_sd_status, "mounting SD...");
+        g_sd_path = "/";
+
+        g_sd_list = lv_list_create(parent);
+        lv_obj_set_width(g_sd_list, lv_pct(100));
+        lv_obj_set_flex_grow(g_sd_list, 1);
+        lv_obj_set_style_bg_color(g_sd_list, lv_color_hex(COL_BG), 0);
+        lv_obj_set_style_border_width(g_sd_list, 0, 0);
+        lv_obj_set_style_pad_all(g_sd_list, 0, 0);
+
+        if (!sd_init()) lv_label_set_text(g_sd_status, "SD mount failed (no card?)");
+        else            sd_show_dir();
+
+        lv_label_set_text(g_toast, LV_SYMBOL_SD_CARD " browse  -  touch Back");
     } else {
         lv_obj_t *l = lv_label_create(parent);
         lv_obj_set_style_text_color(l, lv_color_hex(0xAAAAAA), 0);
@@ -1102,6 +1402,10 @@ static void go_home()
     g_browser_out = NULL;
     g_lora_log = NULL;
     g_lora_input = NULL;
+    g_kr_btn = NULL;
+    g_sd_list = NULL;
+    g_sd_status = NULL;
+    g_edit_slider = NULL;
     lv_obj_clear_flag(g_home_list, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(g_title, "T-Deck OS");
 
@@ -1194,6 +1498,7 @@ static void boot_restore()
     String pass = p.getString("pass", "");
     bool   bt   = p.getBool("bt", false);
     g_kb_bright = p.getUChar("kbl", 127);
+    g_tb_accel  = p.getUChar("tbaccel", 2);
     p.end();
 
     setKeyboardBrightness(g_kb_bright);   // keyboard backlight on at boot
