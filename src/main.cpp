@@ -20,6 +20,7 @@
 #include <BLEAdvertisedDevice.h>
 #include <Preferences.h>
 #include <driver/i2s.h>
+#include <RadioLib.h>
 #include <TFT_eSPI.h>
 #include <lvgl.h>
 #include "TouchDrvGT911.hpp"
@@ -31,6 +32,7 @@
 #define COL_ACCENT   0x3B82F6   // focus / highlights
 #define COL_TEXT     0xE6EDF3   // primary text
 #define COL_MUTED    0x7D8590   // secondary text
+#define RADIO_FREQ   922.0f     // matched to pager DX-LR02 (AT+HELP: Frequency 922000000hz, ch 90)
 
 static TFT_eSPI      tft;
 static TouchDrvGT911 touch;
@@ -60,6 +62,12 @@ static lv_obj_t     *g_url_input;
 static lv_obj_t     *g_browser_out;
 static lv_timer_t   *g_browser_timer;
 static bool          g_audio_inited;
+static SX1262        lora_radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
+static volatile bool g_lora_rx_flag = false;
+static bool          g_lora_ok = false;
+static lv_obj_t     *g_lora_log;
+static lv_obj_t     *g_lora_input;
+static lv_timer_t   *g_lora_timer;
 
 static void go_home();
 static void open_app(const char *name);
@@ -287,7 +295,7 @@ static void build_launcher_ui()
         { LV_SYMBOL_EDIT,     "Notes",             0xFB923C },
         { LV_SYMBOL_HOME,     "Browser",           0x22D3EE },
         { LV_SYMBOL_AUDIO,    "Speaker",           0xF472B6 },
-        { LV_SYMBOL_GPS,      "Meshtastic / LoRa", 0x34D399 },
+        { LV_SYMBOL_GPS,      "LoRa",              0x34D399 },
         { LV_SYMBOL_BELL,     "Messages",          0xFBBF24 },
         { LV_SYMBOL_WIFI,     "Wi-Fi",             0x3B82F6 },
         { LV_SYMBOL_BLUETOOTH,"Bluetooth",         0x60A5FA },
@@ -736,6 +744,121 @@ static void speaker_play_cb(lv_event_t *e)
     i2s_zero_dma_buffer(I2S_NUM_0);      // flush so no tone lingers after playback
 }
 
+// --- LoRa (SX1262) — pager-lora-qwerty interop -------------------------------
+// PHY matched to the pager's DX-LR02: SF12 / BW125 / CR4:6 / CRC-off / preamble 8.
+// App protocol: "[SOF]\n" <chunk>\n ... "[EOF]\n"; chunks <=60 UTF-8-safe bytes;
+// '\n' encoded as [NL]; sender prefix "[id] ". HB heartbeats are ignored on RX.
+#define LORA_MAX_CHUNK  60
+#define LORA_SENDER_ID  "tdeck"
+
+static String g_lora_rx_msg;
+static bool   g_lora_in_frame = false;
+
+static void IRAM_ATTR lora_set_rx_flag() { g_lora_rx_flag = true; }
+
+static void lora_log_print(const char *prefix, const String &msg)
+{
+    if (!g_lora_log) return;
+    lv_textarea_add_text(g_lora_log, prefix);
+    lv_textarea_add_text(g_lora_log, msg.c_str());
+    lv_textarea_add_text(g_lora_log, "\n");
+    lv_textarea_set_cursor_pos(g_lora_log, LV_TEXTAREA_CURSOR_LAST);
+}
+
+static void lora_emit_msg(String msg)
+{
+    msg.replace("[NL]", "\n");
+    if (msg.length()) lora_log_print("< ", msg);
+}
+
+static void lora_process_line(const String &line)
+{
+    if (line == "[SOF]") {
+        if (g_lora_in_frame && g_lora_rx_msg.length()) lora_emit_msg(g_lora_rx_msg);  // prev EOF lost
+        g_lora_rx_msg = "";
+        g_lora_in_frame = true;
+        return;
+    }
+    if (line == "[EOF]") {
+        g_lora_in_frame = false;
+        lora_emit_msg(g_lora_rx_msg);
+        g_lora_rx_msg = "";
+        return;
+    }
+    if (line == "HB" || line.startsWith("HB\t")) return;            // heartbeat — ignore
+    if (g_lora_in_frame) { g_lora_rx_msg += line; return; }
+    if (line == "AT" || line == "OK" || line.startsWith("AT+") ||   // AT artifacts
+        line.startsWith("EROOR") || line.startsWith("ERROR")) return;
+    lora_emit_msg(line);                                            // standalone line
+}
+
+static int lora_init()
+{
+    if (g_lora_ok) return RADIOLIB_ERR_NONE;
+    int st = lora_radio.begin(RADIO_FREQ, 125.0, 12, 6, RADIOLIB_SX126X_SYNC_WORD_PRIVATE, 22, 8, 1.6);
+    if (st == RADIOLIB_ERR_NONE) {
+        lora_radio.setCRC(false);                    // pager runs with CRC off
+        lora_radio.setDio2AsRfSwitch(true);          // T-Deck SX1262: DIO2 = TX/RX switch
+        lora_radio.setDio1Action(lora_set_rx_flag);
+        lora_radio.startReceive();
+        g_lora_ok = true;
+    }
+    return st;
+}
+
+static void lora_poll(lv_timer_t *t)
+{
+    if (!g_lora_rx_flag) return;
+    g_lora_rx_flag = false;
+    String pkt;
+    if (lora_radio.readData(pkt) == RADIOLIB_ERR_NONE && pkt.length()) {
+        int start = 0, len = pkt.length();           // split payload into newline-delimited lines
+        for (int i = 0; i <= len; i++) {
+            if (i == len || pkt[i] == '\n' || pkt[i] == '\r') {
+                if (i > start) lora_process_line(pkt.substring(start, i));
+                start = i + 1;
+            }
+        }
+    }
+    lora_radio.startReceive();
+}
+
+static void lora_tx_line(const String &payload) { lora_radio.transmit(payload.c_str()); }
+
+static void lora_send(const char *text)
+{
+    if (!g_lora_ok || !strlen(text)) return;
+    lora_log_print("> ", String(text));
+    lv_refr_now(NULL);                               // paint before the multi-second SF12 TX
+
+    String body = String("[") + LORA_SENDER_ID + "] " + text;
+    body.replace("\n", "[NL]");
+
+    lora_tx_line("[SOF]\n");
+    int n = body.length(), i = 0;
+    while (i < n) {                                  // UTF-8-safe <=60-byte chunks
+        int end = i, bytes = 0;
+        while (end < n) {
+            uint8_t b = (uint8_t)body[end];
+            int sz = ((b & 0xE0) == 0xC0) ? 2 : ((b & 0xF0) == 0xE0) ? 3 : ((b & 0xF8) == 0xF0) ? 4 : 1;
+            if (bytes + sz > LORA_MAX_CHUNK || end + sz > n) break;
+            bytes += sz; end += sz;
+        }
+        if (end == i) end = i + 1;
+        lora_tx_line(body.substring(i, end) + "\n");
+        i = end;
+    }
+    lora_tx_line("[EOF]\n");
+    lora_radio.startReceive();
+}
+
+static void lora_send_cb(lv_event_t *e)
+{
+    if (!g_lora_input) return;
+    lora_send(lv_textarea_get_text(g_lora_input));
+    lv_textarea_set_text(g_lora_input, "");
+}
+
 static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
 {
     if (strcmp(name, "About") == 0) {
@@ -898,6 +1021,38 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
             lv_group_add_obj(g, bt);
         }
         lv_label_set_text(g_toast, LV_SYMBOL_AUDIO " tap to play (brief freeze)");
+    } else if (strcmp(name, "LoRa") == 0) {
+        int st = lora_init();
+        g_lora_log = lv_textarea_create(parent);
+        lv_obj_set_width(g_lora_log, lv_pct(100));
+        lv_obj_set_flex_grow(g_lora_log, 1);
+        lv_obj_set_style_text_font(g_lora_log, &lv_font_montserrat_12, 0);
+        if (g_lora_ok) {
+            char hdr[64];
+            snprintf(hdr, sizeof(hdr), "LoRa %.1f MHz SF12 (pager) - listening\n", (double)RADIO_FREQ);
+            lv_textarea_set_text(g_lora_log, hdr);
+        } else {
+            char hdr[64];
+            snprintf(hdr, sizeof(hdr), "radio init failed (err %d)\n", st);
+            lv_textarea_set_text(g_lora_log, hdr);
+        }
+
+        g_lora_input = lv_textarea_create(parent);
+        lv_textarea_set_one_line(g_lora_input, true);
+        lv_textarea_set_placeholder_text(g_lora_input, "message");
+        lv_obj_set_width(g_lora_input, lv_pct(100));
+        lv_obj_add_event_cb(g_lora_input, lora_send_cb, LV_EVENT_READY, NULL);
+        lv_group_add_obj(g, g_lora_input);
+
+        lv_obj_t *send = lv_btn_create(parent);
+        lv_obj_t *sl = lv_label_create(send);
+        lv_label_set_text(sl, LV_SYMBOL_UPLOAD " Send");
+        lv_obj_add_event_cb(send, lora_send_cb, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, send);
+
+        if (!g_lora_timer) g_lora_timer = lv_timer_create(lora_poll, 50, NULL);
+        lv_group_focus_obj(g_lora_input);
+        lv_label_set_text(g_toast, LV_SYMBOL_KEYBOARD " msg + Enter to send  -  touch Back");
     } else {
         lv_obj_t *l = lv_label_create(parent);
         lv_obj_set_style_text_color(l, lv_color_hex(0xAAAAAA), 0);
@@ -911,6 +1066,7 @@ static void go_home()
     if (g_wifi_conn_timer) { lv_timer_del(g_wifi_conn_timer); g_wifi_conn_timer = NULL; }
     if (g_bt_scan_timer)   { lv_timer_del(g_bt_scan_timer);   g_bt_scan_timer = NULL; }
     if (g_browser_timer)   { lv_timer_del(g_browser_timer);   g_browser_timer = NULL; }
+    if (g_lora_timer)      { lv_timer_del(g_lora_timer);      g_lora_timer = NULL; }
     if (g_notes_ta) {                                  // auto-save notes on leave
         Preferences p;
         p.begin("tdeckos", false);
@@ -929,6 +1085,8 @@ static void go_home()
     g_notes_ta = NULL;
     g_url_input = NULL;
     g_browser_out = NULL;
+    g_lora_log = NULL;
+    g_lora_input = NULL;
     lv_obj_clear_flag(g_home_list, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(g_title, "T-Deck OS");
 
@@ -1041,6 +1199,7 @@ void setup()
 {
     Serial.begin(115200);
     Serial.println("T-Deck OS booting...");
+    disableLoopWDT();   // allow multi-second blocking ops (SF12 LoRa TX, BLE scan) without WDT reset
 
     // Peripheral power rail MUST be high before touching any peripheral
     pinMode(BOARD_POWERON, OUTPUT);

@@ -50,7 +50,7 @@ esptool v5는 USB-Serial-JTAG로 다운로드 모드에 **자동 진입**한다 
 - [x] Notes 앱 (NVS 저장) + 클럼지 웹브라우저 (HTTP(S) 텍스트, 태그 스트립)
 - [x] 키보드 백라이트 제어 (I2C 0x55, Settings 슬라이더, NVS)
 - [x] Speaker 테스트 앱 (I2S 톤: Beep / Sweep / Melody)
-- [ ] LoRa(SX1262) 메시징 — 안테나 없어 파킹
+- [x] LoRa(SX1262) 메시징 — pager(DX-LR02) **양방향 상호운용** (922MHz / SF12 / `[SOF]`·`[EOF]` 프로토콜)
 
 ## 출처
 부팅 시퀀스·핀맵·라이브러리는 LilyGO 공식 repo 기반:
