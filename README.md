@@ -61,3 +61,6 @@ https://github.com/Xinyuan-LilyGO/T-Deck
 - Launcher: https://bmorcelli.github.io/Launcher/
 - Meshtastic UI: https://flasher.meshtastic.org/
 - Bruce: https://bruce.computer/flasher
+
+## License
+MIT — see [LICENSE](LICENSE). 단, `lib/`의 vendored 라이브러리(lvgl, TFT_eSPI, SensorsLib)는 각자의 라이선스(대부분 MIT)를 따름.
