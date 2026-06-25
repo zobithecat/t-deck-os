@@ -33,6 +33,7 @@
 #define COL_TEXT     0xE6EDF3   // primary text
 #define COL_MUTED    0x7D8590   // secondary text
 #define RADIO_FREQ   922.0f     // matched to pager DX-LR02 (AT+HELP: Frequency 922000000hz, ch 90)
+LV_FONT_DECLARE(font_kr16);     // Korean font (NanumGothic 16px) — for LoRa messages
 
 static TFT_eSPI      tft;
 static TouchDrvGT911 touch;
@@ -785,7 +786,20 @@ static void lora_process_line(const String &line)
         g_lora_rx_msg = "";
         return;
     }
-    if (line == "HB" || line.startsWith("HB\t")) return;            // heartbeat — ignore
+    if (line == "HB" || line.startsWith("HB\t")) {                  // heartbeat beacon
+        String id = "?", rssi = "";
+        int p1 = line.indexOf('\t');
+        if (p1 >= 0) {
+            int p2 = line.indexOf('\t', p1 + 1);
+            id = (p2 < 0) ? line.substring(p1 + 1) : line.substring(p1 + 1, p2);
+            if (p2 >= 0) {
+                String tail = line.substring(p2 + 1);
+                if (tail.startsWith("rssi=")) rssi = " " + tail.substring(5) + "dBm";
+            }
+        }
+        lora_log_print("~ ", id + " beacon" + rssi);
+        return;
+    }
     if (g_lora_in_frame) { g_lora_rx_msg += line; return; }
     if (line == "AT" || line == "OK" || line.startsWith("AT+") ||   // AT artifacts
         line.startsWith("EROOR") || line.startsWith("ERROR")) return;
@@ -1026,7 +1040,7 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         g_lora_log = lv_textarea_create(parent);
         lv_obj_set_width(g_lora_log, lv_pct(100));
         lv_obj_set_flex_grow(g_lora_log, 1);
-        lv_obj_set_style_text_font(g_lora_log, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_font(g_lora_log, &font_kr16, 0);   // Korean-capable
         if (g_lora_ok) {
             char hdr[64];
             snprintf(hdr, sizeof(hdr), "LoRa %.1f MHz SF12 (pager) - listening\n", (double)RADIO_FREQ);
@@ -1041,6 +1055,7 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lv_textarea_set_one_line(g_lora_input, true);
         lv_textarea_set_placeholder_text(g_lora_input, "message");
         lv_obj_set_width(g_lora_input, lv_pct(100));
+        lv_obj_set_style_text_font(g_lora_input, &font_kr16, 0);
         lv_obj_add_event_cb(g_lora_input, lora_send_cb, LV_EVENT_READY, NULL);
         lv_group_add_obj(g, g_lora_input);
 
