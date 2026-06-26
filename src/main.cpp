@@ -85,6 +85,7 @@ static lv_timer_t   *g_rng_poll, *g_rng_tx;
 static uint32_t      g_rng_seq;
 static int           g_rng_rx, g_rng_miss, g_rng_rmin, g_rng_rmax, g_rng_rcount;
 static long          g_rng_rsum, g_rng_last_seq;
+static bool          g_rng_acked;   // 직전에 보낸 PING이 PONG으로 응답받았나 (loss 판정용)
 static String        g_sd_path = "/";
 static char          g_sd_names[50][96];
 static bool          g_sd_isdir[50];
@@ -1240,12 +1241,14 @@ static void range_log_sd(const String &line)
 
 static void range_update_stats()
 {
-    int total = g_rng_rx + g_rng_miss;
-    int loss  = total ? (g_rng_miss * 100 / total) : 0;
-    int avg   = g_rng_rcount ? (int)(g_rng_rsum / g_rng_rcount) : 0;
+    // loss는 "보낸 PING 중 PONG 못 받은 비율". 받은 패킷 갭이 아니라 송신 기준이라
+    // pager가 아예 응답 안 해도 loss가 제대로 올라간다.
+    int sent = (int)g_rng_seq;
+    int loss = sent ? (g_rng_miss * 100 / sent) : 0;
+    int avg  = g_rng_rcount ? (int)(g_rng_rsum / g_rng_rcount) : 0;
     if (g_rng_stats)
-        lv_label_set_text_fmt(g_rng_stats, "rx %d  miss %d  loss %d%%\nrssi  %d / %d / %d  (min/avg/max)",
-                              g_rng_rx, g_rng_miss, loss,
+        lv_label_set_text_fmt(g_rng_stats, "tx %d  rx %d  miss %d  loss %d%%\nrssi  %d / %d / %d  (min/avg/max)",
+                              sent, g_rng_rx, g_rng_miss, loss,
                               g_rng_rcount ? g_rng_rmin : 0, avg, g_rng_rcount ? g_rng_rmax : 0);
 }
 
@@ -1267,12 +1270,14 @@ static void range_poll_cb(lv_timer_t *t)
     int nl = pkt.indexOf('\n'); if (nl >= 0) first = pkt.substring(0, nl);
     first.trim();
     long seq = -1;
-    if (first.startsWith("PING\t") || first.startsWith("PONG\t")) {  // numbered -> gap detection
+    if (first.startsWith("PING\t") || first.startsWith("PONG\t")) {
         int p2 = first.indexOf('\t', 5);
         seq = (p2 > 0 ? first.substring(5, p2) : first.substring(5)).toInt();
-        if (g_rng_last_seq >= 0 && seq > g_rng_last_seq + 1)
-            g_rng_miss += (int)(seq - g_rng_last_seq - 1);
         g_rng_last_seq = seq;
+        // 우리가 방금 보낸 PING(seq = g_rng_seq-1)에 대한 PONG이면 응답받은 것 →
+        // range_tx_cb가 다음 송신 때 loss로 세지 않는다.
+        if (first.startsWith("PONG\t") && seq == (long)g_rng_seq - 1)
+            g_rng_acked = true;
     }
 
     if (g_rng_rssi) lv_label_set_text_fmt(g_rng_rssi, "RSSI %d dBm   SNR %.1f", rssi, snr);
@@ -1296,6 +1301,15 @@ static void range_poll_cb(lv_timer_t *t)
 
 static void range_tx_cb(lv_timer_t *t)
 {
+    // 새 PING 보내기 전에 직전 PING을 판정: PONG으로 응답 못 받았으면 loss.
+    // (이게 핵심 — pager가 아예 응답 안 하면 range_poll_cb가 안 돌아서, 여기서
+    //  TX 시점에 세지 않으면 loss가 영영 안 올라간다.)
+    if (g_rng_seq > 0 && !g_rng_acked) {
+        g_rng_miss++;
+        range_update_stats();
+    }
+    g_rng_acked = false;                                    // 새 PING은 아직 미응답
+
     char buf[40];
     snprintf(buf, sizeof(buf), "PING\t%lu\t%s\n", (unsigned long)g_rng_seq, LORA_SENDER_ID);
     lora_radio.transmit(buf);                               // blocking ~1-2 s at SF12
@@ -1547,6 +1561,7 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lora_init();
         g_rng_rx = g_rng_miss = g_rng_rcount = 0;
         g_rng_rsum = 0; g_rng_last_seq = -1; g_rng_seq = 0;
+        g_rng_acked = false;
 
         g_rng_rssi = lv_label_create(parent);
         lv_obj_set_style_text_font(g_rng_rssi, &lv_font_montserrat_16, 0);
@@ -1555,7 +1570,7 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
 
         g_rng_stats = lv_label_create(parent);
         lv_obj_set_style_text_color(g_rng_stats, lv_color_white(), 0);
-        lv_label_set_text(g_rng_stats, "rx 0  miss 0  loss 0%");
+        lv_label_set_text(g_rng_stats, "tx 0  rx 0  miss 0  loss 0%");
 
         g_rng_log = lv_textarea_create(parent);
         lv_obj_set_width(g_rng_log, lv_pct(100));
