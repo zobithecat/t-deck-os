@@ -21,6 +21,7 @@
 #include <Preferences.h>
 #include <driver/i2s.h>
 #include <RadioLib.h>
+#include <TinyGPS++.h>
 #include <SD.h>
 #include <TFT_eSPI.h>
 #include <lvgl.h>
@@ -86,6 +87,17 @@ static uint32_t      g_rng_seq;
 static int           g_rng_rx, g_rng_miss, g_rng_rmin, g_rng_rmax, g_rng_rcount;
 static long          g_rng_rsum, g_rng_last_seq;
 static bool          g_rng_acked;   // 직전에 보낸 PING이 PONG으로 응답받았나 (loss 판정용)
+
+// ---- GPS (T-Deck Plus on Serial1 / GPIO44 RX, 43 TX) ----
+// The Plus ships with EITHER a u-blox M10 OR a Quectel L76K (both NMEA, both 9600
+// default). A module previously configured by other firmware (e.g. Meshtastic) may
+// be saved at 38400, so we auto-detect the baud instead of hard-coding 9600.
+static TinyGPSPlus   g_gps;
+static lv_obj_t     *g_gps_fix, *g_gps_coord, *g_gps_det, *g_gps_time;
+static lv_timer_t   *g_gps_ui;
+static const uint32_t GPS_BAUDS[] = { 9600, 38400, 115200, 4800 };
+static uint8_t       g_gps_baud_idx = 0;
+static bool          g_gps_locked   = false;
 static String        g_sd_path = "/";
 static char          g_sd_names[50][96];
 static bool          g_sd_isdir[50];
@@ -415,6 +427,7 @@ static void build_launcher_ui()
         { LV_SYMBOL_AUDIO,    "Speaker",           0xF472B6 },
         { LV_SYMBOL_GPS,      "LoRa",              0x34D399 },
         { LV_SYMBOL_UP,       "Range",             0xFBBF24 },
+        { LV_SYMBOL_GPS,      "GPS",               0xF87171 },
         { LV_SYMBOL_BELL,     "Messages",          0xFBBF24 },
         { LV_SYMBOL_WIFI,     "Wi-Fi",             0x3B82F6 },
         { LV_SYMBOL_BLUETOOTH,"Bluetooth",         0x60A5FA },
@@ -1330,6 +1343,70 @@ static void range_tx_toggle_cb(lv_event_t *e)
     if (l) lv_label_set_text(l, g_rng_tx ? "TX beacon: ON" : "TX beacon: off");
 }
 
+// ===================== GPS (u-blox M10 on Serial1) =====================
+// Drain the UART every loop() so the 1 Hz NMEA burst (~500 B) never overflows.
+static void gps_feed()
+{
+    while (Serial1.available()) g_gps.encode((char)Serial1.read());
+}
+
+// Auto-detect the GPS baud (u-blox vs L76K vs a module left at a non-default rate).
+// As soon as ONE NMEA sentence passes checksum we lock; otherwise cycle bauds every
+// ~4 s. Runs always (created in setup), independent of which app is open.
+static void gps_probe_cb(lv_timer_t *t)
+{
+    if (g_gps_locked) return;
+    if (g_gps.passedChecksum() > 0) {            // valid NMEA at this baud -> lock in
+        g_gps_locked = true;
+        Serial.printf("GPS locked @%lu baud\n", (unsigned long)GPS_BAUDS[g_gps_baud_idx]);
+        return;
+    }
+    static uint8_t ticks = 0;
+    if (++ticks >= 4) {                          // timer is 1 s -> ~4 s per baud
+        ticks = 0;
+        g_gps_baud_idx = (g_gps_baud_idx + 1) % (sizeof(GPS_BAUDS) / sizeof(GPS_BAUDS[0]));
+        Serial1.updateBaudRate(GPS_BAUDS[g_gps_baud_idx]);
+        Serial.printf("GPS no NMEA - retry @%lu baud\n", (unsigned long)GPS_BAUDS[g_gps_baud_idx]);
+    }
+}
+
+// Refresh the GPS app labels from the parser. Runs only while the app is open.
+static void gps_ui_poll(lv_timer_t *t)
+{
+    if (!g_gps_fix) return;                       // GPS app not open
+
+    bool fix  = g_gps.location.isValid() && g_gps.location.age() < 5000;
+    int  sats = g_gps.satellites.isValid() ? (int)g_gps.satellites.value() : 0;
+
+    if (fix) {
+        lv_label_set_text_fmt(g_gps_fix, LV_SYMBOL_GPS "  fix   %d sats", sats);
+        lv_obj_set_style_text_color(g_gps_fix, lv_color_hex(0x4ADE80), 0);
+        lv_label_set_text_fmt(g_gps_coord, "%.6f, %.6f", g_gps.location.lat(), g_gps.location.lng());
+        lv_obj_set_style_text_color(g_gps_coord, lv_color_white(), 0);
+    } else {
+        lv_label_set_text_fmt(g_gps_fix, LV_SYMBOL_GPS "  searching... %d sats / %lu B @%lu",
+                              sats, (unsigned long)g_gps.charsProcessed(),
+                              (unsigned long)GPS_BAUDS[g_gps_baud_idx]);
+        lv_obj_set_style_text_color(g_gps_fix, lv_color_hex(0xFBBF24), 0);
+        // byte count climbing = data OK (fix pending); stuck near 0 = wiring/power
+        lv_label_set_text(g_gps_coord, g_gps.charsProcessed() > 10
+                          ? "--.------, ---.------  (acquiring)"
+                          : "no NMEA bytes - check GPS power/pins");
+        lv_obj_set_style_text_color(g_gps_coord, lv_color_hex(0x9CA3AF), 0);
+    }
+
+    lv_label_set_text_fmt(g_gps_det, "alt %.0f m   spd %.1f km/h   hdop %.1f",
+                          g_gps.altitude.isValid() ? g_gps.altitude.meters() : 0.0,
+                          g_gps.speed.isValid()    ? g_gps.speed.kmph()      : 0.0,
+                          g_gps.hdop.isValid()     ? g_gps.hdop.hdop()       : 0.0);
+
+    if (g_gps.time.isValid())
+        lv_label_set_text_fmt(g_gps_time, "UTC %02d:%02d:%02d", g_gps.time.hour(),
+                              g_gps.time.minute(), g_gps.time.second());
+    else
+        lv_label_set_text(g_gps_time, "UTC --");
+}
+
 static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
 {
     if (strcmp(name, "About") == 0) {
@@ -1586,6 +1663,26 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
 
         if (!g_rng_poll) g_rng_poll = lv_timer_create(range_poll_cb, 50, NULL);
         lv_label_set_text(g_toast, LV_SYMBOL_UP " RSSI / loss test  -  log to SD");
+    } else if (strcmp(name, "GPS") == 0) {
+        g_gps_fix = lv_label_create(parent);
+        lv_obj_set_style_text_font(g_gps_fix, &lv_font_montserrat_16, 0);
+        lv_label_set_text(g_gps_fix, LV_SYMBOL_GPS "  starting...");
+
+        g_gps_coord = lv_label_create(parent);
+        lv_obj_set_style_text_font(g_gps_coord, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(g_gps_coord, lv_color_white(), 0);
+        lv_label_set_text(g_gps_coord, "--.------, ---.------");
+
+        g_gps_det = lv_label_create(parent);
+        lv_obj_set_style_text_color(g_gps_det, lv_color_hex(0xAAAAAA), 0);
+        lv_label_set_text(g_gps_det, "alt --   spd --   hdop --");
+
+        g_gps_time = lv_label_create(parent);
+        lv_obj_set_style_text_color(g_gps_time, lv_color_hex(0xAAAAAA), 0);
+        lv_label_set_text(g_gps_time, "UTC --");
+
+        if (!g_gps_ui) g_gps_ui = lv_timer_create(gps_ui_poll, 250, NULL);
+        lv_label_set_text(g_toast, LV_SYMBOL_GPS " u-blox M10  -  outdoors for first fix");
     } else if (strcmp(name, "Files") == 0) {
         g_sd_path = "/";
         sd_build_list();
@@ -1605,6 +1702,7 @@ static void go_home()
     if (g_lora_timer)      { lv_timer_del(g_lora_timer);      g_lora_timer = NULL; }
     if (g_rng_poll)        { lv_timer_del(g_rng_poll);        g_rng_poll = NULL; }
     if (g_rng_tx)          { lv_timer_del(g_rng_tx);          g_rng_tx = NULL; }
+    if (g_gps_ui)          { lv_timer_del(g_gps_ui);          g_gps_ui = NULL; }
     if (g_notes_ta) {                                  // auto-save notes on leave
         Preferences p;
         p.begin("tdeckos", false);
@@ -1630,6 +1728,7 @@ static void go_home()
     g_sd_status = NULL;
     g_sd_view_ta = NULL;
     g_rng_rssi = NULL; g_rng_stats = NULL; g_rng_log = NULL;
+    g_gps_fix = NULL; g_gps_coord = NULL; g_gps_det = NULL; g_gps_time = NULL;
     g_edit_slider = NULL;
     lv_obj_clear_flag(g_home_list, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(g_title, "T-Deck OS");
@@ -1750,6 +1849,14 @@ void setup()
     pinMode(BOARD_POWERON, OUTPUT);
     digitalWrite(BOARD_POWERON, HIGH);
 
+    // GPS UART1. Big RX buffer so the 1 Hz NMEA burst survives even if a long
+    // LVGL/LoRa op delays the next gps_feed(). Baud is auto-detected (gps_probe_cb,
+    // started after LVGL init below), beginning at GPS_BAUDS[0].
+    Serial1.setRxBufferSize(2048);
+    Serial1.begin(GPS_BAUDS[0], SERIAL_8N1, BOARD_GPS_RX_PIN, BOARD_GPS_TX_PIN);
+    Serial.printf("GPS UART @%lu  rx=GPIO%d tx=GPIO%d\n",
+                  (unsigned long)GPS_BAUDS[0], BOARD_GPS_RX_PIN, BOARD_GPS_TX_PIN);
+
     // Park every SPI chip-select high before bringing the bus up
     pinMode(BOARD_SDCARD_CS, OUTPUT); digitalWrite(BOARD_SDCARD_CS, HIGH);
     pinMode(RADIO_CS_PIN,    OUTPUT); digitalWrite(RADIO_CS_PIN,    HIGH);
@@ -1788,6 +1895,7 @@ void setup()
     setup_trackball_indev();
     setup_keyboard_indev();
     lv_timer_create(status_update_cb, 1000, NULL);
+    lv_timer_create(gps_probe_cb, 1000, NULL);   // auto-detect GPS baud (u-blox/L76K)
     boot_restore();   // auto-reconnect saved Wi-Fi + restore BT state
 
     pinMode(BOARD_BL_PIN, OUTPUT);
@@ -1799,5 +1907,6 @@ void setup()
 void loop()
 {
     lv_timer_handler();
+    gps_feed();        // keep the NMEA parser fed regardless of which app is open
     delay(5);
 }

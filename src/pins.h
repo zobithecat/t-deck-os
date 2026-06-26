@@ -53,3 +53,9 @@
 #define BOARD_BOOT_PIN      0
 
 #define BOARD_BL_PIN        42
+
+// GPS (T-Deck Plus, u-blox MIA-M10Q on the Grove header). Native USB frees UART0,
+// so the GPS uses GPIO43/44. ESP RX=44 (from GPS TX), ESP TX=43 (to GPS RX).
+#define BOARD_GPS_RX_PIN    44   // ESP receives NMEA here
+#define BOARD_GPS_TX_PIN    43   // ESP sends to GPS here (config; usually unused)
+#define BOARD_GPS_BAUD      9600 // u-blox M10 default NMEA baud
