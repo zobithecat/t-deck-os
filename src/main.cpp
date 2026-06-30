@@ -22,6 +22,10 @@
 #include <driver/i2s.h>
 #include <RadioLib.h>
 #include <TinyGPS++.h>
+
+#include "lora_rf.h"           // shared LoRa PHY params (freq/SF/BW/CR/sync/CRC)
+#define NODE_ID "TFF"          // relay-layer node id (T-Deck). See RELAY_PROTOCOL.md
+#include "relay.h"
 #include <SD.h>
 #include <TFT_eSPI.h>
 #include <lvgl.h>
@@ -36,7 +40,7 @@
 #define COL_ACCENT   0x3B82F6   // focus / highlights
 #define COL_TEXT     0xE6EDF3   // primary text
 #define COL_MUTED    0x7D8590   // secondary text
-#define RADIO_FREQ   922.0f     // matched to pager DX-LR02 (AT+HELP: Frequency 922000000hz, ch 90)
+#define RADIO_FREQ   RF_FREQ_MHZ   // see lora_rf.h (922 MHz, DX-LR02 ch 90)
 LV_FONT_DECLARE(font_kr16);     // Korean font (NanumGothic 16px) — for LoRa messages
 
 static TFT_eSPI      tft;
@@ -44,6 +48,7 @@ static TouchDrvGT911 touch;
 static int16_t       tp_x[5], tp_y[5];
 static lv_indev_t   *enc_indev;     // trackball (encoder)
 static int           g_tb_accel = 2;     // trackball scroll accel level 0..5 (Settings / NVS)
+static uint8_t       g_beep_vol = 7;     // incoming-message beep volume 0..10 (0=mute; Settings/NVS)
 static lv_obj_t     *g_toast;       // bottom status / selection-feedback line
 static lv_obj_t     *g_home_list;   // launcher app list
 static lv_obj_t     *g_app_view;    // current app screen (NULL when home)
@@ -73,7 +78,9 @@ static volatile bool g_lora_rx_flag = false;
 static bool          g_lora_ok = false;
 static lv_obj_t     *g_lora_log;
 static lv_obj_t     *g_lora_input;
-static lv_timer_t   *g_lora_timer;
+static String        g_lora_history;          // persistent RX/TX log (survives app close)
+static volatile int  g_lora_unread = 0;       // messages received while LoRa app was closed
+static volatile bool g_range_active = false;  // Range app owns the radio when true
 static HangulIME     g_ime;             // 두벌식 한글 입력기
 static bool          g_kr_mode = false; // LoRa input: Korean vs English
 static String        g_lora_compose;    // committed Korean text (preview appended on display)
@@ -93,11 +100,17 @@ static bool          g_rng_acked;   // 직전에 보낸 PING이 PONG으로 응�
 // default). A module previously configured by other firmware (e.g. Meshtastic) may
 // be saved at 38400, so we auto-detect the baud instead of hard-coding 9600.
 static TinyGPSPlus   g_gps;
-static lv_obj_t     *g_gps_fix, *g_gps_coord, *g_gps_det, *g_gps_time;
+static lv_obj_t     *g_gps_fix, *g_gps_coord, *g_gps_det, *g_gps_time, *g_gps_wifi;
 static lv_timer_t   *g_gps_ui;
 static const uint32_t GPS_BAUDS[] = { 9600, 38400, 115200, 4800 };
 static uint8_t       g_gps_baud_idx = 0;
 static bool          g_gps_locked   = false;
+
+// WiFi/IP coarse location (A-GPS-like seed shown before a GPS fix). ip-api.com,
+// free, no API key. Cached once fetched; the GPS app's button forces a refresh.
+static bool          g_ipgeo_ok = false, g_ipgeo_pending = false, g_ipgeo_tried = false;
+static double        g_ipgeo_lat = 0, g_ipgeo_lon = 0;
+static String        g_ipgeo_city;
 static String        g_sd_path = "/";
 static char          g_sd_names[50][96];
 static bool          g_sd_isdir[50];
@@ -839,7 +852,7 @@ static void audio_init()
     g_audio_inited = true;
 }
 
-static void play_tone(int freq, int ms)
+static void play_tone(int freq, int ms, int amp = 12000)
 {
     const int sr = 16000;
     int total = (int)((long)sr * ms / 1000);
@@ -850,7 +863,7 @@ static void play_tone(int freq, int ms)
     while (done < total) {
         int n = (total - done < 256) ? (total - done) : 256;
         for (int i = 0; i < n; i++) {
-            buf[i] = (int16_t)(sin(phase) * 12000.0);
+            buf[i] = (int16_t)(sin(phase) * (double)amp);
             phase += step;
             if (phase >= TWO_PI) phase -= TWO_PI;
         }
@@ -877,12 +890,24 @@ static void speaker_play_cb(lv_event_t *e)
     i2s_zero_dma_buffer(I2S_NUM_0);      // flush so no tone lingers after playback
 }
 
+// Short rising two-tone "ding-dong" for an incoming LoRa message. 0 = mute.
+// Blocks ~210 ms (called from the main loop on message RX) — fine for infrequent msgs.
+static void beep_notify()
+{
+    if (g_beep_vol == 0) return;
+    audio_init();
+    int amp = 1200 * g_beep_vol;         // 0..12000 (vol 10 = full scale)
+    play_tone(1568, 90,  amp);           // G6
+    play_tone(2093, 120, amp);           // C7
+    i2s_zero_dma_buffer(I2S_NUM_0);
+}
+
 // --- LoRa (SX1262) — pager-lora-qwerty interop -------------------------------
 // PHY matched to the pager's DX-LR02: SF12 / BW125 / CR4:6 / CRC-off / preamble 8.
 // App protocol: "[SOF]\n" <chunk>\n ... "[EOF]\n"; chunks <=60 UTF-8-safe bytes;
 // '\n' encoded as [NL]; sender prefix "[id] ". HB heartbeats are ignored on RX.
 #define LORA_MAX_CHUNK  60
-#define LORA_SENDER_ID  "tdeck"
+#define LORA_SENDER_ID  NODE_ID    // unified: display prefix + HB/PING id = relay id
 
 static String g_lora_rx_msg;
 static bool   g_lora_in_frame = false;
@@ -891,11 +916,20 @@ static void IRAM_ATTR lora_set_rx_flag() { g_lora_rx_flag = true; }
 
 static void lora_log_print(const char *prefix, const String &msg)
 {
-    if (!g_lora_log) return;
-    lv_textarea_add_text(g_lora_log, prefix);
-    lv_textarea_add_text(g_lora_log, msg.c_str());
-    lv_textarea_add_text(g_lora_log, "\n");
-    lv_textarea_set_cursor_pos(g_lora_log, LV_TEXTAREA_CURSOR_LAST);
+    if (prefix[0] != '~') {                       // persist messages (not HB beacons)
+        g_lora_history += prefix; g_lora_history += msg; g_lora_history += "\n";
+        if (g_lora_history.length() > 3000)
+            g_lora_history.remove(0, g_lora_history.length() - 3000);
+    }
+    if (g_lora_log) {
+        lv_textarea_add_text(g_lora_log, prefix);
+        lv_textarea_add_text(g_lora_log, msg.c_str());
+        lv_textarea_add_text(g_lora_log, "\n");
+        lv_textarea_set_cursor_pos(g_lora_log, LV_TEXTAREA_CURSOR_LAST);
+    } else if (prefix[0] == '<') {                 // a real message arrived in the background
+        g_lora_unread++;
+    }
+    if (prefix[0] == '<') beep_notify();           // audible alert on any incoming message
 }
 
 static void lora_emit_msg(String msg)
@@ -938,12 +972,29 @@ static void lora_process_line(const String &line)
     lora_emit_msg(line);                                            // standalone line
 }
 
+static RelaySeen g_relay_seen;
+// Relay layer in front of the message parser: strip the R| header, drop our own
+// echoes (src==NODE_ID) and duplicates (a packet that arrived both directly and
+// relayed), then hand the original line to lora_process_line. Untagged (legacy)
+// lines pass straight through.
+static void lora_rx_dispatch(const String &line)
+{
+    String src, orig; uint32_t pktid; uint8_t ttl;
+    if (relay_parse(line, src, pktid, ttl, orig)) {
+        if (src == NODE_ID) return;
+        if (relay_seen(g_relay_seen, src, pktid)) return;
+        lora_process_line(orig);
+    } else {
+        lora_process_line(line);
+    }
+}
+
 static int lora_init()
 {
     if (g_lora_ok) return RADIOLIB_ERR_NONE;
-    int st = lora_radio.begin(RADIO_FREQ, 125.0, 12, 6, RADIOLIB_SX126X_SYNC_WORD_PRIVATE, 22, 8, 1.6);
+    int st = lora_radio.begin(RF_FREQ_MHZ, RF_BW_KHZ, RF_SF, RF_CR_DENOM, RF_SYNC_WORD, RF_TX_DBM, RF_PREAMBLE, 1.6);
     if (st == RADIOLIB_ERR_NONE) {
-        lora_radio.setCRC(false);                    // pager runs with CRC off
+        lora_radio.setCRC(RF_CRC_ON);                // CRC off — matches DX-LR02 (lora_rf.h)
         lora_radio.setDio2AsRfSwitch(true);          // T-Deck SX1262: DIO2 = TX/RX switch
         lora_radio.setDio1Action(lora_set_rx_flag);
         lora_radio.startReceive();
@@ -952,8 +1003,9 @@ static int lora_init()
     return st;
 }
 
-static void lora_poll(lv_timer_t *t)
+static void lora_service()            // always-on background RX (called from loop())
 {
+    if (!g_lora_ok || g_range_active) return;   // radio down, or Range app owns the radio
     if (!g_lora_rx_flag) return;
     g_lora_rx_flag = false;
     String pkt;
@@ -961,7 +1013,7 @@ static void lora_poll(lv_timer_t *t)
         int start = 0, len = pkt.length();           // split payload into newline-delimited lines
         for (int i = 0; i <= len; i++) {
             if (i == len || pkt[i] == '\n' || pkt[i] == '\r') {
-                if (i > start) lora_process_line(pkt.substring(start, i));
+                if (i > start) lora_rx_dispatch(pkt.substring(start, i));
                 start = i + 1;
             }
         }
@@ -969,7 +1021,7 @@ static void lora_poll(lv_timer_t *t)
     lora_radio.startReceive();
 }
 
-static void lora_tx_line(const String &payload) { lora_radio.transmit(payload.c_str()); }
+static void lora_tx_line(const String &payload) { lora_radio.transmit(relay_wrap(payload, RELAY_TTL_MESH).c_str()); }
 
 static void lora_send(const char *text)
 {
@@ -1275,13 +1327,24 @@ static void range_poll_cb(lv_timer_t *t)
     float snr  = lora_radio.getSNR();
     lora_radio.startReceive();
 
+    String first = pkt;
+    int nl = pkt.indexOf('\n'); if (nl >= 0) first = pkt.substring(0, nl);
+    first.trim();
+    // Range path reads raw packets (not via lora_rx_dispatch): strip the relay header,
+    // and drop our own relayed PINGs + duplicate PONGs BEFORE counting so stats stay clean.
+    {
+        String src, orig; uint32_t pid; uint8_t ttl;
+        if (relay_parse(first, src, pid, ttl, orig)) {
+            if (src == NODE_ID) return;
+            if (relay_seen(g_relay_seen, src, pid)) return;
+            first = orig;
+        }
+    }
+
     if (g_rng_rcount == 0) { g_rng_rmin = g_rng_rmax = rssi; }
     else { if (rssi < g_rng_rmin) g_rng_rmin = rssi; if (rssi > g_rng_rmax) g_rng_rmax = rssi; }
     g_rng_rsum += rssi; g_rng_rcount++; g_rng_rx++;
 
-    String first = pkt;
-    int nl = pkt.indexOf('\n'); if (nl >= 0) first = pkt.substring(0, nl);
-    first.trim();
     long seq = -1;
     if (first.startsWith("PING\t") || first.startsWith("PONG\t")) {
         int p2 = first.indexOf('\t', 5);
@@ -1325,7 +1388,7 @@ static void range_tx_cb(lv_timer_t *t)
 
     char buf[40];
     snprintf(buf, sizeof(buf), "PING\t%lu\t%s\n", (unsigned long)g_rng_seq, LORA_SENDER_ID);
-    lora_radio.transmit(buf);                               // blocking ~1-2 s at SF12
+    lora_radio.transmit(relay_wrap(buf, RELAY_TTL_MESH).c_str());   // blocking ~1-2 s at SF12
     lora_radio.startReceive();
     if (g_rng_log) {
         char ln[32]; snprintf(ln, sizeof(ln), "TX #%lu\n", (unsigned long)g_rng_seq);
@@ -1343,7 +1406,43 @@ static void range_tx_toggle_cb(lv_event_t *e)
     if (l) lv_label_set_text(l, g_rng_tx ? "TX beacon: ON" : "TX beacon: off");
 }
 
-// ===================== GPS (u-blox M10 on Serial1) =====================
+// ---- WiFi/IP coarse location (ip-api.com, free, no key) ----
+// Blocking HTTP GET (~1-2 s); called once from gps_ui_poll when pending so the
+// "locating..." frame renders first. Short timeouts cap the UI freeze on failure.
+static void ipgeo_fetch()
+{
+    if (WiFi.status() != WL_CONNECTED) { g_ipgeo_ok = false; return; }
+    HTTPClient http;
+    http.setConnectTimeout(4000);
+    http.setTimeout(4000);
+    if (!http.begin("http://ip-api.com/json/?fields=status,city,regionName,country,lat,lon")) {
+        g_ipgeo_ok = false; return;
+    }
+    int code = http.GET();
+    if (code == 200) {
+        String b = http.getString();
+        if (b.indexOf("\"status\":\"success\"") >= 0) {
+            int li = b.indexOf("\"lat\":");
+            int oi = b.indexOf("\"lon\":");
+            int ci = b.indexOf("\"city\":\"");
+            if (li >= 0) g_ipgeo_lat = b.substring(li + 6).toDouble();
+            if (oi >= 0) g_ipgeo_lon = b.substring(oi + 6).toDouble();
+            if (ci >= 0) { int s = ci + 8, e = b.indexOf('"', s); g_ipgeo_city = b.substring(s, e); }
+            g_ipgeo_ok = (li >= 0 && oi >= 0);
+        } else g_ipgeo_ok = false;
+    } else g_ipgeo_ok = false;
+    http.end();
+    Serial.printf("IPGEO %s  %s %.4f,%.4f\n", g_ipgeo_ok ? "ok" : "fail",
+                  g_ipgeo_city.c_str(), g_ipgeo_lat, g_ipgeo_lon);
+}
+
+static void gps_wifi_refresh_cb(lv_event_t *e)
+{
+    g_ipgeo_pending = true;     // re-fetch on next gps_ui_poll
+    if (g_gps_wifi) lv_label_set_text(g_gps_wifi, LV_SYMBOL_WIFI " loc: locating...");
+}
+
+// ===================== GPS (u-blox M10 / L76K on Serial1) =====================
 // Drain the UART every loop() so the 1 Hz NMEA burst (~500 B) never overflows.
 static void gps_feed()
 {
@@ -1405,6 +1504,22 @@ static void gps_ui_poll(lv_timer_t *t)
                               g_gps.time.minute(), g_gps.time.second());
     else
         lv_label_set_text(g_gps_time, "UTC --");
+
+    // WiFi/IP coarse location (A-GPS-like). Fetch once when pending (blocking),
+    // then just reflect the cached result. GPS fix above always takes precedence.
+    if (g_gps_wifi) {
+        if (g_ipgeo_pending) { g_ipgeo_pending = false; g_ipgeo_tried = true; ipgeo_fetch(); }
+
+        if (WiFi.status() != WL_CONNECTED)
+            lv_label_set_text(g_gps_wifi, LV_SYMBOL_WIFI " loc: connect WiFi first");
+        else if (!g_ipgeo_tried)
+            lv_label_set_text(g_gps_wifi, LV_SYMBOL_WIFI " loc: locating...");
+        else if (g_ipgeo_ok)
+            lv_label_set_text_fmt(g_gps_wifi, LV_SYMBOL_WIFI " ~%s  %.4f, %.4f",
+                                  g_ipgeo_city.c_str(), g_ipgeo_lat, g_ipgeo_lon);
+        else
+            lv_label_set_text(g_gps_wifi, LV_SYMBOL_WIFI " loc: failed (press refresh)");
+    }
 }
 
 static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
@@ -1467,6 +1582,22 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
             Preferences p; p.begin("tdeckos", false); p.putUChar("tbaccel", (uint8_t)g_tb_accel); p.end();
         }, LV_EVENT_VALUE_CHANGED, NULL);
         lv_group_add_obj(g, tslider);
+
+        lv_obj_t *blbl = lv_label_create(parent);
+        lv_label_set_text(blbl, "Message beep volume  (0 = mute)");
+        lv_obj_set_style_text_color(blbl, lv_color_white(), 0);
+        lv_obj_t *bslider = lv_slider_create(parent);
+        lv_obj_set_width(bslider, 260);
+        lv_slider_set_range(bslider, 0, 10);
+        lv_slider_set_value(bslider, g_beep_vol, LV_ANIM_OFF);
+        lv_obj_add_event_cb(bslider, [](lv_event_t *e) {       // save on each step
+            g_beep_vol = (uint8_t)lv_slider_get_value(lv_event_get_target(e));
+            Preferences p; p.begin("tdeckos", false); p.putUChar("beepvol", g_beep_vol); p.end();
+        }, LV_EVENT_VALUE_CHANGED, NULL);
+        lv_obj_add_event_cb(bslider, [](lv_event_t *e) {       // preview the level on release
+            beep_notify();
+        }, LV_EVENT_RELEASED, NULL);
+        lv_group_add_obj(g, bslider);
     } else if (strcmp(name, "Wi-Fi") == 0) {
         WiFi.mode(WIFI_STA);
         WiFi.disconnect();
@@ -1592,6 +1723,8 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
             char hdr[64];
             snprintf(hdr, sizeof(hdr), "LoRa %.1f MHz SF12 (pager) - listening\n", (double)RADIO_FREQ);
             lv_textarea_set_text(g_lora_log, hdr);
+            if (g_lora_history.length()) lv_textarea_add_text(g_lora_log, g_lora_history.c_str());
+            lv_textarea_set_cursor_pos(g_lora_log, LV_TEXTAREA_CURSOR_LAST);
         } else {
             char hdr[64];
             snprintf(hdr, sizeof(hdr), "radio init failed (err %d)\n", st);
@@ -1631,11 +1764,12 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
 
         g_lora_compose = "";
         g_ime.reset();
-        if (!g_lora_timer) g_lora_timer = lv_timer_create(lora_poll, 50, NULL);
+        g_lora_unread = 0;                 // opened the app → mark all read; RX runs in background
         lv_group_focus_obj(g_lora_input);
         lv_label_set_text(g_toast, LV_SYMBOL_KEYBOARD " type+Enter to send  -  Kor/Eng btn");
     } else if (strcmp(name, "Range") == 0) {
         lora_init();
+        g_range_active = true;             // Range owns the radio; background RX yields to range_poll_cb
         g_rng_rx = g_rng_miss = g_rng_rcount = 0;
         g_rng_rsum = 0; g_rng_last_seq = -1; g_rng_seq = 0;
         g_rng_acked = false;
@@ -1681,8 +1815,19 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lv_obj_set_style_text_color(g_gps_time, lv_color_hex(0xAAAAAA), 0);
         lv_label_set_text(g_gps_time, "UTC --");
 
+        g_gps_wifi = lv_label_create(parent);              // A-GPS-like coarse loc
+        lv_obj_set_style_text_color(g_gps_wifi, lv_color_hex(0x60A5FA), 0);
+        lv_label_set_text(g_gps_wifi, LV_SYMBOL_WIFI " loc: --");
+        if (!g_ipgeo_tried && WiFi.status() == WL_CONNECTED) g_ipgeo_pending = true;
+
+        lv_obj_t *wb = lv_btn_create(parent);
+        lv_obj_t *wl = lv_label_create(wb);
+        lv_label_set_text(wl, LV_SYMBOL_REFRESH " WiFi loc");
+        lv_obj_add_event_cb(wb, gps_wifi_refresh_cb, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, wb);
+
         if (!g_gps_ui) g_gps_ui = lv_timer_create(gps_ui_poll, 250, NULL);
-        lv_label_set_text(g_toast, LV_SYMBOL_GPS " u-blox M10  -  outdoors for first fix");
+        lv_label_set_text(g_toast, LV_SYMBOL_GPS " GPS + WiFi coarse loc  -  outdoors for fix");
     } else if (strcmp(name, "Files") == 0) {
         g_sd_path = "/";
         sd_build_list();
@@ -1699,7 +1844,7 @@ static void go_home()
     if (g_wifi_conn_timer) { lv_timer_del(g_wifi_conn_timer); g_wifi_conn_timer = NULL; }
     if (g_bt_scan_timer)   { lv_timer_del(g_bt_scan_timer);   g_bt_scan_timer = NULL; }
     if (g_browser_timer)   { lv_timer_del(g_browser_timer);   g_browser_timer = NULL; }
-    if (g_lora_timer)      { lv_timer_del(g_lora_timer);      g_lora_timer = NULL; }
+    g_range_active = false;     // leaving any app → background LoRa RX resumes
     if (g_rng_poll)        { lv_timer_del(g_rng_poll);        g_rng_poll = NULL; }
     if (g_rng_tx)          { lv_timer_del(g_rng_tx);          g_rng_tx = NULL; }
     if (g_gps_ui)          { lv_timer_del(g_gps_ui);          g_gps_ui = NULL; }
@@ -1728,7 +1873,7 @@ static void go_home()
     g_sd_status = NULL;
     g_sd_view_ta = NULL;
     g_rng_rssi = NULL; g_rng_stats = NULL; g_rng_log = NULL;
-    g_gps_fix = NULL; g_gps_coord = NULL; g_gps_det = NULL; g_gps_time = NULL;
+    g_gps_fix = NULL; g_gps_coord = NULL; g_gps_det = NULL; g_gps_time = NULL; g_gps_wifi = NULL;
     g_edit_slider = NULL;
     lv_obj_clear_flag(g_home_list, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(g_title, "T-Deck OS");
@@ -1804,8 +1949,11 @@ static void status_update_cb(lv_timer_t *t)
         snprintf(tbuf, sizeof(tbuf), "%u:%02u", (unsigned)(s / 60), (unsigned)(s % 60));
     }
 
-    char line[48];
-    snprintf(line, sizeof(line), "%s%s%s %d%% %s",
+    char nbuf[16] = "";
+    if (g_lora_unread > 0) snprintf(nbuf, sizeof(nbuf), LV_SYMBOL_BELL "%d ", g_lora_unread);
+    char line[64];
+    snprintf(line, sizeof(line), "%s%s%s%s %d%% %s",
+             nbuf,
              g_wifi_on ? LV_SYMBOL_WIFI " "      : "",
              g_bt_on   ? LV_SYMBOL_BLUETOOTH " " : "",
              bat, pct, tbuf);
@@ -1823,6 +1971,7 @@ static void boot_restore()
     bool   bt   = p.getBool("bt", false);
     g_kb_bright = p.getUChar("kbl", 127);
     g_tb_accel  = p.getUChar("tbaccel", 2);
+    g_beep_vol  = p.getUChar("beepvol", 7);
     p.end();
 
     setKeyboardBrightness(g_kb_bright);   // keyboard backlight on at boot
@@ -1856,6 +2005,8 @@ void setup()
     Serial1.begin(GPS_BAUDS[0], SERIAL_8N1, BOARD_GPS_RX_PIN, BOARD_GPS_TX_PIN);
     Serial.printf("GPS UART @%lu  rx=GPIO%d tx=GPIO%d\n",
                   (unsigned long)GPS_BAUDS[0], BOARD_GPS_RX_PIN, BOARD_GPS_TX_PIN);
+
+    relay_begin();             // seed relay pktid counter (random, survives reboot dedup)
 
     // Park every SPI chip-select high before bringing the bus up
     pinMode(BOARD_SDCARD_CS, OUTPUT); digitalWrite(BOARD_SDCARD_CS, HIGH);
@@ -1896,6 +2047,7 @@ void setup()
     setup_keyboard_indev();
     lv_timer_create(status_update_cb, 1000, NULL);
     lv_timer_create(gps_probe_cb, 1000, NULL);   // auto-detect GPS baud (u-blox/L76K)
+    lora_init();      // bring the radio up at boot so LoRa RX runs in the background
     boot_restore();   // auto-reconnect saved Wi-Fi + restore BT state
 
     pinMode(BOARD_BL_PIN, OUTPUT);
@@ -1908,5 +2060,6 @@ void loop()
 {
     lv_timer_handler();
     gps_feed();        // keep the NMEA parser fed regardless of which app is open
+    lora_service();    // always-on LoRa RX so messages arrive even with the app closed
     delay(5);
 }
