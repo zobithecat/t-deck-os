@@ -997,9 +997,9 @@ static void lora_rx_dispatch(const String &line)
         if (src == NODE_ID) return;
         if (relay_seen(g_relay_seen, src, pktid)) return;
         lora_process_line(orig);
-    } else {
-        lora_process_line(line);
     }
+    // else: not a valid R| line = RF corruption (CRC is off; all real traffic is
+    // wrapped now) → DROP, so a mangled relayed copy can't pollute/break the frame.
 }
 
 static int lora_init()
@@ -1019,22 +1019,30 @@ static int lora_init()
 static void lora_service()            // always-on background RX (called from loop())
 {
     if (!g_lora_ok || g_range_active) return;   // radio down, or Range app owns the radio
-    if (!g_lora_rx_flag) return;
-    g_lora_rx_flag = false;
-    String pkt;
-    if (lora_radio.readData(pkt) == RADIOLIB_ERR_NONE && pkt.length()) {
-        int start = 0, len = pkt.length();           // split payload into newline-delimited lines
-        for (int i = 0; i <= len; i++) {
-            if (i == len || pkt[i] == '\n' || pkt[i] == '\r') {
-                if (i > start) lora_rx_dispatch(pkt.substring(start, i));
-                start = i + 1;
+    int guard = 0;
+    while (g_lora_rx_flag && guard++ < 6) {     // drain bursts so fast SF9 packets don't pile up/corrupt
+        g_lora_rx_flag = false;
+        String pkt;
+        if (lora_radio.readData(pkt) == RADIOLIB_ERR_NONE && pkt.length()) {
+            int start = 0, len = pkt.length();           // split payload into newline-delimited lines
+            for (int i = 0; i <= len; i++) {
+                if (i == len || pkt[i] == '\n' || pkt[i] == '\r') {
+                    if (i > start) lora_rx_dispatch(pkt.substring(start, i));
+                    start = i + 1;
+                }
             }
         }
+        lora_radio.startReceive();
     }
-    lora_radio.startReceive();
 }
 
-static void lora_tx_line(const String &payload) { lora_radio.transmit(relay_wrap(payload, RELAY_TTL_MESH).c_str()); }
+static void lora_tx_line(const String &payload)
+{
+    String w = relay_wrap(payload, RELAY_TTL_MESH);
+    lora_radio.transmit(w.c_str());
+    // ~2x ToA gap so the half-duplex relay can RX+forward this packet before the next
+    delay(lora_radio.getTimeOnAir(w.length()) / 500 + 50);
+}
 
 static void lora_send(const char *text)
 {

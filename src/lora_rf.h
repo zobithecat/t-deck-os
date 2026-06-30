@@ -26,7 +26,7 @@
 #define RF_DX_CHANNEL   90              // DX-LR02 AT+CHANNEL for 922 MHz
 
 // ── Spreading factor / bandwidth ─────────────────────────────────────────────
-#define RF_SF           12              // 7..12
+#define RF_SF           9               // 7..12  (mesh tune 2026-06-30: SF9 ≈ 7x less airtime than SF12)
 #define RF_BW_KHZ       125.0f          // RadioLib begin() wants kHz (float)
 #define RF_BW_HZ        125000UL        // ToA / DX-LR02 reference
 
