@@ -19,6 +19,7 @@
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 #include <Preferences.h>
+#include <sys/time.h>
 #include <driver/i2s.h>
 #include <RadioLib.h>
 #include <TinyGPS++.h>
@@ -94,6 +95,8 @@ static uint32_t      g_rng_seq;
 static int           g_rng_rx, g_rng_miss, g_rng_rmin, g_rng_rmax, g_rng_rcount;
 static long          g_rng_rsum, g_rng_last_seq;
 static bool          g_rng_acked;   // 직전에 보낸 PING이 PONG으로 응답받았나 (loss 판정용)
+static String        g_rng_file;            // per-session range CSV path (set on Range app open)
+static bool          g_time_synced = false; // system clock set from GPS or NTP
 
 // ---- GPS (T-Deck Plus on Serial1 / GPIO44 RX, 43 TX) ----
 // The Plus ships with EITHER a u-blox M10 OR a Quectel L76K (both NMEA, both 9600
@@ -282,6 +285,15 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     }
 }
 
+// Scroll the newly-focused widget into view so trackball (encoder) navigation can
+// reach off-screen controls — e.g. the lower sliders on the Settings page once it
+// overflows. LVGL doesn't auto-scroll on focus by default.
+static void group_focus_cb(lv_group_t *grp)
+{
+    lv_obj_t *f = lv_group_get_focused(grp);
+    if (f) lv_obj_scroll_to_view(f, LV_ANIM_OFF);
+}
+
 static void setup_trackball_indev()
 {
     static lv_indev_drv_t indev_enc;
@@ -290,6 +302,7 @@ static void setup_trackball_indev()
     indev_enc.read_cb = trackball_read;
     enc_indev = lv_indev_drv_register(&indev_enc);
     lv_indev_set_group(enc_indev, lv_group_get_default());
+    lv_group_set_focus_cb(lv_group_get_default(), group_focus_cb);
 }
 
 // Center-press / Enter on a launcher row -> open that app's screen
@@ -1297,10 +1310,18 @@ static void sd_view_file(const char *path)
 }
 
 // --- LoRa range / link-quality test ------------------------------------------
+// Current GPS position as "lat,lon" (6dp) when there's a fresh fix, else ",".
+static String gps_loc_csv()
+{
+    if (g_gps.location.isValid() && g_gps.location.age() < 5000)
+        return String(g_gps.location.lat(), 6) + "," + String(g_gps.location.lng(), 6);
+    return ",";
+}
+
 static void range_log_sd(const String &line)
 {
-    if (!sd_init()) return;
-    File f = SD.open("/range_log.csv", FILE_APPEND);
+    if (!sd_init() || g_rng_file.length() == 0) return;
+    File f = SD.open(g_rng_file.c_str(), FILE_APPEND);
     if (f) { f.println(line); f.close(); }
 }
 
@@ -1369,9 +1390,9 @@ static void range_poll_cb(lv_timer_t *t)
     const char *typ = first.startsWith("PONG") ? "PONG" :
                       first.startsWith("PING") ? "PING" :
                       first.startsWith("HB")   ? "HB"   : "OTHER";
-    char csv[80];
-    snprintf(csv, sizeof(csv), "%lu,%s,%ld,%d,%.1f", (unsigned long)(millis() / 1000),
-             typ, seq, rssi, snr);
+    char csv[96];
+    snprintf(csv, sizeof(csv), "%ld,%s,%ld,%d,%.1f,%s", (long)time(NULL),
+             typ, seq, rssi, snr, gps_loc_csv().c_str());
     range_log_sd(String(csv));
 }
 
@@ -1443,10 +1464,50 @@ static void gps_wifi_refresh_cb(lv_event_t *e)
 }
 
 // ===================== GPS (u-blox M10 / L76K on Serial1) =====================
+// Once GPS has a fresh valid UTC date+time, set the system clock from it so the
+// wall clock works WITHOUT WiFi/NTP. Skips if NTP already set the time. Runs each
+// loop until synced (then returns immediately). GPS time goes valid before a full
+// position fix, so the clock syncs fast.
+// UTC broken-down time -> epoch seconds (ESP32 newlib has no timegm; mktime would
+// apply the local TZ). Howard Hinnant's days_from_civil — correct for any date.
+static time_t utc_to_epoch(const struct tm *t)
+{
+    int  y = t->tm_year + 1900, m = t->tm_mon + 1, d = t->tm_mday;
+    y -= (m <= 2);
+    long era = (y >= 0 ? y : y - 399) / 400;
+    long yoe = y - era * 400;
+    long doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    long days = era * 146097 + doe - 719468;
+    return (time_t)(days * 86400L + t->tm_hour * 3600L + t->tm_min * 60L + t->tm_sec);
+}
+
+static void gps_time_sync()
+{
+    if (g_time_synced) return;
+    if (time(NULL) > 1700000000) { g_time_synced = true; return; }   // NTP got there first
+    if (!g_gps.time.isValid() || !g_gps.date.isValid()) return;
+    if (g_gps.date.year() < 2024 || g_gps.time.age() > 2000) return; // sane + fresh
+    struct tm tmv = {};
+    tmv.tm_year = g_gps.date.year() - 1900;
+    tmv.tm_mon  = g_gps.date.month() - 1;
+    tmv.tm_mday = g_gps.date.day();
+    tmv.tm_hour = g_gps.time.hour();
+    tmv.tm_min  = g_gps.time.minute();
+    tmv.tm_sec  = g_gps.time.second();
+    struct timeval tv; tv.tv_sec = utc_to_epoch(&tmv); tv.tv_usec = 0;  // GPS is UTC
+    settimeofday(&tv, NULL);
+    g_time_synced = true;
+    Serial.printf("GPS time sync %04d-%02d-%02d %02d:%02d:%02d UTC\n",
+                  g_gps.date.year(), g_gps.date.month(), g_gps.date.day(),
+                  g_gps.time.hour(), g_gps.time.minute(), g_gps.time.second());
+}
+
 // Drain the UART every loop() so the 1 Hz NMEA burst (~500 B) never overflows.
 static void gps_feed()
 {
     while (Serial1.available()) g_gps.encode((char)Serial1.read());
+    gps_time_sync();
 }
 
 // Auto-detect the GPS baud (u-blox vs L76K vs a module left at a non-default rate).
@@ -1774,6 +1835,17 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         g_rng_rsum = 0; g_rng_last_seq = -1; g_rng_seq = 0;
         g_rng_acked = false;
 
+        // new per-session CSV named by start time (wall clock if synced, else uptime)
+        { time_t t = time(NULL); char fn[48];
+          if (t > 1700000000) { struct tm tmv; localtime_r(&t, &tmv);
+              snprintf(fn, sizeof(fn), "/range_%04d%02d%02d_%02d%02d%02d.csv",
+                       tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                       tmv.tm_hour, tmv.tm_min, tmv.tm_sec); }
+          else snprintf(fn, sizeof(fn), "/range_up%lu.csv", (unsigned long)(millis() / 1000));
+          g_rng_file = fn;
+          if (sd_init()) { File hf = SD.open(g_rng_file.c_str(), FILE_WRITE);
+                           if (hf) { hf.println("time,dir,seq,rssi,snr,lat,lon"); hf.close(); } } }
+
         g_rng_rssi = lv_label_create(parent);
         lv_obj_set_style_text_font(g_rng_rssi, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(g_rng_rssi, lv_color_hex(0x4ADE80), 0);
@@ -1787,7 +1859,7 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lv_obj_set_width(g_rng_log, lv_pct(100));
         lv_obj_set_flex_grow(g_rng_log, 1);
         lv_obj_set_style_text_font(g_rng_log, &font_kr16, 0);
-        lv_textarea_set_text(g_rng_log, "listening - log: /range_log.csv\n");
+        lv_textarea_set_text(g_rng_log, (String("log: ") + g_rng_file + "\n").c_str());
 
         lv_obj_t *txb = lv_btn_create(parent);
         lv_obj_t *tl = lv_label_create(txb);
