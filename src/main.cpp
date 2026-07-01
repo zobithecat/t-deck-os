@@ -93,7 +93,8 @@ static lv_obj_t     *g_rng_rssi, *g_rng_stats, *g_rng_log;   // LoRa range test
 static lv_timer_t   *g_rng_poll, *g_rng_tx;
 static uint32_t      g_rng_seq;
 static int           g_rng_rx, g_rng_miss, g_rng_rmin, g_rng_rmax, g_rng_rcount;
-static long          g_rng_rsum, g_rng_last_seq;
+static int           g_rng_h0, g_rng_h1, g_rng_h2;   // reply hop histogram: direct / 1-hop / 2-hop
+static long          g_rng_rsum, g_rng_last_seq;     // g_rng_last_seq = last counted seq (dedup relay copies)
 static bool          g_rng_acked;   // 직전에 보낸 PING이 PONG으로 응답받았나 (loss 판정용)
 static String        g_rng_file;            // per-session range CSV path (set on Range app open)
 static bool          g_time_synced = false; // system clock set from GPS or NTP
@@ -1341,9 +1342,11 @@ static void range_update_stats()
     int loss = sent ? (g_rng_miss * 100 / sent) : 0;
     int avg  = g_rng_rcount ? (int)(g_rng_rsum / g_rng_rcount) : 0;
     if (g_rng_stats)
-        lv_label_set_text_fmt(g_rng_stats, "tx %d  rx %d  miss %d  loss %d%%\nrssi  %d / %d / %d  (min/avg/max)",
+        lv_label_set_text_fmt(g_rng_stats,
+                              "tx %d  rx %d  miss %d  loss %d%%\nrssi  %d / %d / %d  (min/avg/max)\nhops  direct %d  1-hop %d  2-hop %d",
                               sent, g_rng_rx, g_rng_miss, loss,
-                              g_rng_rcount ? g_rng_rmin : 0, avg, g_rng_rcount ? g_rng_rmax : 0);
+                              g_rng_rcount ? g_rng_rmin : 0, avg, g_rng_rcount ? g_rng_rmax : 0,
+                              g_rng_h0, g_rng_h1, g_rng_h2);
 }
 
 static void range_poll_cb(lv_timer_t *t)
@@ -1359,48 +1362,51 @@ static void range_poll_cb(lv_timer_t *t)
     String first = pkt;
     int nl = pkt.indexOf('\n'); if (nl >= 0) first = pkt.substring(0, nl);
     first.trim();
-    // Range path reads raw packets (not via lora_rx_dispatch): strip the relay header,
-    // and drop our own relayed PINGs + duplicate PONGs BEFORE counting so stats stay clean.
-    {
-        String src, orig; uint32_t pid; uint8_t ttl;
-        if (relay_parse(first, src, pid, ttl, orig)) {
-            if (src == NODE_ID) return;
-            if (relay_seen(g_relay_seen, src, pid)) return;
-            first = orig;
-        }
-    }
+    // Range is relay-aware: a PONG counts whether it came direct or via relays, so the pager
+    // staying reachable through a relay is NOT scored as loss. Dropped only when the line can't
+    // be our reply:  non-R| = RF corruption;  src==us = our own PING echoed back;
+    //   non-PONG = HB / text / PING.
+    String src, orig; uint32_t pid; uint8_t ttl;
+    if (!relay_parse(first, src, pid, ttl, orig)) return;
+    if (src == NODE_ID)             return;
+    if (!orig.startsWith("PONG\t")) return;
+
+    int  p2  = orig.indexOf('\t', 5);
+    long seq = (p2 > 0 ? orig.substring(5, p2) : orig.substring(5)).toInt();
+
+    // Hop count is carried by the reply's ttl: the pager sends every PONG at RELAY_TTL_MESH and
+    // each relay decrements it, so hops = RELAY_TTL_MESH - ttl (0 = direct, 1, 2 ...).
+    int hops = (int)RELAY_TTL_MESH - (int)ttl;
+    if (hops < 0) hops = 0;
+
+    if (seq == (long)g_rng_seq - 1) g_rng_acked = true;   // our latest PING was answered (any path) → not a loss
+
+    // The same PONG reaches us several times (direct + one copy per relay). Count each seq once:
+    // the FIRST copy — the direct one when the direct link is up (shortest path arrives first),
+    // else the best relayed copy. Ignore the later duplicates of that seq.
+    if (seq == g_rng_last_seq) return;
+    g_rng_last_seq = seq;
+
+    if      (hops <= 0) g_rng_h0++;
+    else if (hops == 1) g_rng_h1++;
+    else                g_rng_h2++;
 
     if (g_rng_rcount == 0) { g_rng_rmin = g_rng_rmax = rssi; }
     else { if (rssi < g_rng_rmin) g_rng_rmin = rssi; if (rssi > g_rng_rmax) g_rng_rmax = rssi; }
     g_rng_rsum += rssi; g_rng_rcount++; g_rng_rx++;
 
-    long seq = -1;
-    if (first.startsWith("PING\t") || first.startsWith("PONG\t")) {
-        int p2 = first.indexOf('\t', 5);
-        seq = (p2 > 0 ? first.substring(5, p2) : first.substring(5)).toInt();
-        g_rng_last_seq = seq;
-        // 우리가 방금 보낸 PING(seq = g_rng_seq-1)에 대한 PONG이면 응답받은 것 →
-        // range_tx_cb가 다음 송신 때 loss로 세지 않는다.
-        if (first.startsWith("PONG\t") && seq == (long)g_rng_seq - 1)
-            g_rng_acked = true;
-    }
-
-    if (g_rng_rssi) lv_label_set_text_fmt(g_rng_rssi, "RSSI %d dBm   SNR %.1f", rssi, snr);
+    const char *hoptxt = hops <= 0 ? "direct" : (hops == 1 ? "1 hop" : "2 hop");
+    if (g_rng_rssi) lv_label_set_text_fmt(g_rng_rssi, "RSSI %d dBm  SNR %.1f  (%s)", rssi, snr, hoptxt);
     if (g_rng_log) {
-        char ln[64];
-        if (seq >= 0) snprintf(ln, sizeof(ln), "#%ld  %d dBm  %.1f\n", seq, rssi, snr);
-        else          snprintf(ln, sizeof(ln), "%s  %d dBm\n", first.c_str(), rssi);
+        char ln[64]; snprintf(ln, sizeof(ln), "#%ld  %ddBm  %.1f  %s\n", seq, rssi, snr, hoptxt);
         lv_textarea_add_text(g_rng_log, ln);
         lv_textarea_set_cursor_pos(g_rng_log, LV_TEXTAREA_CURSOR_LAST);
     }
     range_update_stats();
 
-    const char *typ = first.startsWith("PONG") ? "PONG" :
-                      first.startsWith("PING") ? "PING" :
-                      first.startsWith("HB")   ? "HB"   : "OTHER";
-    char csv[96];
-    snprintf(csv, sizeof(csv), "%ld,%s,%ld,%d,%.1f,%s", (long)time(NULL),
-             typ, seq, rssi, snr, gps_loc_csv().c_str());
+    char csv[112];
+    snprintf(csv, sizeof(csv), "%ld,PONG,%ld,%d,%d,%.1f,%s", (long)time(NULL),
+             seq, hops, rssi, snr, gps_loc_csv().c_str());
     range_log_sd(String(csv));
 }
 
@@ -1417,7 +1423,7 @@ static void range_tx_cb(lv_timer_t *t)
 
     char buf[40];
     snprintf(buf, sizeof(buf), "PING\t%lu\t%s\n", (unsigned long)g_rng_seq, LORA_SENDER_ID);
-    lora_radio.transmit(relay_wrap(buf, RELAY_TTL_MESH).c_str());   // blocking ~1-2 s at SF12
+    lora_radio.transmit(relay_wrap(buf, RELAY_TTL_MESH).c_str());   // blocking ~0.5 s at SF9
     lora_radio.startReceive();
     if (g_rng_log) {
         char ln[32]; snprintf(ln, sizeof(ln), "TX #%lu\n", (unsigned long)g_rng_seq);
@@ -1840,6 +1846,7 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lora_init();
         g_range_active = true;             // Range owns the radio; background RX yields to range_poll_cb
         g_rng_rx = g_rng_miss = g_rng_rcount = 0;
+        g_rng_h0 = g_rng_h1 = g_rng_h2 = 0;
         g_rng_rsum = 0; g_rng_last_seq = -1; g_rng_seq = 0;
         g_rng_acked = false;
 
@@ -1852,7 +1859,7 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
           else snprintf(fn, sizeof(fn), "/range_up%lu.csv", (unsigned long)(millis() / 1000));
           g_rng_file = fn;
           if (sd_init()) { File hf = SD.open(g_rng_file.c_str(), FILE_WRITE);
-                           if (hf) { hf.println("time,dir,seq,rssi,snr,lat,lon"); hf.close(); } } }
+                           if (hf) { hf.println("time,dir,seq,hops,rssi,snr,lat,lon"); hf.close(); } } }
 
         g_rng_rssi = lv_label_create(parent);
         lv_obj_set_style_text_font(g_rng_rssi, &lv_font_montserrat_16, 0);
