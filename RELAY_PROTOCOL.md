@@ -1,5 +1,10 @@
 # LoRa Relay Protocol — pager ↔ Heltec relay ↔ T-Deck
 
+> ⚠️ **Historical design doc.** The current, canonical spec is
+> **[`PROTOCOL.md`](PROTOCOL.md)** — update that one. This file captures the
+> original *relay-layer* design + rationale (some values are stale, e.g. SF12 →
+> now **SF9**; PONG timing and hop-aware Range are described in PROTOCOL.md).
+
 A thin "relay layer" that lets a **Heltec Wireless Stick V3** (ESP32-S3 + SX1262,
 902–928 MHz band) repeat packets between the DX-LR02 **pager** and the **T-Deck**,
 extending range — **without changing existing message semantics**
