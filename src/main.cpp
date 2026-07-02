@@ -50,6 +50,7 @@ static int16_t       tp_x[5], tp_y[5];
 static lv_indev_t   *enc_indev;     // trackball (encoder)
 static int           g_tb_accel = 2;     // trackball scroll accel level 0..5 (Settings / NVS)
 static uint8_t       g_beep_vol = 7;     // incoming-message beep volume 0..10 (0=mute; Settings/NVS)
+static uint8_t       g_screen_bright = 16;   // display brightness 1..16 (Settings/NVS "bright")
 static lv_obj_t     *g_toast;       // bottom status / selection-feedback line
 static lv_obj_t     *g_home_list;   // launcher app list
 static lv_obj_t     *g_app_view;    // current app screen (NULL when home)
@@ -84,6 +85,12 @@ static volatile int  g_lora_unread = 0;       // messages received while LoRa ap
 static volatile bool g_range_active = false;  // Range app owns the radio when true
 static HangulIME     g_ime;             // 두벌식 한글 입력기
 static bool          g_kr_mode = false; // LoRa input: Korean vs English
+static bool          g_shift_lock = false;  // one-handed CAPS/shift lock (via the $ leader key)
+static bool          g_sym_lock   = false;  // one-handed symbol lock
+static bool          g_leader     = false;  // $ (0x04=shift+$) pressed → next key selects a mode
+static uint32_t      g_leader_ms  = 0;
+static bool          g_kbtest_active = false;   // KbTest app owns the keyboard (logs every key)
+static lv_obj_t     *g_kbtest_log;              // KbTest on-screen key readout
 static String        g_lora_compose;    // committed Korean text (preview appended on display)
 static lv_obj_t     *g_kr_btn;          // Kor/Eng toggle button
 static lv_obj_t     *g_sd_list;
@@ -97,6 +104,10 @@ static int           g_rng_h0, g_rng_h1, g_rng_h2;   // reply hop histogram: dir
 static long          g_rng_rsum, g_rng_last_seq;     // g_rng_last_seq = last counted seq (dedup relay copies)
 static bool          g_rng_acked;   // 직전에 보낸 PING이 PONG으로 응답받았나 (loss 판정용)
 static String        g_rng_file;            // per-session range CSV path (set on Range app open)
+static lv_obj_t     *g_rng_dist;            // walk-test: big distance-from-base readout
+static double        g_rng_anchor_lat, g_rng_anchor_lon;   // "base" position set on-site
+static bool          g_rng_has_anchor;
+static uint32_t      g_rng_period;          // current beacon period ms (0=off / 5000 / 2000-walk)
 static bool          g_time_synced = false; // system clock set from GPS or NTP
 
 // ---- GPS (T-Deck Plus on Serial1 / GPIO44 RX, 43 TX) ----
@@ -109,6 +120,7 @@ static lv_timer_t   *g_gps_ui;
 static const uint32_t GPS_BAUDS[] = { 9600, 38400, 115200, 4800 };
 static uint8_t       g_gps_baud_idx = 0;
 static bool          g_gps_locked   = false;
+static bool          g_gps_enabled  = true;    // GPS power state (Settings toggle; NVS "gpsen")
 
 // WiFi/IP coarse location (A-GPS-like seed shown before a GPS fix). ip-api.com,
 // free, no API key. Cached once fetched; the GPS app's button forces a refresh.
@@ -123,6 +135,7 @@ static int           g_sd_count;
 static void go_home();
 static void open_app(const char *name);
 static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g);
+static void kbtest_log_key(uint32_t key);
 static void back_event_cb(lv_event_t *e);
 static bool lora_kr_handle_key(uint32_t key);   // Korean IME for the LoRa input
 
@@ -329,11 +342,81 @@ static uint32_t keyboard_get_key()
     return 0;
 }
 
+// SYM lock: map a base-layer letter to a symbol/number (a T-Deck-side symbol layer, so the
+// user never has to hold the keyboard's own sym key). Customize the table to taste.
+static uint32_t sym_map(uint32_t k)
+{
+    switch (k) {
+    // number pad, matching the keyboard's printed sym layer (user-specified)
+    case 'q': return '#'; case 'w': return '1'; case 'e': return '2'; case 'r': return '3';
+    case 'a': return '*'; case 's': return '4'; case 'd': return '5'; case 'f': return '6';
+    case 'z': return '7'; case 'x': return '8'; case 'c': return '9'; case 'v': return '0';
+    // rest — sensible defaults (tell me the keyboard's real layer to match exactly)
+    case 't': return '('; case 'y': return ')'; case 'u': return '-'; case 'i': return '_';
+    case 'o': return '+'; case 'p': return '=';
+    case 'g': return '/'; case 'h': return ':'; case 'j': return ';'; case 'k': return '@';
+    case 'l': return '?';
+    case 'b': return '!'; case 'n': return ','; case 'm': return '.';
+    default:  return k;
+    }
+}
+
+// Show the current one-handed modifier state on the status line.
+static void modifier_toast()
+{
+    if (!g_toast) return;
+    lv_label_set_text_fmt(g_toast, "%s  %s%s",
+                          g_kr_mode ? "KR 한글" : "EN",
+                          g_shift_lock ? "CAPS " : "",
+                          g_sym_lock   ? "SYM"   : "");
+}
+
 static void keypad_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
-    static uint32_t last_key = 0;
-    uint32_t key = keyboard_get_key();
+    static uint32_t last_key     = 0;
+    static uint32_t kb_pending   = 0;                 // 1-slot buffer for the $-leader escape
+    uint32_t key = kb_pending ? kb_pending : keyboard_get_key();
+    kb_pending = 0;
     if (key != 0) {
+        if (g_kbtest_active) {                        // KbTest app owns the keyboard: log + swallow
+            kbtest_log_key(key);
+            data->key = 0; data->state = LV_INDEV_STATE_RELEASED;
+            return;
+        }
+
+        // ---- one-handed modifiers (single thumb, 2 taps) ------------------------------
+        // shift+$ (0x04) = quick 한/영.  $ (0x24) = LEADER → the next key toggles a lock:
+        //   $ M = Kor/Eng   $ L = CAPS/shift   $ Enter = SYM   $ $ = literal $.
+        // $ then any other key emits the $ and that key (via kb_pending), so $ still types.
+        if (key == 0x04) {                                   // shift+$ → 한/영 shortcut
+            g_kr_mode = !g_kr_mode; modifier_toast();
+            data->key = 0; data->state = LV_INDEV_STATE_RELEASED; return;
+        }
+        if (key == '$' && !g_leader) {                       // $ → enter leader
+            g_leader = true; g_leader_ms = millis();
+            if (g_toast) lv_label_set_text(g_toast, "$  M=Kor/Eng  L=CAPS  Enter=SYM  ($=literal)");
+            data->key = 0; data->state = LV_INDEV_STATE_RELEASED; return;
+        }
+        if (g_leader) {
+            bool fresh = (uint32_t)(millis() - g_leader_ms) < 4000;
+            g_leader = false;
+            uint32_t sel = (key >= 'A' && key <= 'Z') ? key + 32 : key;   // case-insensitive
+            if (fresh && (sel == 'm' || sel == 'l' || key == 13)) {
+                if      (sel == 'm') g_kr_mode    = !g_kr_mode;          // M
+                else if (sel == 'l') g_shift_lock = !g_shift_lock;      // L
+                else                 g_sym_lock   = !g_sym_lock;        // Enter
+                modifier_toast();
+                data->key = 0; data->state = LV_INDEV_STATE_RELEASED; return;
+            }
+            if (!(fresh && key == '$')) kb_pending = key;   // $$ = one literal $; else emit $ + key
+            data->key = '$'; data->state = LV_INDEV_STATE_PRESSED; last_key = '$'; return;
+        }
+        // apply active locks to a base-layer letter, then let the IME/insert path run
+        if (key >= 'a' && key <= 'z') {
+            if      (g_sym_lock)   key = sym_map(key);
+            else if (g_shift_lock) key = key - 'a' + 'A';
+        }
+
         // Korean IME: typing into the LoRa input in Korean mode goes through the
         // jamo composer instead of inserting raw characters.
         if (g_kr_mode && g_lora_input &&
@@ -343,8 +426,10 @@ static void keypad_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
             data->state = LV_INDEV_STATE_RELEASED;
             return;
         }
-        if (key >= 32 && key < 127) {                     // printable -> echo + pass through
-            if (g_toast) lv_label_set_text_fmt(g_toast, LV_SYMBOL_KEYBOARD " '%c'", (char)key);
+        if (key >= 32 && key < 127) {                     // printable -> echo (show active locks)
+            if (g_toast) lv_label_set_text_fmt(g_toast, "%s%s%s" LV_SYMBOL_KEYBOARD " '%c'",
+                                               g_kr_mode ? "KR " : "", g_shift_lock ? "CAPS " : "",
+                                               g_sym_lock ? "SYM " : "", (char)key);
         } else {
             switch (key) {                                 // map control codes to LVGL keys
             case 13: key = LV_KEY_ENTER;     break;
@@ -455,6 +540,7 @@ static void build_launcher_ui()
         { LV_SYMBOL_GPS,      "LoRa",              0x34D399 },
         { LV_SYMBOL_UP,       "Range",             0xFBBF24 },
         { LV_SYMBOL_GPS,      "GPS",               0xF87171 },
+        { LV_SYMBOL_KEYBOARD, "KbTest",            0x60A5FA },
         { LV_SYMBOL_BELL,     "Messages",          0xFBBF24 },
         { LV_SYMBOL_WIFI,     "Wi-Fi",             0x3B82F6 },
         { LV_SYMBOL_BLUETOOTH,"Bluetooth",         0x60A5FA },
@@ -482,6 +568,7 @@ static void build_launcher_ui()
 
     // --- Soft-key hint / selection feedback ---
     g_toast = lv_label_create(scr);
+    lv_obj_set_style_text_font(g_toast, &font_kr16, 0);   // Korean + FontAwesome (IME/modifier state)
     lv_label_set_text(g_toast, LV_SYMBOL_OK " Select     " LV_SYMBOL_UP LV_SYMBOL_DOWN " Move (trackball)");
     lv_obj_set_style_text_color(g_toast, lv_color_hex(COL_MUTED), 0);
     lv_obj_align(g_toast, LV_ALIGN_BOTTOM_MID, 0, -4);
@@ -1334,6 +1421,26 @@ static void range_log_sd(const String &line)
     if (f) { f.println(line); f.close(); }
 }
 
+// KbTest app: record one raw keyboard byte to the on-screen readout, serial, and SD
+// (/kbtest.log, appended). Lets the keyboard be mapped thoroughly + untethered.
+static void kbtest_log_key(uint32_t key)
+{
+    bool pr = (key >= 32 && key < 127);
+    char line[48];
+    snprintf(line, sizeof(line), "%lu\t0x%02lX\t%lu\t%c",
+             (unsigned long)millis(), (unsigned long)key, (unsigned long)key, pr ? (char)key : '.');
+    Serial.printf("[KBTEST] %s\n", line);
+    if (g_kbtest_log) {
+        lv_textarea_add_text(g_kbtest_log, line);
+        lv_textarea_add_char(g_kbtest_log, '\n');
+        lv_textarea_set_cursor_pos(g_kbtest_log, LV_TEXTAREA_CURSOR_LAST);
+    }
+    if (sd_init()) {
+        File f = SD.open("/kbtest.log", FILE_APPEND);
+        if (f) { f.println(line); f.close(); }
+    }
+}
+
 static void range_update_stats()
 {
     // loss는 "보낸 PING 중 PONG 못 받은 비율". 받은 패킷 갭이 아니라 송신 기준이라
@@ -1351,6 +1458,22 @@ static void range_update_stats()
 
 static void range_poll_cb(lv_timer_t *t)
 {
+    // walk-test: refresh the big distance-from-base readout every ~500 ms (runs even with
+    // no RX, since GPS updates independently of PONGs).
+    static uint32_t last_dist = 0;
+    if (g_rng_dist && (uint32_t)(millis() - last_dist) > 500) {
+        last_dist = millis();
+        if (!g_rng_has_anchor)
+            lv_label_set_text(g_rng_dist, "set base");
+        else if (g_gps.location.isValid() && g_gps.location.age() < 5000) {
+            double d = TinyGPSPlus::distanceBetween(g_rng_anchor_lat, g_rng_anchor_lon,
+                                                    g_gps.location.lat(), g_gps.location.lng());
+            if (d < 1000) lv_label_set_text_fmt(g_rng_dist, "%d m", (int)(d + 0.5));
+            else          lv_label_set_text_fmt(g_rng_dist, "%.2f km", d / 1000.0);
+        } else
+            lv_label_set_text(g_rng_dist, "GPS --");
+    }
+
     if (!g_lora_rx_flag) return;
     g_lora_rx_flag = false;
     String pkt;
@@ -1396,7 +1519,7 @@ static void range_poll_cb(lv_timer_t *t)
     g_rng_rsum += rssi; g_rng_rcount++; g_rng_rx++;
 
     const char *hoptxt = hops <= 0 ? "direct" : (hops == 1 ? "1 hop" : "2 hop");
-    if (g_rng_rssi) lv_label_set_text_fmt(g_rng_rssi, "RSSI %d dBm  SNR %.1f  (%s)", rssi, snr, hoptxt);
+    if (g_rng_rssi) lv_label_set_text_fmt(g_rng_rssi, "%d dBm  %s", rssi, hoptxt);   // big; SNR stays in log+CSV
     if (g_rng_log) {
         char ln[64]; snprintf(ln, sizeof(ln), "#%ld  %ddBm  %.1f  %s\n", seq, rssi, snr, hoptxt);
         lv_textarea_add_text(g_rng_log, ln);
@@ -1433,12 +1556,30 @@ static void range_tx_cb(lv_timer_t *t)
     g_rng_seq++;
 }
 
+static void range_setbase_cb(lv_event_t *e)
+{
+    // capture the current GPS fix as the "base" the walk-test distance is measured from.
+    lv_obj_t *l = lv_obj_get_child(lv_event_get_target(e), 0);
+    if (g_gps.location.isValid() && g_gps.location.age() < 5000) {
+        g_rng_anchor_lat = g_gps.location.lat();
+        g_rng_anchor_lon = g_gps.location.lng();
+        g_rng_has_anchor = true;
+        if (l) lv_label_set_text(l, LV_SYMBOL_OK " base");
+    } else if (l) {
+        lv_label_set_text(l, "no GPS");
+    }
+}
+
 static void range_tx_toggle_cb(lv_event_t *e)
 {
+    // cycle the beacon: off -> 5 s (stationary) -> 2 s (walk) -> off. 2 s, not 1 s: the pager
+    // holds its PONG ~4x ToA (~1.2 s) to clear the relay's PING-forward, so pings must be
+    // spaced longer than that hold or the reply never fires.
+    uint32_t next = (!g_rng_tx) ? 5000 : (g_rng_period == 5000) ? 2000 : 0;
     if (g_rng_tx) { lv_timer_del(g_rng_tx); g_rng_tx = NULL; }
-    else          { g_rng_tx = lv_timer_create(range_tx_cb, 5000, NULL); }
+    if (next)     { g_rng_tx = lv_timer_create(range_tx_cb, next, NULL); g_rng_period = next; }
     lv_obj_t *l = lv_obj_get_child(lv_event_get_target(e), 0);
-    if (l) lv_label_set_text(l, g_rng_tx ? "TX beacon: ON" : "TX beacon: off");
+    if (l) lv_label_set_text(l, next == 0 ? "TX: off" : next == 5000 ? "TX: 5s" : "TX: 2s walk");
 }
 
 // ---- WiFi/IP coarse location (ip-api.com, free, no key) ----
@@ -1518,8 +1659,47 @@ static void gps_time_sync()
 }
 
 // Drain the UART every loop() so the 1 Hz NMEA burst (~500 B) never overflows.
+// Send a UBX frame: B5 62, class, id, len(LE16), payload, Fletcher-8 checksum.
+static void gps_send_ubx(uint8_t cls, uint8_t id, const uint8_t *pl, uint8_t len)
+{
+    if (len > 32) return;
+    uint8_t buf[40];
+    buf[0] = 0xB5; buf[1] = 0x62; buf[2] = cls; buf[3] = id; buf[4] = len; buf[5] = 0;
+    for (uint8_t i = 0; i < len; i++) buf[6 + i] = pl[i];
+    uint8_t a = 0, b = 0;
+    for (uint8_t i = 2; i < 6 + len; i++) { a += buf[i]; b += a; }
+    buf[6 + len] = a; buf[7 + len] = b;
+    Serial1.write(buf, 8 + len);
+    Serial1.flush();
+}
+
+// GPS power toggle. The T-Deck Plus MIA-M10Q shares the BOARD_POWERON rail (no independent
+// power pin), so "off" puts the u-blox into BACKUP mode via UBX-RXM-PMREQ (~25 mA -> µA) and
+// stops feeding the parser; "on" wakes it (any RX byte) and forces a fresh baud re-probe.
+// Re-enabling re-acquires (may take from seconds to a cold-start minute). Persisted in NVS.
+static void gps_set_enabled(bool on)
+{
+    g_gps_enabled = on;
+    if (!on) {
+        uint8_t pl[16] = {0};
+        pl[8]  = 0x02;   // flags: bit1 = backup
+        pl[12] = 0x08;   // wakeupSources: bit3 = UART RX (any byte wakes it)
+        gps_send_ubx(0x02, 0x41, pl, 16);          // UBX-RXM-PMREQ, duration 0 = infinite
+        g_gps_locked = false;
+    } else {
+        uint8_t wake[8] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
+        Serial1.write(wake, sizeof(wake)); Serial1.flush();   // RX activity wakes from backup
+        g_gps_locked   = false;                               // re-detect baud from scratch
+        g_gps_baud_idx = 0;
+        Serial1.updateBaudRate(GPS_BAUDS[0]);
+    }
+    Preferences pr; pr.begin("tdeckos", false); pr.putBool("gpsen", on); pr.end();
+    Serial.printf("GPS %s\n", on ? "on (re-acquiring)" : "off (backup)");
+}
+
 static void gps_feed()
 {
+    if (!g_gps_enabled) return;
     while (Serial1.available()) g_gps.encode((char)Serial1.read());
     gps_time_sync();
 }
@@ -1529,7 +1709,7 @@ static void gps_feed()
 // ~4 s. Runs always (created in setup), independent of which app is open.
 static void gps_probe_cb(lv_timer_t *t)
 {
-    if (g_gps_locked) return;
+    if (!g_gps_enabled || g_gps_locked) return;
     if (g_gps.passedChecksum() > 0) {            // valid NMEA at this baud -> lock in
         g_gps_locked = true;
         Serial.printf("GPS locked @%lu baud\n", (unsigned long)GPS_BAUDS[g_gps_baud_idx]);
@@ -1624,9 +1804,11 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lv_obj_t *slider = lv_slider_create(parent);
         lv_obj_set_width(slider, 260);
         lv_slider_set_range(slider, 1, 16);
-        lv_slider_set_value(slider, 16, LV_ANIM_OFF);
+        lv_slider_set_value(slider, g_screen_bright, LV_ANIM_OFF);
         lv_obj_add_event_cb(slider, [](lv_event_t *e) {
-            setBrightness((uint8_t)lv_slider_get_value(lv_event_get_target(e)));
+            g_screen_bright = (uint8_t)lv_slider_get_value(lv_event_get_target(e));
+            setBrightness(g_screen_bright);
+            Preferences p; p.begin("tdeckos", false); p.putUChar("bright", g_screen_bright); p.end();
         }, LV_EVENT_VALUE_CHANGED, NULL);
         lv_group_add_obj(g, slider);
 
@@ -1673,6 +1855,16 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
             beep_notify();
         }, LV_EVENT_RELEASED, NULL);
         lv_group_add_obj(g, bslider);
+
+        lv_obj_t *glbl = lv_label_create(parent);
+        lv_label_set_text(glbl, "GPS   (off = battery save)");
+        lv_obj_set_style_text_color(glbl, lv_color_white(), 0);
+        lv_obj_t *gsw = lv_switch_create(parent);
+        if (g_gps_enabled) lv_obj_add_state(gsw, LV_STATE_CHECKED);
+        lv_obj_add_event_cb(gsw, [](lv_event_t *e) {
+            gps_set_enabled(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+        }, LV_EVENT_VALUE_CHANGED, NULL);
+        lv_group_add_obj(g, gsw);
     } else if (strcmp(name, "Wi-Fi") == 0) {
         WiFi.mode(WIFI_STA);
         WiFi.disconnect();
@@ -1849,6 +2041,7 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         g_rng_h0 = g_rng_h1 = g_rng_h2 = 0;
         g_rng_rsum = 0; g_rng_last_seq = -1; g_rng_seq = 0;
         g_rng_acked = false;
+        g_rng_has_anchor = false; g_rng_period = 0;
 
         // new per-session CSV named by start time (wall clock if synced, else uptime)
         { time_t t = time(NULL); char fn[48];
@@ -1862,9 +2055,14 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
                            if (hf) { hf.println("time,dir,seq,hops,rssi,snr,lat,lon"); hf.close(); } } }
 
         g_rng_rssi = lv_label_create(parent);
-        lv_obj_set_style_text_font(g_rng_rssi, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(g_rng_rssi, &lv_font_montserrat_28, 0);    // big, glanceable outdoors
         lv_obj_set_style_text_color(g_rng_rssi, lv_color_hex(0x4ADE80), 0);
-        lv_label_set_text(g_rng_rssi, g_lora_ok ? "RSSI --   SNR --" : "radio init failed");
+        lv_label_set_text(g_rng_rssi, g_lora_ok ? "-- dBm" : "radio fail");
+
+        g_rng_dist = lv_label_create(parent);                                // walk-test distance-from-base
+        lv_obj_set_style_text_font(g_rng_dist, &lv_font_montserrat_28, 0);
+        lv_obj_set_style_text_color(g_rng_dist, lv_color_hex(0x38BDF8), 0);
+        lv_label_set_text(g_rng_dist, "set base");
 
         g_rng_stats = lv_label_create(parent);
         lv_obj_set_style_text_color(g_rng_stats, lv_color_white(), 0);
@@ -1876,14 +2074,54 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lv_obj_set_style_text_font(g_rng_log, &font_kr16, 0);
         lv_textarea_set_text(g_rng_log, (String("log: ") + g_rng_file + "\n").c_str());
 
-        lv_obj_t *txb = lv_btn_create(parent);
+        // Set base + TX beacon side by side (keeps vertical room for the two big readouts)
+        lv_obj_t *brow = lv_obj_create(parent);
+        lv_obj_remove_style_all(brow);
+        lv_obj_set_width(brow, lv_pct(100));
+        lv_obj_set_height(brow, LV_SIZE_CONTENT);
+        lv_obj_clear_flag(brow, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(brow, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(brow, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+        lv_obj_t *basb = lv_btn_create(brow);
+        lv_obj_t *bl = lv_label_create(basb);
+        lv_label_set_text(bl, "Set base");
+        lv_obj_add_event_cb(basb, range_setbase_cb, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, basb);
+
+        lv_obj_t *txb = lv_btn_create(brow);
         lv_obj_t *tl = lv_label_create(txb);
-        lv_label_set_text(tl, "TX beacon: off");
+        lv_label_set_text(tl, "TX: off");
         lv_obj_add_event_cb(txb, range_tx_toggle_cb, LV_EVENT_CLICKED, NULL);
         lv_group_add_obj(g, txb);
 
         if (!g_rng_poll) g_rng_poll = lv_timer_create(range_poll_cb, 50, NULL);
         lv_label_set_text(g_toast, LV_SYMBOL_UP " RSSI / loss test  -  log to SD");
+    } else if (strcmp(name, "KbTest") == 0) {
+        g_kbtest_active = true;
+        // Dump the previous (possibly untethered) log to serial so a reconnect captures it.
+        Serial.println("=== KBTEST /kbtest.log DUMP ===");
+        if (sd_init()) { File f = SD.open("/kbtest.log", FILE_READ);
+                         if (f) { while (f.available()) Serial.write(f.read()); f.close(); } }
+        Serial.println("=== DUMP END — live keys follow ===");
+
+        lv_obj_t *lbl = lv_label_create(parent);
+        lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+        lv_label_set_text(lbl, "Press EVERY key + combos (shift+, sym+).\n"
+                               "Logs to /kbtest.log + serial.  Trackball: click Close.");
+
+        g_kbtest_log = lv_textarea_create(parent);
+        lv_obj_set_width(g_kbtest_log, lv_pct(100));
+        lv_obj_set_flex_grow(g_kbtest_log, 1);
+        lv_obj_set_style_text_font(g_kbtest_log, &lv_font_montserrat_16, 0);
+        lv_textarea_set_text(g_kbtest_log, "ms\tcode\tdec\tchar\n");
+
+        lv_obj_t *cb = lv_btn_create(parent);
+        lv_obj_t *cl = lv_label_create(cb);
+        lv_label_set_text(cl, LV_SYMBOL_CLOSE " Close");
+        lv_obj_add_event_cb(cb, [](lv_event_t *) { lv_async_call(go_home_async, NULL); },
+                            LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, cb);
     } else if (strcmp(name, "GPS") == 0) {
         g_gps_fix = lv_label_create(parent);
         lv_obj_set_style_text_font(g_gps_fix, &lv_font_montserrat_16, 0);
@@ -1932,8 +2170,10 @@ static void go_home()
     if (g_bt_scan_timer)   { lv_timer_del(g_bt_scan_timer);   g_bt_scan_timer = NULL; }
     if (g_browser_timer)   { lv_timer_del(g_browser_timer);   g_browser_timer = NULL; }
     g_range_active = false;     // leaving any app → background LoRa RX resumes
+    g_kbtest_active = false; g_kbtest_log = NULL;
     if (g_rng_poll)        { lv_timer_del(g_rng_poll);        g_rng_poll = NULL; }
     if (g_rng_tx)          { lv_timer_del(g_rng_tx);          g_rng_tx = NULL; }
+    g_rng_dist = NULL;     // objects belong to the app view being torn down
     if (g_gps_ui)          { lv_timer_del(g_gps_ui);          g_gps_ui = NULL; }
     if (g_notes_ta) {                                  // auto-save notes on leave
         Preferences p;
@@ -2059,9 +2299,12 @@ static void boot_restore()
     g_kb_bright = p.getUChar("kbl", 127);
     g_tb_accel  = p.getUChar("tbaccel", 2);
     g_beep_vol  = p.getUChar("beepvol", 7);
+    g_gps_enabled = p.getBool("gpsen", true);
+    g_screen_bright = p.getUChar("bright", 16);
     p.end();
 
     setKeyboardBrightness(g_kb_bright);   // keyboard backlight on at boot
+    if (!g_gps_enabled) gps_set_enabled(false);   // apply saved GPS-off: put the module to backup
 
     if (ssid.length()) {
         WiFi.mode(WIFI_STA);
@@ -2138,7 +2381,7 @@ void setup()
     boot_restore();   // auto-reconnect saved Wi-Fi + restore BT state
 
     pinMode(BOARD_BL_PIN, OUTPUT);
-    setBrightness(16);
+    setBrightness(g_screen_bright);   // restore saved brightness (boot_restore loaded it above)
 
     Serial.println("T-Deck OS ready.");
 }
