@@ -230,9 +230,24 @@ identity. If the edge router is destroyed, a high-power transmitter outside a
 collapsed building broadcasts the *same frames* and every surviving device
 consumes them unmodified. The disaster extension therefore needs only three
 additions, not a new protocol: an arbitration rule when multiple broadcasters
-coexist (rev conflicts), mandatory authentication on `!AL`/evacuation content
-(spoofing is life-safety there), and an unsolicited repeat cadence — the
-downlink may reach devices whose uplink (`!GL`/`!GQ`) cannot climb back out.
+coexist (rev conflicts), **trust labeling** on `!AL`/evacuation content, and an
+unsolicited repeat cadence — the downlink may reach devices whose uplink
+(`!GL`/`!GQ`) cannot climb back out.
+
+**Trust model: authentication is a badge, never a gate.** A disaster is
+exactly when key infrastructure dies with the edge router, so receivers MUST
+consume and display unauthenticated broadcasts (a dropped real evacuation
+order kills more surely than a spoofed one) — and there is deliberately no
+"disaster mode" switch, since whoever can flip such a switch owns a downgrade
+attack. Instead, one policy at all times: signed frames (future: Ed25519
+detached signature — public-key, not PSK/HMAC, so the verify key can be
+printed on the device and shared with any agency) show "✓ authenticated",
+unsigned show "⚠ unauthenticated"; peacetime discipline comes from the label,
+not from dropping. One hard rule only: **an unsigned frame can never cancel
+or relax a signed directive** (monotonicity — the lure-them-out spoof is the
+one thing blocked structurally). **Payload encryption stays out on purpose**:
+confidentiality is the enemy of a life-safety broadcast — a borrowed, keyless
+device must still be able to read the evacuation map.
 
 **Design intent.** This channel assumes a **disaster scenario**: an edge router
 broadcasting to many receivers (evacuation info — the Gopher news service is
