@@ -298,8 +298,16 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     // comes from the glitch-suppressed `diff`; magnitude is fixed at one line.
     lv_obj_t *scroll_tgt = g_sd_view_ta ? g_sd_view_ta : g_art_scroll;   // file viewer OR news article
     if (scroll_tgt && diff != 0) {
-        lv_coord_t lh = lv_font_get_line_height(&font_kr16);
-        lv_obj_scroll_by(scroll_tgt, 0, diff > 0 ? -lh : lh, LV_ANIM_OFF);
+        // Clamp to the remaining content. lv_obj_scroll_by() does NOT bound a
+        // programmatic scroll (only touch drags are bounded), so without this the
+        // view keeps scrolling into blank space past the start/end of the text.
+        lv_coord_t lh   = lv_font_get_line_height(&font_kr16);
+        lv_coord_t dy   = (diff > 0) ? -lh : lh;                  // <0 = toward the end
+        lv_coord_t room = (dy < 0) ? lv_obj_get_scroll_bottom(scroll_tgt)
+                                   : lv_obj_get_scroll_top(scroll_tgt);
+        if (room < 0) room = 0;
+        if ((dy < 0 ? -dy : dy) > room) dy = (dy < 0) ? -room : room;
+        if (dy) lv_obj_scroll_by(scroll_tgt, 0, dy, LV_ANIM_OFF);
         data->enc_diff = 0;
     } else {
         data->enc_diff = g_edit_slider ? 0 : diff;
