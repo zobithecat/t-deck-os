@@ -9,8 +9,8 @@ Source of truth in code: **`src/lora_rf.h`** (PHY) and **`src/relay.h`** (envelo
 dedup) — both copied **byte-identical** into all three repos. Change PHY/envelope
 only there, then reflash every node (and re-AT the DX-LR02 if SF/CR/freq change).
 
-**Protocol version: v1.3** — _2026-08-11 (message class layer L0/L1/L2 — system
-lines leave the chat)._
+**Protocol version: v1.4** — _2026-08-11 (Gopher news headline frames `!GA`/`!GH`
+specified — endpoints show them in a news inbox, not the chat)._
 
 Versioning: **major** = incompatible on-air change (envelope or PHY flag-day —
 every node must be reflashed together); **minor** = backward-compatible addition
@@ -116,12 +116,44 @@ doesn't know a new system type simply never shows it.
 ```
 !CS\t<id>\tifft=<m>\tps=<m>\trtt=<m>      ← CS distance report (anchor broadcast)
 !SYS\tCSRATE\t<connected_s>\t<gap_s>      ← fleet command (was: bare "SYS CSRATE …")
-!GA\t… / !GH\t… / !GQ\t… / !GD\t…         ← reserved: Gopher-over-LoRa frames
+!GA\t<rev>\t<count>\t<digest>             ← news announce (v1.4, live — see below)
+!GH\t<rev>\t<art_id>\t<title>             ← news headline (v1.4, live — see below)
+!GQ\t… / !GD\t…                           ← reserved: Gopher article streams
 !AL\t…                                    ← reserved: disaster alert (unsolicited,
                                             repeated, preempts document streams)
 !SR\t…                                    ← reserved: situation report uplink
                                             (small nodes → edge router, backoff)
 ```
+
+### News headline service — `!GA` / `!GH`  (v1.4, live)
+
+The edge router (`P10`, the RPi-attached anchor) fetches a gopher news menu
+whenever the gopher server pings its webhook and broadcasts the headlines.
+This is the rehearsal for disaster evacuation-info dissemination — same data
+shape. Frames go out ttl=3 (relayed), one unframed packet each, ~1.5 s apart,
+each line ≤ 60 UTF-8 bytes.
+
+| frame | fields | encoding |
+|-------|--------|----------|
+| `!GA\t<rev>\t<count>\t<digest>` | revision announce, sent first | `rev` = crc32 of the raw menu, **base36 uppercase** (≤7 chars); `count` = headline count, base36; `digest` = crc32 of the joined selectors, base36 |
+| `!GH\t<rev>\t<art_id>\t<title>` | one per headline, in menu order | `art_id` = crc32 of the gopher **selector**, base36 (stable across revisions of the same article); `title` = UTF-8, truncated UTF-8-safe to fit the 60 B line. **Last field — may contain further tabs; split only the first 3.** |
+
+**Endpoint behavior (what a v1.4 device implements):**
+- Keep a **news inbox** keyed by `art_id` — a separate UI surface, never the
+  chat. On `!GH`: store/replace `{rev, art_id, title}`.
+- On `!GA` or `!GH` with a **new** `rev`: the new revision wins — drop stored
+  headlines belonging to older revs (the broadcast always re-sends the full
+  set for a revision).
+- `!GA`'s `count` tells the endpoint whether its set for that rev is complete
+  (missed frames happen; there is **no list-request frame yet** — an
+  incomplete set self-heals on the next broadcast of that or a newer rev).
+- The inbox is **ephemeral** (RAM); persistence and full-article fetch
+  (`!GQ`/`!GD` streams) come with a later version.
+- A duplicate `!GH` (same rev + art_id, e.g. direct + relayed copy that beat
+  the envelope dedup window) is an idempotent overwrite.
+
+Reference sender: `BLE_6_lora_combo/edge-router/edged.py` (`gopher_frames`) —
+the de-facto wire truth for these two frames.
 
 **Design intent.** This channel assumes a **disaster scenario**: an edge router
 broadcasting to many receivers (evacuation info — the Gopher news service is
@@ -294,6 +326,14 @@ are not stable.
 
 ## 12. Changelog
 
+- **v1.4 · 2026-08-11** — **News headline frames `!GA`/`!GH` specified** (§5).
+  The edge router broadcasts a gopher news menu on webhook: `!GA` revision
+  announce (crc32-base36 rev, count, digest) + one `!GH` per headline
+  (selector-derived stable `art_id`, UTF-8-safe-truncated title, split first
+  3 tabs only). Endpoints keep an ephemeral **news inbox** keyed by art_id
+  (separate UI, never chat); a newer rev evicts older headlines; incomplete
+  sets self-heal on the next broadcast. `!GQ`/`!GD` article streams stay
+  reserved. Minor bump — v1.3 devices silently drop these frames.
 - **v1.3 · 2026-08-11** — **Message class layer L0/L1/L2** (§5). System/telemetry
   lines (CS distance reports, `SYS` fleet commands, future Gopher frames) get a
   `!` prefix and a type registry; only L2 (`[SOF]`-framed text) reaches the chat
