@@ -224,6 +224,16 @@ acceptable for now; a later version can unicast the body (AAODV) once
 point-to-point routing lands. `!GD` is the concrete form of the reserved
 "Gopher article stream".
 
+**Broadcaster-agnostic by construction.** Receivers key on `rev`/`art_id`,
+never on the envelope `src` — no authority is bound to the edge router's
+identity. If the edge router is destroyed, a high-power transmitter outside a
+collapsed building broadcasts the *same frames* and every surviving device
+consumes them unmodified. The disaster extension therefore needs only three
+additions, not a new protocol: an arbitration rule when multiple broadcasters
+coexist (rev conflicts), mandatory authentication on `!AL`/evacuation content
+(spoofing is life-safety there), and an unsolicited repeat cadence — the
+downlink may reach devices whose uplink (`!GL`/`!GQ`) cannot climb back out.
+
 **Design intent.** This channel assumes a **disaster scenario**: an edge router
 broadcasting to many receivers (evacuation info — the Gopher news service is
 the rehearsal for exactly that data shape: revisioned documents, headlines as
