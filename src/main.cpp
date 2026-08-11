@@ -107,6 +107,7 @@ static int           g_news_n = 0;
 static char          g_news_rev[8] = "";        // current revision (base36 string)
 static int           g_news_count = -1;         // expected headline count from !GA (-1 = unknown)
 static uint32_t      g_news_beep_ms = 0;        // throttle the background "news arrived" chime
+static uint32_t      g_news_gl_ms   = 0;        // rate-limit our !GL menu requests
 static lv_obj_t     *g_news_root = NULL;        // News app content container (below the Back btn)
 static lv_obj_t     *g_news_list = NULL;        // headline list (non-NULL only in list view)
 // article body fetch/reassembly (v1.5 !GQ request / !GD chunked reply)
@@ -1095,6 +1096,7 @@ static void lora_tx_line(const String &payload);   // defined below; used by new
 static void news_show_list();
 static void news_show_article(const char *art_id, const char *title);
 static void news_send_gq();
+static void news_send_gl();
 
 // Upsert one headline by art_id. Returns true iff a NEW art_id was added (drives the
 // background chime + list refresh); an existing art_id is an idempotent title overwrite.
@@ -1180,8 +1182,25 @@ static void news_open_article_cb(lv_event_t *e)
     int idx = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
     if (idx >= 0 && idx < g_news_n) news_show_article(g_news[idx].art_id, g_news[idx].title);
 }
-static void news_back_cb(lv_event_t *)  { g_art_id[0] = 0; g_art_body = NULL; news_show_list(); }
-static void news_reqbtn_cb(lv_event_t *){ news_send_gq(); }
+static void news_back_cb(lv_event_t *)   { g_art_id[0] = 0; g_art_body = NULL; news_show_list(); }
+static void news_reqbtn_cb(lv_event_t *) { news_send_gq(); }
+static void news_refresh_cb(lv_event_t *){ news_send_gl(); }
+
+// Ask the edge router to (re)broadcast the headline menu — the news feed is
+// otherwise push-only, so a node that just booted waits for the next webhook.
+// We send the rev we hold a COMPLETE set for, else "-" = send me everything.
+// Rate-limited: the reply is a broadcast that costs the whole mesh its airtime.
+static void news_send_gl()
+{
+    if (!g_lora_ok) return;
+    uint32_t now = millis();
+    if (g_news_gl_ms && (uint32_t)(now - g_news_gl_ms) < 8000) return;   // too soon
+    g_news_gl_ms = now;
+    bool complete = g_news_rev[0] && g_news_count >= 0 && g_news_n >= g_news_count;
+    lora_tx_line(String("!GL\t") + (complete ? g_news_rev : "-") + "\n");
+    lora_radio.startReceive();
+    if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_REFRESH " requesting headlines...");
+}
 
 // Flood a body request for the open article to the edge router, then return to RX.
 static void news_send_gq()
@@ -1220,6 +1239,11 @@ static void news_show_list()
         lv_obj_add_event_cb(b, news_open_article_cb, LV_EVENT_CLICKED, NULL);
         lv_group_add_obj(g, b);
     }
+
+    lv_obj_t *rf = lv_btn_create(g_news_root);   // pull the menu instead of waiting for a push
+    lv_label_set_text(lv_label_create(rf), LV_SYMBOL_REFRESH " Refresh");
+    lv_obj_add_event_cb(rf, news_refresh_cb, LV_EVENT_CLICKED, NULL);
+    lv_group_add_obj(g, rf);
 }
 
 // ARTICLE view: title + body textarea + [List | Re-req], and fire the fetch.
@@ -2441,6 +2465,7 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lv_obj_set_style_pad_row(g_news_root, 6, 0);
         lv_obj_clear_flag(g_news_root, LV_OBJ_FLAG_SCROLLABLE);  // inner list/body scroll, not the root
         news_show_list();                     // paint the warm inbox as a tappable list
+        if (!g_news_n) news_send_gl();        // nothing cached -> pull the menu once
         lv_label_set_text(g_toast, LV_SYMBOL_BELL " select a headline -> fetch body");
     } else if (strcmp(name, "KbTest") == 0) {
         g_kbtest_active = true;
