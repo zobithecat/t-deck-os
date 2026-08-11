@@ -9,7 +9,13 @@ Source of truth in code: **`src/lora_rf.h`** (PHY) and **`src/relay.h`** (envelo
 dedup) — both copied **byte-identical** into all three repos. Change PHY/envelope
 only there, then reflash every node (and re-AT the DX-LR02 if SF/CR/freq change).
 
-_Last updated: 2026-08-11 (message class layer L0/L1/L2 — system lines leave the chat)._
+**Protocol version: v1.3** — _2026-08-11 (message class layer L0/L1/L2 — system
+lines leave the chat)._
+
+Versioning: **major** = incompatible on-air change (envelope or PHY flag-day —
+every node must be reflashed together); **minor** = backward-compatible addition
+(old nodes keep working, possibly ignoring new traffic). Each changelog entry
+(§12) carries its version. Bump the version in the same commit as the change.
 
 ---
 
@@ -275,18 +281,21 @@ are not stable.
 
 ## 12. Changelog
 
-- **2026-08-11** — **Message class layer L0/L1/L2** (§5). System/telemetry lines
-  (CS distance reports, `SYS` fleet commands, future Gopher frames) get a `!`
-  prefix and a type registry; only L2 (`[SOF]`-framed text) reaches the chat
+- **v1.3 · 2026-08-11** — **Message class layer L0/L1/L2** (§5). System/telemetry
+  lines (CS distance reports, `SYS` fleet commands, future Gopher frames) get a
+  `!` prefix and a type registry; only L2 (`[SOF]`-framed text) reaches the chat
   inbox/read-state. `!!` escape for user text starting with `!`. Unknown `!`
-  types drop silently (forward compat). Envelope/relay/dedup untouched.
-  Migration: RX + grandfather list first, then switch system TX to `!` forms.
-- **2026-07-01** — Pager schedules its Range PONG ~4× ToA after the PING (fixes
-  100 % Range loss with a relay: DX-LR02 turnaround + collision with the relay's
-  PING-forward). T-Deck Range is relay-aware and shows hops (direct/1/2). CSV gains
-  a `hops` column.
-- **2026-06-30** — SF12 → **SF9** (~7× less airtime). Pager 3× ToA / T-Deck 2× ToA
-  packet pacing; relay LBT (CAD); drop non-`R|` lines as corruption (CRC off).
-  Second relay `RBB` via build flag.
-- **2026-06-30** — Relay layer introduced: `R|src|pktid|ttl|line` envelope, 48-key
-  dedup, TTL flood (HB=1, text/PING/PONG=3). Shared `lora_rf.h` PHY params.
+  types drop silently (forward compat). Envelope/relay/dedup untouched — minor
+  bump. Migration: RX + grandfather list first, then switch system TX to `!` forms.
+- **v1.2 · 2026-07-01** — Pager schedules its Range PONG ~4× ToA after the PING
+  (fixes 100 % Range loss with a relay: DX-LR02 turnaround + collision with the
+  relay's PING-forward). T-Deck Range is relay-aware and shows hops (direct/1/2).
+  CSV gains a `hops` column. Behavior/timing only — minor bump.
+- **v1.1 · 2026-06-30** — SF12 → **SF9** (~7× less airtime). Pager 3× ToA /
+  T-Deck 2× ToA packet pacing; relay LBT (CAD); drop non-`R|` lines as corruption
+  (CRC off). Second relay `RBB` via build flag. PHY flag-day, but versioned
+  retroactively as minor (predates the scheme; all nodes were reflashed together).
+- **v1.0 · 2026-06-30** — Relay layer introduced: `R|src|pktid|ttl|line` envelope,
+  48-key dedup, TTL flood (HB=1, text/PING/PONG=3). Shared `lora_rf.h` PHY params.
+  Baseline of this versioning scheme. (Pre-envelope bare-line traffic = v0.x,
+  historical.)
