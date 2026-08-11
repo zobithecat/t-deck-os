@@ -21,8 +21,8 @@ every node must be reflashed together); **minor** = backward-compatible addition
 
 ## 1. Nodes
 
-A P2P multi-hop mesh of 4 nodes. Every node runs the same envelope + PHY, so any
-node hears any other in range; relays extend range by re-flooding.
+A P2P multi-hop mesh. Every node runs the same envelope + PHY, so any node hears
+any other in range; relays extend range by re-flooding.
 
 | id  | device        | radio                    | role                     |
 |-----|---------------|--------------------------|--------------------------|
@@ -30,10 +30,21 @@ node hears any other in range; relays extend range by re-flooding.
 | `P00` | pager         | ESP32-C3 + **DX-LR02** UART modem | endpoint (BLE keyboard)  |
 | `RAA` | Heltec WSV3 #1| ESP32-S3 + RadioLib SX1262 | pure relay               |
 | `RBB` | Heltec WSV3 #2| ESP32-S3 + RadioLib SX1262 | pure relay               |
+| `P10` | RPi + ME25LS02 anchor | ME25LS02 (own firmware, USB serial) | **edge router** — gopher news + `!SYS` fleet commands (`edged.py`) |
+
+Further ME25LS02 **CS anchors** share the PHY and broadcast `!CS` distance
+reports; they are not enumerated here.
 
 Per-hardware MACs live in `heltec-relay/node_id_map.csv` (gitignored). The DX-LR02
-is a **transparent** modem (LoRa PHY over UART, AT-configured); the other three
-drive the SX1262 directly via RadioLib. They interoperate because the PHY matches.
+is a **transparent** modem (LoRa PHY over UART, AT-configured) and the ME25LS02
+runs its own firmware, driven over USB serial by `edged.py`; the T-Deck and the two
+Heltecs drive the SX1262 directly via RadioLib. They interoperate because the PHY
+matches.
+
+**Relays originate nothing.** `RAA`/`RBB` only re-flood other nodes' packets
+(`src`/`pktid` preserved) and never transmit under their own id, so a node that
+builds a neighbour table from received traffic never sees them — the T-Deck's
+Discovery app therefore lists endpoints only.
 
 ---
 
@@ -262,6 +273,19 @@ blocking AT query — that used to drop the BLE keyboard).
 
 **Range ping/pong.** See §8.
 
+### Implementation status — what each node does *today*
+
+| node | L0/L1/L2 classes | headlines `!GA`/`!GH` | article `!GQ`/`!GD` | menu request `!GL` |
+|------|------------------|-----------------------|---------------------|--------------------|
+| `TFF` T-Deck | yes | yes — News app list + chime | yes — select a headline | yes — Refresh, and once on opening an empty inbox |
+| `P00` pager | yes | yes — announce/headline callbacks | not yet | not yet |
+| `P10` edge router | sender side | broadcasts them | answers `!GQ` | **not yet — `!GL` is ignored** |
+| `RAA`/`RBB` relays | payload stays opaque: they forward by `ttl`, never parse it | | | |
+
+Pager support lives in `pager-lora-qwerty/lora.cpp` (that tree carries uncommitted
+work in progress). Until the router implements `!GL`, a T-Deck Refresh transmits
+but nothing answers — v1.5 routers drop the unknown type silently, as intended.
+
 ### Migration
 
 RX first, TX second — same play as the relay-layer rollout:
@@ -283,8 +307,8 @@ RX first, TX second — same play as the relay-layer rollout:
 | `RELAY_TTL_MESH`  | 3 | yes — **up to 2 relay hops** |
 
 A relay (Heltec) forwards `ttl−1`, and **only when `ttl > 1`**, preserving
-`src`+`pktid`. Endpoints (`TFF`/`P00`) do **not** relay — they only originate and
-receive. Relay loop for each received line:
+`src`+`pktid`. Endpoints (`TFF`/`P00`/`P10`) do **not** relay — they only originate
+and receive. Relay loop for each received line:
 
 ```
 if !startsWith("R|"):        drop            # corruption (§9)
@@ -362,7 +386,7 @@ reply. It is **relay-aware**:
   `direct N  1-hop N  2-hop N`, and a per-session CSV
   `time,dir,seq,hops,rssi,snr,lat,lon`.
 
-Co-located (all 4 nodes on one desk) this reads mostly `direct` with occasional
+Co-located (the RF nodes on one desk) this reads mostly `direct` with occasional
 `1hop`; spread out, hops rise as the relay actually bridges.
 
 ---
@@ -375,10 +399,11 @@ Co-located (all 4 nodes on one desk) this reads mostly `direct` with occasional
 | envelope / TTL / dedup | `src/relay.h` (all 3 repos) | reflash all |
 | message formats / timing | endpoint TX/RX (`t-deck-os/src/main.cpp`, `pager-lora-qwerty/lora.cpp`) | reflash the endpoints |
 | relay behavior | `heltec-relay/src/main.cpp` | reflash relays |
+| news / system frames the router sends or answers (`!GA`/`!GH`/`!GD`, `!GQ`/`!GL`) | `BLE_6_lora_combo/edge-router/edged.py` | restart the daemon — no flashing |
 
 Repos: **t-deck-os** (GitHub), **pager-lora-qwerty** (local), **heltec-relay**
-(local). Identify boards by MAC (`esptool read-mac`) before flashing — port names
-are not stable.
+(local), **BLE_6_lora_combo/edge-router** (local, Python on the Pi). Identify boards
+by MAC (`esptool read-mac`) before flashing — port names are not stable.
 
 ---
 
