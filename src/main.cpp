@@ -320,15 +320,21 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     bool left = digitalRead(BOARD_TBOX_G04);
     if (left != last_left)   { last_left = left;   hdir = (hdir != 0) ? 0 : -1; }
 
-    if (hdir != 0 && g_edit_slider) {
+    if (hdir != 0 && (g_edit_slider || scroll_tgt)) {
         uint32_t now = millis();
         if (!(hdir == -last_hdir && (now - last_hms) < TB_REVERSE_MS)) {
-            int32_t mn = lv_slider_get_min_value(g_edit_slider);
-            int32_t mx = lv_slider_get_max_value(g_edit_slider);
-            int32_t range = mx - mn;
-            int32_t hstep = (range > 25) ? range / 25 : 1;
-            lv_slider_set_value(g_edit_slider, lv_slider_get_value(g_edit_slider) + hdir * hstep, LV_ANIM_OFF);
-            lv_event_send(g_edit_slider, LV_EVENT_VALUE_CHANGED, NULL);
+            if (g_edit_slider) {
+                int32_t mn = lv_slider_get_min_value(g_edit_slider);
+                int32_t mx = lv_slider_get_max_value(g_edit_slider);
+                int32_t range = mx - mn;
+                int32_t hstep = (range > 25) ? range / 25 : 1;
+                lv_slider_set_value(g_edit_slider, lv_slider_get_value(g_edit_slider) + hdir * hstep, LV_ANIM_OFF);
+                lv_event_send(g_edit_slider, LV_EVENT_VALUE_CHANGED, NULL);
+            } else {
+                // Reading view: vertical is taken by scrolling, so horizontal moves
+                // focus across the buttons (Back / List / Re-req); press activates.
+                data->enc_diff = hdir;
+            }
             last_hdir = hdir;
             last_hms  = now;
         }
@@ -1268,6 +1274,8 @@ static void news_show_article(const char *art_id, const char *title)
     lv_obj_add_event_cb(rq, news_reqbtn_cb, LV_EVENT_CLICKED, NULL);
     lv_group_add_obj(g, rq);
     lv_group_focus_obj(lst);
+    lv_label_set_text(g_toast, LV_SYMBOL_UP LV_SYMBOL_DOWN " scroll   "
+                               LV_SYMBOL_LEFT LV_SYMBOL_RIGHT " buttons   press = select");
 
     news_send_gq();
 }
