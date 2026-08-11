@@ -116,7 +116,8 @@ static int           g_art_total  = 0;          // n from !GD (0 = not yet known
 static int           g_art_have   = 0;          // chunks received
 static bool          g_art_seen[ART_MAX_CHUNKS];
 static String        g_art_chunk[ART_MAX_CHUNKS];
-static lv_obj_t     *g_art_body = NULL;         // article body textarea (non-NULL only in article view)
+static lv_obj_t     *g_art_body = NULL;         // article body label (non-NULL only in article view)
+static lv_obj_t     *g_art_scroll = NULL;       // article scroll container — trackball scrolls this by line
 static String        g_lora_compose;    // committed Korean text (preview appended on display)
 static lv_obj_t     *g_kr_btn;          // Kor/Eng toggle button
 static lv_obj_t     *g_sd_list;
@@ -295,9 +296,10 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     // In the file viewer, vertical scrolls the text one line at a time instead
     // of moving focus (the viewer's group holds only the Back button). Direction
     // comes from the glitch-suppressed `diff`; magnitude is fixed at one line.
-    if (g_sd_view_ta && diff != 0) {
+    lv_obj_t *scroll_tgt = g_sd_view_ta ? g_sd_view_ta : g_art_scroll;   // file viewer OR news article
+    if (scroll_tgt && diff != 0) {
         lv_coord_t lh = lv_font_get_line_height(&font_kr16);
-        lv_obj_scroll_by(g_sd_view_ta, 0, diff > 0 ? -lh : lh, LV_ANIM_OFF);
+        lv_obj_scroll_by(scroll_tgt, 0, diff > 0 ? -lh : lh, LV_ANIM_OFF);
         data->enc_diff = 0;
     } else {
         data->enc_diff = g_edit_slider ? 0 : diff;
@@ -1179,7 +1181,7 @@ static void news_send_gq()
 static void news_show_list()
 {
     if (!g_news_root) return;
-    g_art_body = NULL; g_art_id[0] = 0;
+    g_art_body = NULL; g_art_scroll = NULL; g_art_id[0] = 0;
     lv_obj_clean(g_news_root);
     lv_group_t *g = lv_group_get_default();
 
@@ -1233,6 +1235,7 @@ static void news_show_article(const char *art_id, const char *title)
     lv_obj_set_style_pad_all(scroll, 2, 0);
     lv_obj_set_scroll_dir(scroll, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(scroll, LV_SCROLLBAR_MODE_AUTO);
+    g_art_scroll = scroll;                           // trackball scrolls this (see trackball_read)
 
     g_art_body = lv_label_create(scroll);            // a label scrolls cleanly (textarea grabs touch for the cursor)
     lv_obj_set_width(g_art_body, lv_pct(100));
@@ -2503,7 +2506,7 @@ static void go_home()
     if (g_gps_ui)          { lv_timer_del(g_gps_ui);          g_gps_ui = NULL; }
     if (g_disc_timer)      { lv_timer_del(g_disc_timer);      g_disc_timer = NULL; }
     g_disc_lbl = NULL;
-    g_news_root = NULL; g_news_list = NULL; g_art_body = NULL; g_art_id[0] = 0;  // News views torn down (inbox data persists)
+    g_news_root = NULL; g_news_list = NULL; g_art_body = NULL; g_art_scroll = NULL; g_art_id[0] = 0;  // News views torn down (inbox data persists)
     if (g_notes_ta) {                                  // auto-save notes on leave
         Preferences p;
         p.begin("tdeckos", false);
