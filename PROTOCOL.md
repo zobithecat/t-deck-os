@@ -9,8 +9,8 @@ Source of truth in code: **`src/lora_rf.h`** (PHY) and **`src/relay.h`** (envelo
 dedup) — both copied **byte-identical** into all three repos. Change PHY/envelope
 only there, then reflash every node (and re-AT the DX-LR02 if SF/CR/freq change).
 
-**Protocol version: v1.4** — _2026-08-11 (Gopher news headline frames `!GA`/`!GH`
-specified — endpoints show them in a news inbox, not the chat)._
+**Protocol version: v1.5** — _2026-08-11 (Article fetch `!GQ`/`!GD` — selecting a
+news headline pulls the full body from the edge router as a chunked stream)._
 
 Versioning: **major** = incompatible on-air change (envelope or PHY flag-day —
 every node must be reflashed together); **minor** = backward-compatible addition
@@ -118,7 +118,8 @@ doesn't know a new system type simply never shows it.
 !SYS\tCSRATE\t<connected_s>\t<gap_s>      ← fleet command (was: bare "SYS CSRATE …")
 !GA\t<rev>\t<count>\t<digest>             ← news announce (v1.4, live — see below)
 !GH\t<rev>\t<art_id>\t<title>             ← news headline (v1.4, live — see below)
-!GQ\t… / !GD\t…                           ← reserved: Gopher article streams
+!GQ\t<art_id>                             ← article body request (v1.5, live — see below)
+!GD\t<art_id>\t<i>\t<n>\t<chunk>          ← article body chunk   (v1.5, live — see below)
 !AL\t…                                    ← reserved: disaster alert (unsolicited,
                                             repeated, preempts document streams)
 !SR\t…                                    ← reserved: situation report uplink
@@ -154,6 +155,36 @@ each line ≤ 60 UTF-8 bytes.
 
 Reference sender: `BLE_6_lora_combo/edge-router/edged.py` (`gopher_frames`) —
 the de-facto wire truth for these two frames.
+
+### Article fetch — `!GQ` / `!GD`  (v1.5, live)
+
+Selecting a headline in the news inbox pulls the **full article body** from the
+edge router on demand. The request floods to the router; the body streams back as
+chunks. One fetch serves every endpoint viewing that article (broadcast).
+
+| frame | fields | encoding |
+|-------|--------|----------|
+| `!GQ\t<art_id>` | body request, endpoint → router | `art_id` = the base36 id from the `!GH` headline the user selected. ttl=3 (reaches the multi-hop router). No nonce — the router coalesces repeats and the envelope dedup drops on-air duplicates. |
+| `!GD\t<art_id>\t<i>\t<n>\t<chunk>` | one body chunk, router → all | `art_id` echoes the request; `i` = chunk index (base36), `n` = total chunks (base36); `chunk` = UTF-8 body piece. **Last field — may contain tabs; split only the first 4.** Whole line ≤ 60 B. ttl=3. **Body newlines are encoded `\n` → `[NL]`** (the L2 chat convention) — decode after reassembly, since unframed lines cannot carry literal newlines. Chunks split on UTF-8 boundaries: index-ordered join restores the body byte-exactly. The router caps a body at ~1600 B and appends `[NL][이하 생략]` when truncated. |
+
+**Endpoint behavior (v1.5):**
+- Only the endpoint currently **viewing** that `art_id` consumes `!GD`; others
+  ignore it (art_id mismatch). The body is **ephemeral** (RAM), dropped on leaving.
+- Reassemble by index `i` (out-of-order tolerant); render progressively, showing
+  `i/n` and a `…` placeholder for gaps.
+- **No per-chunk ACK.** A missed chunk self-heals on **re-request** (send `!GQ`
+  again — the T-Deck's "Re-req" button).
+
+**Edge-router side (to implement):** answer `!GQ\t<art_id>` by mapping `art_id`
+(= crc32-base36 of a gopher selector) back to its selector, fetching that gopher
+document, chunking the body ≤ 60 B UTF-8-safe, and broadcasting `!GD` frames
+`i = 0…n-1` at ttl=3, ~1.5 s apart (same pacing as `gopher_frames`).
+
+**Note.** The reply is **broadcast** (the mesh has no unicast yet), so a fetch
+costs the whole mesh its airtime. Fetches are on-demand and rare, so this is
+acceptable for now; a later version can unicast the body (AAODV) once
+point-to-point routing lands. `!GD` is the concrete form of the reserved
+"Gopher article stream".
 
 **Design intent.** This channel assumes a **disaster scenario**: an edge router
 broadcasting to many receivers (evacuation info — the Gopher news service is
@@ -326,6 +357,12 @@ are not stable.
 
 ## 12. Changelog
 
+- **v1.5 · 2026-08-11** — **Article fetch `!GQ`/`!GD`** (§5). Selecting a news
+  headline sends `!GQ\t<art_id>`; the edge router streams the body back as
+  `!GD\t<art_id>\t<i>\t<n>\t<chunk>` (base36 `i`/`n`, split first 4 tabs, ≤ 60 B/line,
+  ttl=3, broadcast). Endpoints reassemble out-of-order, render progressively, and
+  re-request on gaps (no per-chunk ACK); body is ephemeral. T-Deck News app is now a
+  tappable list → article view. Minor bump — v1.4 devices drop `!GQ`/`!GD` silently.
 - **v1.4 · 2026-08-11** — **News headline frames `!GA`/`!GH` specified** (§5).
   The edge router broadcasts a gopher news menu on webhook: `!GA` revision
   announce (crc32-base36 rev, count, digest) + one `!GH` per headline
