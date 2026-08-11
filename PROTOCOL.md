@@ -9,7 +9,7 @@ Source of truth in code: **`src/lora_rf.h`** (PHY) and **`src/relay.h`** (envelo
 dedup) — both copied **byte-identical** into all three repos. Change PHY/envelope
 only there, then reflash every node (and re-AT the DX-LR02 if SF/CR/freq change).
 
-_Last updated: 2026-07-01 (SF9, scheduled Range PONG, hop-aware Range)._
+_Last updated: 2026-08-11 (message class layer L0/L1/L2 — system lines leave the chat)._
 
 ---
 
@@ -85,25 +85,84 @@ message are consecutive (`[SOF]`=n, chunk=n+1…, `[EOF]`=n+k).
 
 ---
 
-## 5. Message types  (the `<original-line>`)
+## 5. Message classes & types  (the `<original-line>`)
 
-| type | format | ttl |
-|------|--------|-----|
-| **text** (multi-packet) | `[SOF]` · `<chunk>`… · `[EOF]` | 3 |
-| **heartbeat** | `HB` \| `HB\t<id>` \| `HB\t<id>\trssi=<v>` | **1** |
-| **range ping** | `PING\t<seq>\t<id>` | 3 |
-| **range pong** | `PONG\t<seq>\t<id>` | 3 |
+Every payload line belongs to exactly one **class**. The class decides who
+consumes it — the stack, a system handler, or the chat UI. This is a pure
+**software-level** layer inside `<original-line>`: the envelope (§4), relays,
+dedup and TTL mechanics are untouched (relays treat the payload as opaque).
+
+| class | name | recognized by | consumer | in chat? | stored/read-state? |
+|-------|------|---------------|----------|----------|--------------------|
+| **L0** | link control | first token `HB` / `PING` / `PONG` | protocol stack | never | no |
+| **L1** | system / telemetry | line starts with **`!`** | type-dispatched handler | never | no (handler may keep its own state) |
+| **L2** | user text | `[SOF]` / chunk / `[EOF]` framing | chat inbox | yes | yes — only L2 gets inbox, chime, read-state and persistence |
+
+**Why.** Before this layer, anything that wasn't HB/PING/PONG fell through to
+the chat path — e.g. the CS anchors' distance reports (`CS ifft=…`) and
+`SYS CSRATE` commands rendered as chat bubbles on the T-Deck and pager, and the
+pager's EOF-timeout recovery could even wrap stray telemetry into a synthesized
+message. Classes make that routing explicit and forward-compatible: a node that
+doesn't know a new system type simply never shows it.
+
+### L1 system lines — `!<TYPE>\t<fields…>`
+
+```
+!CS\t<id>\tifft=<m>\tps=<m>\trtt=<m>      ← CS distance report (anchor broadcast)
+!SYS\tCSRATE\t<connected_s>\t<gap_s>      ← fleet command (was: bare "SYS CSRATE …")
+!GA\t… / !GH\t… / !GQ\t… / !GD\t…         ← reserved: Gopher-over-LoRa frames
+```
+
+- `<TYPE>` = short uppercase token; fields are tab-separated, **last field may
+  contain tabs** (parse first N tabs only, same rule as the envelope).
+- **Unknown `<TYPE>` → drop silently.** Never falls through to chat. This is
+  the forward-compatibility contract: new system traffic can be added without
+  touching nodes that don't care about it.
+- Default **ttl = 3** (relayed); a type may choose 1 (e.g. high-rate telemetry
+  that only matters in direct range — mind the airtime, every relayed L1 line
+  costs the mesh ~3× its ToA).
+- L1 lines may arrive **in the middle of an open L2 frame**; they must be
+  dispatched out-of-band and must **not** touch the SOF/EOF frame state or the
+  pager's EOF-timeout timer.
+
+### L2 escape rule
+
+A user chunk that would begin with a literal `!` is sent as `!!…`; the receiver
+strips one `!` from a chunk starting with `!!` **inside an open frame**. (A
+single-`!` line is always L1, even mid-frame.)
+
+### Types
+
+| class | type | format | ttl |
+|-------|------|--------|-----|
+| L2 | **text** (multi-packet) | `[SOF]` · `<chunk>`… · `[EOF]` | 3 |
+| L0 | **heartbeat** | `HB` \| `HB\t<id>` \| `HB\t<id>\trssi=<v>` | **1** |
+| L0 | **range ping** | `PING\t<seq>\t<id>` | 3 |
+| L0 | **range pong** | `PONG\t<seq>\t<id>` | 3 |
+| L1 | **system** | `!<TYPE>\t…` (registry above) | 3 (per-type) |
 
 **Text.** Body is chunked into **≤ 60 B UTF-8-safe** pieces (`LORA_MAX_LINE_BYTES`);
 literal newlines are encoded `\n` → `[NL]`. The T-Deck prefixes the body with
 `[<id>] `. Receiver accumulates chunks between `[SOF]`/`[EOF]`; the pager also
-**synthesizes an EOF** if a frame goes idle (EOF-timeout recovery).
+**synthesizes an EOF** if a frame goes idle (EOF-timeout recovery) — L1 lines do
+not reset that idle timer.
 
 **Heartbeat.** Every **60 s** (`LORA_HB_TX_MS`). ttl=1 → **never relayed** (the
 neighbor table reflects direct range only). Carries the last cached RSSI (no
 blocking AT query — that used to drop the BLE keyboard).
 
 **Range ping/pong.** See §8.
+
+### Migration
+
+RX first, TX second — same play as the relay-layer rollout:
+1. All endpoints learn the `!` dispatch + `!!` escape (RX-ready). During the
+   transition they also **grandfather** the known bare system patterns
+   (`CS ifft=`, `SYS `) into L1 so today's CS-anchor firmware stops polluting
+   the chat immediately.
+2. System senders (the ME25LS02 CS anchors' `lora_link`, the edge router)
+   switch their TX to `!CS` / `!SYS`.
+3. Once no bare system lines remain on air, delete the grandfather list.
 
 ---
 
@@ -216,6 +275,12 @@ are not stable.
 
 ## 12. Changelog
 
+- **2026-08-11** — **Message class layer L0/L1/L2** (§5). System/telemetry lines
+  (CS distance reports, `SYS` fleet commands, future Gopher frames) get a `!`
+  prefix and a type registry; only L2 (`[SOF]`-framed text) reaches the chat
+  inbox/read-state. `!!` escape for user text starting with `!`. Unknown `!`
+  types drop silently (forward compat). Envelope/relay/dedup untouched.
+  Migration: RX + grandfather list first, then switch system TX to `!` forms.
 - **2026-07-01** — Pager schedules its Range PONG ~4× ToA after the PING (fixes
   100 % Range loss with a relay: DX-LR02 turnaround + collision with the relay's
   PING-forward). T-Deck Range is relay-aware and shows hops (direct/1/2). CSV gains

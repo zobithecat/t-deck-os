@@ -4,6 +4,9 @@
 > **[`PROTOCOL.md`](PROTOCOL.md)** — update that one. This file captures the
 > original *relay-layer* design + rationale (some values are stale, e.g. SF12 →
 > now **SF9**; PONG timing and hop-aware Range are described in PROTOCOL.md).
+> Payloads are additionally classified **L0/L1/L2** since 2026-08-11 (system
+> lines carry a `!` prefix and never render as chat) — see PROTOCOL.md §5.
+> The relay is unaffected: the payload stays opaque to it.
 
 A thin "relay layer" that lets a **Heltec Wireless Stick V3** (ESP32-S3 + SX1262,
 902–928 MHz band) repeat packets between the DX-LR02 **pager** and the **T-Deck**,
