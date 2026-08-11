@@ -117,7 +117,20 @@ doesn't know a new system type simply never shows it.
 !CS\t<id>\tifft=<m>\tps=<m>\trtt=<m>      ← CS distance report (anchor broadcast)
 !SYS\tCSRATE\t<connected_s>\t<gap_s>      ← fleet command (was: bare "SYS CSRATE …")
 !GA\t… / !GH\t… / !GQ\t… / !GD\t…         ← reserved: Gopher-over-LoRa frames
+!AL\t…                                    ← reserved: disaster alert (unsolicited,
+                                            repeated, preempts document streams)
+!SR\t…                                    ← reserved: situation report uplink
+                                            (small nodes → edge router, backoff)
 ```
+
+**Design intent.** This channel assumes a **disaster scenario**: an edge router
+broadcasting to many receivers (evacuation info — the Gopher news service is
+the rehearsal for exactly that data shape: revisioned documents, headlines as
+alert summaries), plus **tiny, rare uplinks** from small nodes (`!SR`). The
+asymmetry is deliberate — downlink is structured and cacheable so late-joining
+nodes catch up via revisions; uplink is contention-based and must stay small.
+Alerts (`!AL`) are the one exception to request-triggered flow: pushed
+unsolicited, repeated, and allowed to preempt an in-flight document stream.
 
 - `<TYPE>` = short uppercase token; fields are tab-separated, **last field may
   contain tabs** (parse first N tabs only, same rule as the envelope).
