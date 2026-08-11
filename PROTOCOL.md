@@ -9,8 +9,8 @@ Source of truth in code: **`src/lora_rf.h`** (PHY) and **`src/relay.h`** (envelo
 dedup) — both copied **byte-identical** into all three repos. Change PHY/envelope
 only there, then reflash every node (and re-AT the DX-LR02 if SF/CR/freq change).
 
-**Protocol version: v1.5** — _2026-08-11 (Article fetch `!GQ`/`!GD` — selecting a
-news headline pulls the full body from the edge router as a chunked stream)._
+**Protocol version: v1.6** — _2026-08-11 (Headline menu request `!GL` — the news
+feed can be pulled, not just pushed)._
 
 Versioning: **major** = incompatible on-air change (envelope or PHY flag-day —
 every node must be reflashed together); **minor** = backward-compatible addition
@@ -118,6 +118,7 @@ doesn't know a new system type simply never shows it.
 !SYS\tCSRATE\t<connected_s>\t<gap_s>      ← fleet command (was: bare "SYS CSRATE …")
 !GA\t<rev>\t<count>\t<digest>             ← news announce (v1.4, live — see below)
 !GH\t<rev>\t<art_id>\t<title>             ← news headline (v1.4, live — see below)
+!GL\t<have_rev>                           ← headline menu request (v1.6, live — see below)
 !GQ\t<art_id>                             ← article body request (v1.5, live — see below)
 !GD\t<art_id>\t<i>\t<n>\t<chunk>          ← article body chunk   (v1.5, live — see below)
 !AL\t…                                    ← reserved: disaster alert (unsolicited,
@@ -146,8 +147,8 @@ each line ≤ 60 UTF-8 bytes.
   headlines belonging to older revs (the broadcast always re-sends the full
   set for a revision).
 - `!GA`'s `count` tells the endpoint whether its set for that rev is complete
-  (missed frames happen; there is **no list-request frame yet** — an
-  incomplete set self-heals on the next broadcast of that or a newer rev).
+  (missed frames happen; an incomplete set self-heals on the next broadcast
+  of that or a newer rev, or immediately via `!GL` below).
 - The inbox is **ephemeral** (RAM); persistence and full-article fetch
   (`!GQ`/`!GD` streams) come with a later version.
 - A duplicate `!GH` (same rev + art_id, e.g. direct + relayed copy that beat
@@ -155,6 +156,32 @@ each line ≤ 60 UTF-8 bytes.
 
 Reference sender: `BLE_6_lora_combo/edge-router/edged.py` (`gopher_frames`) —
 the de-facto wire truth for these two frames.
+
+### Headline menu request — `!GL`  (v1.6, live)
+
+The news feed is otherwise **push-only**: headlines go out when the gopher
+server pings the router's webhook, so a node that just booted (or just joined
+the mesh) sits on an empty inbox until the next push. `!GL` lets it **pull**.
+
+| frame | fields | encoding |
+|-------|--------|----------|
+| `!GL\t<have_rev>` | menu request, endpoint → router | `have_rev` = the `rev` the endpoint holds a **complete** set for, or **`-`** = "I have nothing / an incomplete set — send everything". ttl=3. |
+
+**Router behavior (to implement):**
+- `have_rev` = `-` **or** ≠ the router's current rev → **re-broadcast the whole
+  menu** (`!GA` + every `!GH`), same encoding and ~1.5 s pacing as the webhook path.
+- `have_rev` **==** current rev → send **`!GA` only** (confirms "you are current"
+  and carries `count`); do not re-send the headlines.
+- **Coalesce.** The reply is a broadcast, so one answer serves every listener:
+  ignore further `!GL` for ~30 s after answering. Several nodes waking together
+  must not each trigger a full menu storm.
+
+**Endpoint behavior:**
+- Send on explicit user action (a Refresh control) and **once** when the news UI
+  opens on an empty inbox. Never on a timer.
+- Rate-limit locally (T-Deck: one `!GL` per 8 s) — a full menu costs the mesh
+  `(count+1)` relayed lines of airtime.
+- Send `-` unless the local set is complete (`count` known and all headlines held).
 
 ### Article fetch — `!GQ` / `!GD`  (v1.5, live)
 
@@ -357,6 +384,14 @@ are not stable.
 
 ## 12. Changelog
 
+- **v1.6 · 2026-08-11** — **Headline menu request `!GL`** (§5). The news feed was
+  push-only, so a node that booted after the last webhook sat on an empty inbox.
+  `!GL\t<have_rev>` asks the router to re-broadcast the menu (`-` = send
+  everything); a matching rev is answered with `!GA` alone. The router coalesces
+  requests (~30 s) since the reply is a broadcast, and endpoints rate-limit and
+  only ask on user action or an empty inbox — never on a timer. T-Deck News gains
+  a Refresh button and asks once on open. Minor bump — v1.5 routers ignore `!GL`
+  and the feed stays push-only.
 - **v1.5 · 2026-08-11** — **Article fetch `!GQ`/`!GD`** (§5). Selecting a news
   headline sends `!GQ\t<art_id>`; the edge router streams the body back as
   `!GD\t<art_id>\t<i>\t<n>\t<chunk>` (base36 `i`/`n`, split first 4 tabs, ≤ 60 B/line,
