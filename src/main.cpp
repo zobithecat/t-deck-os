@@ -91,6 +91,32 @@ static bool          g_leader     = false;  // $ (0x04=shift+$) pressed → next
 static uint32_t      g_leader_ms  = 0;
 static bool          g_kbtest_active = false;   // KbTest app owns the keyboard (logs every key)
 static lv_obj_t     *g_kbtest_log;              // KbTest on-screen key readout
+
+// --- device discovery (live neighbor table, fed by every received R| packet) --
+struct Neighbor { char rid[4]; char name[14]; uint32_t last_ms; int16_t rssi; uint8_t hops; uint16_t count; };
+static Neighbor      g_neigh[8];
+static int           g_neigh_n = 0;
+static volatile int  g_lora_rx_rssi = 0;        // our RSSI of the packet being dispatched
+static lv_obj_t     *g_disc_lbl = NULL;         // Discovery app roster label
+static lv_timer_t   *g_disc_timer = NULL;
+
+// --- news inbox (v1.4 !GA/!GH headlines; v1.5 !GQ/!GD article fetch) — never chat --
+struct NewsItem { char art_id[8]; char title[62]; };
+static NewsItem      g_news[16];
+static int           g_news_n = 0;
+static char          g_news_rev[8] = "";        // current revision (base36 string)
+static int           g_news_count = -1;         // expected headline count from !GA (-1 = unknown)
+static uint32_t      g_news_beep_ms = 0;        // throttle the background "news arrived" chime
+static lv_obj_t     *g_news_root = NULL;        // News app content container (below the Back btn)
+static lv_obj_t     *g_news_list = NULL;        // headline list (non-NULL only in list view)
+// article body fetch/reassembly (v1.5 !GQ request / !GD chunked reply)
+#define ART_MAX_CHUNKS 48
+static char          g_art_id[8]  = "";         // art_id being fetched/viewed ("" = list mode)
+static int           g_art_total  = 0;          // n from !GD (0 = not yet known)
+static int           g_art_have   = 0;          // chunks received
+static bool          g_art_seen[ART_MAX_CHUNKS];
+static String        g_art_chunk[ART_MAX_CHUNKS];
+static lv_obj_t     *g_art_body = NULL;         // article body textarea (non-NULL only in article view)
 static String        g_lora_compose;    // committed Korean text (preview appended on display)
 static lv_obj_t     *g_kr_btn;          // Kor/Eng toggle button
 static lv_obj_t     *g_sd_list;
@@ -539,6 +565,8 @@ static void build_launcher_ui()
         { LV_SYMBOL_AUDIO,    "Speaker",           0xF472B6 },
         { LV_SYMBOL_GPS,      "LoRa",              0x34D399 },
         { LV_SYMBOL_UP,       "Range",             0xFBBF24 },
+        { LV_SYMBOL_LIST,     "Discovery",         0xA3E635 },
+        { LV_SYMBOL_BELL,     "News",              0xFCD34D },
         { LV_SYMBOL_GPS,      "GPS",               0xF87171 },
         { LV_SYMBOL_KEYBOARD, "KbTest",            0x60A5FA },
         { LV_SYMBOL_BELL,     "Messages",          0xFBBF24 },
@@ -1039,6 +1067,210 @@ static void lora_emit_msg(String msg)
     if (msg.length()) lora_log_print("< ", msg);
 }
 
+// --- message class layer (PROTOCOL.md §5, v1.3) ------------------------------
+// L1 system line "!<TYPE>\t<fields>": dispatched OUT-OF-BAND — logged to Serial for
+// debug, NEVER to the chat log/inbox (no bubble, chime, unread, persistence), and it
+// must not touch the [SOF]/[EOF] frame state. Unknown <TYPE> → silent drop (forward
+// compat). Per-type handlers are added here as the channel grows:
+//   !CS distance report · !SYS fleet cmd · !GA/!GH/!GQ/!GD Gopher · !AL alert · !SR sitrep.
+// News UI is a small state machine inside g_news_root: LIST ⇄ ARTICLE. Views rebuild
+// that container (never g_app_view — the framework Back button lives there).
+static void lora_tx_line(const String &payload);   // defined below; used by news_send_gq()
+static void news_show_list();
+static void news_show_article(const char *art_id, const char *title);
+static void news_send_gq();
+
+// Upsert one headline by art_id. Returns true iff a NEW art_id was added (drives the
+// background chime + list refresh); an existing art_id is an idempotent title overwrite.
+static bool news_upsert(const String &art, const String &title)
+{
+    if (!art.length()) return false;
+    const int CAP = sizeof(g_news) / sizeof(g_news[0]);
+    for (int i = 0; i < g_news_n; i++)
+        if (art.equals(g_news[i].art_id)) {
+            strncpy(g_news[i].title, title.c_str(), sizeof(g_news[i].title) - 1);
+            g_news[i].title[sizeof(g_news[i].title) - 1] = 0; return false;
+        }
+    if (g_news_n >= CAP) return false;
+    NewsItem &n = g_news[g_news_n++];
+    strncpy(n.art_id, art.c_str(),   sizeof(n.art_id) - 1); n.art_id[sizeof(n.art_id) - 1] = 0;
+    strncpy(n.title,  title.c_str(), sizeof(n.title)  - 1); n.title[sizeof(n.title)  - 1] = 0;
+    return true;
+}
+
+// Repaint the article body from the reassembly buffer (no-op unless the body view is up).
+static void news_art_render()
+{
+    if (!g_art_body) return;
+    if (!g_art_total) { lv_label_set_text(g_art_body, "requesting article..."); return; }
+    String body;
+    for (int i = 0; i < g_art_total; i++) body += g_art_seen[i] ? g_art_chunk[i] : "...";
+    body.replace("[NL]", "\n");            // decode newline encoding (same as chat lora_emit_msg)
+    if (g_art_have < g_art_total) {
+        char f[40]; snprintf(f, sizeof(f), "\n\n[%d/%d - tap Re-req]", g_art_have, g_art_total);
+        body += f;
+    }
+    lv_label_set_text(g_art_body, body.c_str());
+}
+
+// v1.5 article body chunk: !GD\t<art_id>\t<i>\t<n>\t<chunk>  (i,n base36; split first 4 tabs).
+static void news_data_handle(const String &line)
+{
+    int t0 = line.indexOf('\t');         if (t0 < 0) return;
+    int t1 = line.indexOf('\t', t0 + 1); if (t1 < 0) return;
+    int t2 = line.indexOf('\t', t1 + 1); if (t2 < 0) return;
+    int t3 = line.indexOf('\t', t2 + 1); if (t3 < 0) return;
+    if (!line.substring(t0 + 1, t1).equals(g_art_id)) return;         // not the open article
+    int i = (int)strtol(line.substring(t1 + 1, t2).c_str(), NULL, 36);
+    int n = (int)strtol(line.substring(t2 + 1, t3).c_str(), NULL, 36);
+    if (n < 1 || n > ART_MAX_CHUNKS || i < 0 || i >= n) return;
+    if (g_art_total != n) {                                           // (re)init on first / changed n
+        for (int k = 0; k < ART_MAX_CHUNKS; k++) { g_art_seen[k] = false; g_art_chunk[k] = ""; }
+        g_art_total = n; g_art_have = 0;
+    }
+    if (!g_art_seen[i]) { g_art_seen[i] = true; g_art_have++; g_art_chunk[i] = line.substring(t3 + 1); }
+    news_art_render();
+}
+
+// v1.4 news frames (§5): !GA rev-announce / !GH headline → ephemeral inbox keyed by
+// art_id (never chat). A newer <rev> evicts the old set; dup (rev,art_id) overwrites.
+static void news_handle(bool is_ga, const String &line)
+{
+    int t0 = line.indexOf('\t');           if (t0 < 0) return;
+    int t1 = line.indexOf('\t', t0 + 1);   if (t1 < 0) return;
+    int t2 = line.indexOf('\t', t1 + 1);
+    String rev = line.substring(t0 + 1, t1);
+    bool structural = false;
+    if (!rev.equals(g_news_rev)) {                         // new revision wins → drop old set
+        strncpy(g_news_rev, rev.c_str(), sizeof(g_news_rev) - 1);
+        g_news_rev[sizeof(g_news_rev) - 1] = 0;
+        g_news_n = 0; g_news_count = -1; structural = true;
+    }
+    if (is_ga) {
+        String cnt = (t2 < 0) ? line.substring(t1 + 1) : line.substring(t1 + 1, t2);
+        g_news_count = (int)strtol(cnt.c_str(), NULL, 36);
+    } else {
+        if (t2 < 0) return;                               // no title boundary → malformed
+        if (news_upsert(line.substring(t1 + 1, t2), line.substring(t2 + 1))) {   // NEW headline
+            structural = true;
+            if ((uint32_t)(millis() - g_news_beep_ms) > 4000) { beep_notify(); g_news_beep_ms = millis(); }
+        }
+    }
+    if (g_news_list && structural) news_show_list();      // refresh the list view if it's up
+}
+
+static void news_open_article_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+    if (idx >= 0 && idx < g_news_n) news_show_article(g_news[idx].art_id, g_news[idx].title);
+}
+static void news_back_cb(lv_event_t *)  { g_art_id[0] = 0; g_art_body = NULL; news_show_list(); }
+static void news_reqbtn_cb(lv_event_t *){ news_send_gq(); }
+
+// Flood a body request for the open article to the edge router, then return to RX.
+static void news_send_gq()
+{
+    if (!g_art_id[0] || !g_lora_ok) return;
+    lora_tx_line("!GQ\t" + String(g_art_id) + "\n");      // ttl=3, reaches the multi-hop edge router
+    lora_radio.startReceive();                            // listen for the !GD stream
+}
+
+// LIST view: header + a tappable button per headline.
+static void news_show_list()
+{
+    if (!g_news_root) return;
+    g_art_body = NULL; g_art_id[0] = 0;
+    lv_obj_clean(g_news_root);
+    lv_group_t *g = lv_group_get_default();
+
+    lv_obj_t *hdr = lv_label_create(g_news_root);
+    lv_obj_set_style_text_font(hdr, &font_kr16, 0);
+    lv_obj_set_style_text_color(hdr, lv_color_hex(0xFCD34D), 0);
+    if (g_news_n)
+        lv_label_set_text_fmt(hdr, LV_SYMBOL_BELL " news  rev %s  %d/%s",
+            g_news_rev[0] ? g_news_rev : "-", g_news_n,
+            g_news_count >= 0 ? String(g_news_count).c_str() : "?");
+    else
+        lv_label_set_text(hdr, LV_SYMBOL_BELL " news  (waiting for headlines...)");
+
+    g_news_list = lv_list_create(g_news_root);
+    lv_obj_set_width(g_news_list, lv_pct(100));
+    lv_obj_set_flex_grow(g_news_list, 1);
+    lv_obj_set_style_text_font(g_news_list, &font_kr16, 0);
+    for (int i = 0; i < g_news_n; i++) {
+        lv_obj_t *b = lv_list_add_btn(g_news_list, LV_SYMBOL_RIGHT, g_news[i].title);
+        lv_obj_set_style_text_font(b, &font_kr16, 0);   // Korean title — theme default doesn't reach list btns
+        lv_obj_set_user_data(b, (void *)(intptr_t)i);
+        lv_obj_add_event_cb(b, news_open_article_cb, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, b);
+    }
+}
+
+// ARTICLE view: title + body textarea + [List | Re-req], and fire the fetch.
+static void news_show_article(const char *art_id, const char *title)
+{
+    if (!g_news_root) return;
+    g_news_list = NULL;
+    strncpy(g_art_id, art_id, sizeof(g_art_id) - 1); g_art_id[sizeof(g_art_id) - 1] = 0;
+    g_art_total = 0; g_art_have = 0;
+    for (int k = 0; k < ART_MAX_CHUNKS; k++) { g_art_seen[k] = false; g_art_chunk[k] = ""; }
+
+    lv_obj_clean(g_news_root);
+    lv_group_t *g = lv_group_get_default();
+
+    lv_obj_t *ttl = lv_label_create(g_news_root);
+    lv_obj_set_width(ttl, lv_pct(100));
+    lv_label_set_long_mode(ttl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(ttl, &font_kr16, 0);
+    lv_obj_set_style_text_color(ttl, lv_color_hex(0xFCD34D), 0);
+    lv_label_set_text(ttl, title);
+
+    lv_obj_t *scroll = lv_obj_create(g_news_root);   // touch-scrollable read region
+    lv_obj_set_width(scroll, lv_pct(100));
+    lv_obj_set_flex_grow(scroll, 1);
+    lv_obj_set_style_bg_opa(scroll, LV_OPA_0, 0);
+    lv_obj_set_style_border_width(scroll, 0, 0);
+    lv_obj_set_style_pad_all(scroll, 2, 0);
+    lv_obj_set_scroll_dir(scroll, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(scroll, LV_SCROLLBAR_MODE_AUTO);
+
+    g_art_body = lv_label_create(scroll);            // a label scrolls cleanly (textarea grabs touch for the cursor)
+    lv_obj_set_width(g_art_body, lv_pct(100));
+    lv_label_set_long_mode(g_art_body, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(g_art_body, &font_kr16, 0);
+    lv_label_set_text(g_art_body, "requesting article...");
+
+    lv_obj_t *row = lv_obj_create(g_news_root);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_width(row, lv_pct(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *lst = lv_btn_create(row);
+    lv_label_set_text(lv_label_create(lst), LV_SYMBOL_LEFT " List");
+    lv_obj_add_event_cb(lst, news_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_group_add_obj(g, lst);
+
+    lv_obj_t *rq = lv_btn_create(row);
+    lv_label_set_text(lv_label_create(rq), LV_SYMBOL_REFRESH " Re-req");
+    lv_obj_add_event_cb(rq, news_reqbtn_cb, LV_EVENT_CLICKED, NULL);
+    lv_group_add_obj(g, rq);
+    lv_group_focus_obj(lst);
+
+    news_send_gq();
+}
+
+static void lora_l1_dispatch(const String &line)
+{
+    int t1 = line.indexOf('\t');
+    String type = (t1 < 0) ? line.substring(1) : line.substring(1, t1);
+    if (type == "GA") { news_handle(true,  line); return; }   // v1.4 news announce
+    if (type == "GH") { news_handle(false, line); return; }   // v1.4 news headline → inbox
+    if (type == "GD") { news_data_handle(line);   return; }   // v1.5 article body chunk
+    Serial.printf("[L1 %s] %s\n", type.c_str(), line.c_str()); // !CS/!SYS/!AL/… → drop
+}
+
 static void lora_process_line(const String &line)
 {
     if (line == "[SOF]") {
@@ -1053,18 +1285,23 @@ static void lora_process_line(const String &line)
         g_lora_rx_msg = "";
         return;
     }
-    if (line == "HB" || line.startsWith("HB\t")) {                  // heartbeat beacon
-        String id = "?", rssi = "";
-        int p1 = line.indexOf('\t');
-        if (p1 >= 0) {
-            int p2 = line.indexOf('\t', p1 + 1);
-            id = (p2 < 0) ? line.substring(p1 + 1) : line.substring(p1 + 1, p2);
-            if (p2 >= 0) {
-                String tail = line.substring(p2 + 1);
-                if (tail.startsWith("rssi=")) rssi = " " + tail.substring(5) + "dBm";
-            }
-        }
-        lora_log_print("~ ", id + " beacon" + rssi);
+    if (line == "HB" || line.startsWith("HB\t")) return;  // L0 beacon → Discovery app (neigh table), never chat
+    // --- message class layer (PROTOCOL.md §5) — MUST precede frame accumulation ---
+    // L1 ('!'): out-of-band system line, never chat. Inside an open frame a chunk
+    // beginning '!!' is L2 user text (strip one '!'); a single '!' is always L1.
+    if (line.length() && line[0] == '!') {
+        if (g_lora_in_frame && line.length() >= 2 && line[1] == '!')
+            g_lora_rx_msg += line.substring(1);           // L2 escape
+        else
+            lora_l1_dispatch(line);                       // L1 system → out-of-band
+        return;
+    }
+    // L0 range ping/pong: consumed by the Range app; never a chat bubble here.
+    if (line.startsWith("PING\t") || line.startsWith("PONG\t")) return;
+    // Grandfather (transition, §5 migration): bare pre-v1.3 system lines → consume so
+    // today's CS-anchor firmware stops polluting chat. Delete once none remain on air.
+    if (line.startsWith("CS ifft=") || line.startsWith("SYS ")) {
+        Serial.printf("[L1-legacy] %s\n", line.c_str());
         return;
     }
     if (g_lora_in_frame) { g_lora_rx_msg += line; return; }
@@ -1074,6 +1311,55 @@ static void lora_process_line(const String &line)
 }
 
 static RelaySeen g_relay_seen;
+
+// Upsert a node into the discovery table (evict the stalest when full).
+static void neigh_update(const String &rid, const String &name, int rssi, int hops)
+{
+    if (rid.length() == 0 || rid.length() > 3) return;
+    const int CAP = sizeof(g_neigh) / sizeof(g_neigh[0]);
+    int idx = -1;
+    for (int i = 0; i < g_neigh_n; i++) if (rid.equals(g_neigh[i].rid)) { idx = i; break; }
+    if (idx < 0) {
+        if (g_neigh_n < CAP) idx = g_neigh_n++;
+        else { idx = 0; for (int i = 1; i < CAP; i++) if (g_neigh[i].last_ms < g_neigh[idx].last_ms) idx = i; }
+        memset(&g_neigh[idx], 0, sizeof(Neighbor));
+        strncpy(g_neigh[idx].rid, rid.c_str(), 3);
+    }
+    Neighbor &n = g_neigh[idx];
+    n.last_ms = millis();
+    n.rssi    = (int16_t)rssi;
+    n.hops    = (uint8_t)hops;
+    if (n.count < 0xFFFF) n.count++;
+    if (name.length()) { strncpy(n.name, name.c_str(), sizeof(n.name) - 1); n.name[sizeof(n.name) - 1] = 0; }
+}
+
+// Discovery app: repaint the live-node roster once a second. A node is "alive" if
+// its last packet is < 180 s old (~3× the 60 s HB). The table is filled in the
+// background by lora_rx_dispatch, so it's warm before the app is even opened.
+static void discovery_poll_cb(lv_timer_t *)
+{
+    if (!g_disc_lbl) return;
+    uint32_t now = millis();
+    int alive = 0;
+    String body;
+    for (int i = 0; i < g_neigh_n; i++) {
+        Neighbor &n = g_neigh[i];
+        uint32_t age = (now - n.last_ms) / 1000;
+        bool live = age < 180;
+        if (live) alive++;
+        const char *hop = n.hops == 0 ? "direct" : (n.hops == 1 ? "1hop" : "2hop");
+        body += live ? LV_SYMBOL_OK " " : LV_SYMBOL_CLOSE " ";
+        body += n.rid;
+        if (n.name[0]) { body += " "; body += n.name; }
+        char tail[48];
+        snprintf(tail, sizeof(tail), "  %ddBm %s  %lus\n", (int)n.rssi, hop, (unsigned long)age);
+        body += tail;
+    }
+    if (!g_neigh_n) { lv_label_set_text(g_disc_lbl, "listening...  (no nodes yet)"); return; }
+    char hdr[40]; snprintf(hdr, sizeof(hdr), "%d/%d alive\n", alive, g_neigh_n);
+    lv_label_set_text(g_disc_lbl, (String(hdr) + body).c_str());
+}
+
 // Relay layer in front of the message parser: strip the R| header, drop our own
 // echoes (src==NODE_ID) and duplicates (a packet that arrived both directly and
 // relayed), then hand the original line to lora_process_line. Untagged (legacy)
@@ -1084,6 +1370,17 @@ static void lora_rx_dispatch(const String &line)
     if (relay_parse(line, src, pktid, ttl, orig)) {
         if (src == NODE_ID) return;
         if (relay_seen(g_relay_seen, src, pktid)) return;
+        // device discovery: this first (shortest-path) copy proves src is alive.
+        // HB is ttl=1 (never relayed) → always direct; other traffic hops = MESH−ttl.
+        bool is_hb = (orig == "HB" || orig.startsWith("HB\t"));
+        int  hops  = is_hb ? 0 : ((int)RELAY_TTL_MESH - (int)ttl);
+        if (hops < 0) hops = 0;
+        String nm;
+        if (orig.startsWith("HB\t")) {                 // HB carries a friendly display name
+            int p1 = orig.indexOf('\t'), p2 = orig.indexOf('\t', p1 + 1);
+            nm = (p2 < 0) ? orig.substring(p1 + 1) : orig.substring(p1 + 1, p2);
+        }
+        neigh_update(src, nm, g_lora_rx_rssi, hops);
         lora_process_line(orig);
     }
     // else: not a valid R| line = RF corruption (CRC is off; all real traffic is
@@ -1112,6 +1409,7 @@ static void lora_service()            // always-on background RX (called from lo
         g_lora_rx_flag = false;
         String pkt;
         if (lora_radio.readData(pkt) == RADIOLIB_ERR_NONE && pkt.length()) {
+            g_lora_rx_rssi = (int)lora_radio.getRSSI();  // for the discovery table
             int start = 0, len = pkt.length();           // split payload into newline-delimited lines
             for (int i = 0; i <= len; i++) {
                 if (i == len || pkt[i] == '\n' || pkt[i] == '\r') {
@@ -1152,7 +1450,9 @@ static void lora_send(const char *text)
             bytes += sz; end += sz;
         }
         if (end == i) end = i + 1;
-        lora_tx_line(body.substring(i, end) + "\n");
+        String chunk = body.substring(i, end);
+        if (chunk.length() && chunk[0] == '!') chunk = "!" + chunk;  // L2 escape (§5): user '!' → '!!'
+        lora_tx_line(chunk + "\n");
         i = end;
     }
     lora_tx_line("[EOF]\n");
@@ -2097,6 +2397,32 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
 
         if (!g_rng_poll) g_rng_poll = lv_timer_create(range_poll_cb, 50, NULL);
         lv_label_set_text(g_toast, LV_SYMBOL_UP " RSSI / loss test  -  log to SD");
+    } else if (strcmp(name, "Discovery") == 0) {
+        lora_init();                          // background RX feeds g_neigh; no radio ownership
+        lv_obj_t *hdr = lv_label_create(parent);
+        lv_obj_set_style_text_color(hdr, lv_color_hex(0xA3E635), 0);
+        lv_label_set_text(hdr, LV_SYMBOL_LIST "  live nodes  (HB + any traffic)");
+
+        g_disc_lbl = lv_label_create(parent);
+        lv_obj_set_width(g_disc_lbl, lv_pct(100));
+        lv_obj_set_style_text_font(g_disc_lbl, &font_kr16, 0);
+        lv_label_set_long_mode(g_disc_lbl, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(g_disc_lbl, "listening...");
+
+        if (!g_disc_timer) g_disc_timer = lv_timer_create(discovery_poll_cb, 1000, NULL);
+        discovery_poll_cb(NULL);              // paint immediately from the warm table
+        lv_label_set_text(g_toast, LV_SYMBOL_LIST " who's alive on the mesh");
+    } else if (strcmp(name, "News") == 0) {
+        lora_init();                          // background RX fills the inbox even when closed
+        g_news_root = lv_obj_create(parent);  // own container so list↔article rebuilds keep the Back btn
+        lv_obj_remove_style_all(g_news_root);
+        lv_obj_set_width(g_news_root, lv_pct(100));
+        lv_obj_set_flex_grow(g_news_root, 1);
+        lv_obj_set_flex_flow(g_news_root, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(g_news_root, 6, 0);
+        lv_obj_clear_flag(g_news_root, LV_OBJ_FLAG_SCROLLABLE);  // inner list/body scroll, not the root
+        news_show_list();                     // paint the warm inbox as a tappable list
+        lv_label_set_text(g_toast, LV_SYMBOL_BELL " select a headline -> fetch body");
     } else if (strcmp(name, "KbTest") == 0) {
         g_kbtest_active = true;
         // Dump the previous (possibly untethered) log to serial so a reconnect captures it.
@@ -2175,6 +2501,9 @@ static void go_home()
     if (g_rng_tx)          { lv_timer_del(g_rng_tx);          g_rng_tx = NULL; }
     g_rng_dist = NULL;     // objects belong to the app view being torn down
     if (g_gps_ui)          { lv_timer_del(g_gps_ui);          g_gps_ui = NULL; }
+    if (g_disc_timer)      { lv_timer_del(g_disc_timer);      g_disc_timer = NULL; }
+    g_disc_lbl = NULL;
+    g_news_root = NULL; g_news_list = NULL; g_art_body = NULL; g_art_id[0] = 0;  // News views torn down (inbox data persists)
     if (g_notes_ta) {                                  // auto-save notes on leave
         Preferences p;
         p.begin("tdeckos", false);
