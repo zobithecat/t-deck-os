@@ -9,8 +9,8 @@ Source of truth in code: **`src/lora_rf.h`** (PHY) and **`src/relay.h`** (envelo
 dedup) — both copied **byte-identical** into all three repos. Change PHY/envelope
 only there, then reflash every node (and re-AT the DX-LR02 if SF/CR/freq change).
 
-**Protocol version: v1.6** — _2026-08-11 (Headline menu request `!GL` — the news
-feed can be pulled, not just pushed)._
+**Protocol version: v1.7** — _2026-08-12 (Fan control `!FAN`/`!FS` — 12V PWM fan
+controllers driven by L1 broadcasts)._
 
 Versioning: **major** = incompatible on-air change (envelope or PHY flag-day —
 every node must be reflashed together); **minor** = backward-compatible addition
@@ -31,6 +31,7 @@ any other in range; relays extend range by re-flooding.
 | `RAA` | Heltec WSV3 #1| ESP32-S3 + RadioLib SX1262 | pure relay               |
 | `RBB` | Heltec WSV3 #2| ESP32-S3 + RadioLib SX1262 | pure relay               |
 | `P10` | RPi + ME25LS02 anchor | ME25LS02 (own firmware, USB serial) | **edge router** — gopher news + `!SYS` fleet commands (`edged.py`) |
+| `F00` | fan controller | XIAO ESP32S3 + RadioLib SX1262 (Wio-SX1262) | endpoint (12V 4-pin PWM fan, `!FAN`/`!FS`) |
 
 Further ME25LS02 **CS anchors** share the PHY and broadcast `!CS` distance
 reports; they are not enumerated here.
@@ -132,6 +133,8 @@ doesn't know a new system type simply never shows it.
 !GL\t<have_rev>                           ← headline menu request (v1.6, live — see below)
 !GQ\t<art_id>                             ← article body request (v1.5, live — see below)
 !GD\t<art_id>\t<i>\t<n>\t<chunk>          ← article body chunk   (v1.5, live — see below)
+!FAN\t<target>\t<cmd>[\t<arg>]            ← fan control command (v1.7, live — see below)
+!FS\t<id>\t<duty>\t<rpm>                  ← fan status report   (v1.7, live — see below)
 !AL\t…                                    ← reserved: disaster alert (unsolicited,
                                             repeated, preempts document streams)
 !SR\t…                                    ← reserved: situation report uplink
@@ -224,6 +227,29 @@ acceptable for now; a later version can unicast the body (AAODV) once
 point-to-point routing lands. `!GD` is the concrete form of the reserved
 "Gopher article stream".
 
+### Fan control — `!FAN` / `!FS`  (v1.7, live)
+
+12V 4-pin PWM fan controllers (`lora-fan-control` repo, XIAO ESP32S3 +
+Wio-SX1262, role letter **`F`**) are driven by broadcast L1 commands and answer
+with a status broadcast. Any node can command; commands reach through relays
+(ttl=3).
+
+| frame | fields | encoding |
+|-------|--------|----------|
+| `!FAN\t<target>\t<cmd>[\t<arg>]` | control command, any node → fans | `target` = 3-char routing id (`F00`) or `*` = every fan. `cmd` = `SET` (arg = duty 0–100, persisted to NVS and restored on boot) or `GET` (no arg). ttl=3. |
+| `!FS\t<id>\t<duty>\t<rpm>` | status report, fan → all | `id` = the fan's routing id; `duty` = current %, `rpm` = tach-measured. Sent in reply to `SET`/`GET`. ttl=3. |
+
+**Fan-controller behavior:**
+- The `!FS` reply is **scheduled ~4× ToA after the command, plus a random
+  0–4×ToA jitter** — the same no-immediate-reply rule as the Range PONG (§8:
+  DX-LR02 RX→TX turnaround + collision with the relay's own forward), with
+  jitter so multiple fans answering a `*` GET don't collide with each other.
+- A non-matching `target` is ignored silently; unknown `cmd` drops.
+- Optional local failsafe: no `!FAN` heard for a configured period → revert
+  to a configured duty (off by default; a pure local policy, not on-air).
+- Fans also send HB (ttl=1) and answer Range PING with a scheduled PONG, so
+  placement can be verified with the T-Deck Range app.
+
 **Broadcaster-agnostic by construction.** Receivers key on `rev`/`art_id`,
 never on the envelope `src` — no authority is bound to the edge router's
 identity. If the edge router is destroyed, a high-power transmitter outside a
@@ -306,6 +332,7 @@ blocking AT query — that used to drop the BLE keyboard).
 | `P00` pager | yes | yes — announce/headline callbacks | not yet | not yet |
 | `P10` edge router | sender side | broadcasts them | answers `!GQ` | **not yet — `!GL` is ignored** |
 | `RAA`/`RBB` relays | payload stays opaque: they forward by `ttl`, never parse it | | | |
+| `F00` fan controller | L0/L1 (no L2 chat) | drops | drops | — consumes `!FAN`, emits `!FS` (v1.7) |
 
 Pager support lives in `pager-lora-qwerty/lora.cpp` (that tree carries uncommitted
 work in progress). Until the router implements `!GL`, a T-Deck Refresh transmits
@@ -434,6 +461,13 @@ by MAC (`esptool read-mac`) before flashing — port names are not stable.
 
 ## 12. Changelog
 
+- **v1.7 · 2026-08-12** — **Fan control `!FAN`/`!FS`** (§5). New endpoint role
+  `F` (12V 4-pin PWM fan controllers, XIAO ESP32S3 + Wio-SX1262,
+  `lora-fan-control` repo). `!FAN\t<target|*>\tSET\t<0-100>` / `GET` command any fan over the mesh;
+  the fan replies `!FS\t<id>\t<duty>\t<rpm>` after a ~4×ToA hold + random jitter
+  (same deferred-reply rule as the Range PONG, jittered so `*` replies don't
+  collide). Duty persists in NVS across reboots; optional local failsafe. Minor
+  bump — v1.6 devices drop both types silently.
 - **v1.6 · 2026-08-11** — **Headline menu request `!GL`** (§5). The news feed was
   push-only, so a node that booted after the last webhook sat on an empty inbox.
   `!GL\t<have_rev>` asks the router to re-broadcast the menu (`-` = send
