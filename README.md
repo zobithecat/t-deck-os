@@ -38,6 +38,10 @@ esptool v5는 USB-Serial-JTAG로 다운로드 모드에 **자동 진입**한다 
 | `src/pins.h` | 핀맵 |
 | `src/main.cpp` | 부팅 시퀀스 + 런처 UI |
 
+메시 프로토콜 정본(PHY / `R|` envelope / L0·L1·L2 메시지 클래스 / `!G*` 뉴스 프레임)은
+이 repo가 아니라 **`gopher-over-lora` repo의 `lora/PROTOCOL.md`** 에 있다 — 4개 코드베이스
+(t-deck-os, pager-lora-qwerty, heltec-relay, 엣지 라우터)가 공유하는 문서라서.
+
 ## 로드맵
 - [x] 부팅 + 디스플레이 + 터치 + 런처 골격
 - [x] 트랙볼 인코더 내비게이션 + 키보드(I2C 0x55) 입력

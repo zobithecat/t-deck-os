@@ -25,7 +25,7 @@
 #include <TinyGPS++.h>
 
 #include "lora_rf.h"           // shared LoRa PHY params (freq/SF/BW/CR/sync/CRC)
-#define NODE_ID "TFF"          // relay-layer node id (T-Deck). See RELAY_PROTOCOL.md
+#define NODE_ID "TFF"          // relay-layer node id (T-Deck). Spec: gopher-over-lora lora/PROTOCOL.md
 #include "relay.h"
 #include <SD.h>
 #include <TFT_eSPI.h>
@@ -1084,7 +1084,7 @@ static void lora_emit_msg(String msg)
     if (msg.length()) lora_log_print("< ", msg);
 }
 
-// --- message class layer (PROTOCOL.md §5, v1.3) ------------------------------
+// --- message class layer (gopher-over-lora lora/PROTOCOL.md §5, v1.3) --------
 // L1 system line "!<TYPE>\t<fields>": dispatched OUT-OF-BAND — logged to Serial for
 // debug, NEVER to the chat log/inbox (no bubble, chime, unread, persistence), and it
 // must not touch the [SOF]/[EOF] frame state. Unknown <TYPE> → silent drop (forward
@@ -1329,7 +1329,7 @@ static void lora_process_line(const String &line)
         return;
     }
     if (line == "HB" || line.startsWith("HB\t")) return;  // L0 beacon → Discovery app (neigh table), never chat
-    // --- message class layer (PROTOCOL.md §5) — MUST precede frame accumulation ---
+    // --- message class layer (lora/PROTOCOL.md §5) — MUST precede frame accumulation ---
     // L1 ('!'): out-of-band system line, never chat. Inside an open frame a chunk
     // beginning '!!' is L2 user text (strip one '!'); a single '!' is always L1.
     if (line.length() && line[0] == '!') {
