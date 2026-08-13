@@ -126,6 +126,9 @@ static uint32_t      g_news_pending_ms = 0;
 static String        g_news_speak;              // what the announcement should read aloud
 // v1.8 !AL disaster alert — the channel this protocol exists for.
 static char          g_alert_id[8]   = "";
+static char          g_alert_seen[8] = "";   // last ANNOUNCED alert, kept in NVS ("alrtid"):
+                                             // an alert being repeated on the mesh must not
+                                             // chime again every time the device is switched on
 static char          g_alert_text[72] = "";
 static int           g_alert_sev     = 0;
 static uint32_t      g_alert_exp_ms  = 0;       // 0 = none active
@@ -189,7 +192,8 @@ static void go_home();
 static void open_app(const char *name);
 static void news_tick();
 static void tts_say(const String &text);   // eSpeak-NG (ko) via BackgroundAudio; no-op if muted
-static bool g_tts_enabled = true;          // Settings toggle, persisted in NVS ("tts")
+static bool    g_tts_enabled = true;       // Settings toggle, persisted in NVS ("tts")
+// loudness lives in g_audio_vol (one master control for speech AND tones) — see audio section
 static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g);
 static void kbtest_log_key(uint32_t key);
 static void back_event_cb(lv_event_t *e);
@@ -1327,8 +1331,16 @@ static void alert_handle(const String &line)
     strncpy(g_alert_text, text.c_str(), sizeof(g_alert_text) - 1); g_alert_text[sizeof(g_alert_text) - 1] = 0;
     g_alert_sev = sev;
     g_alert_exp_ms = exp > 0 ? millis() + (uint32_t)exp * 60000u : 0;
+    if (g_news_list) news_show_list();                    // banner always updates
+
+    // Announce ONCE per alert, ever. !AL is repeated on the mesh by design, and the
+    // display state is RAM-only, so without this every power-on re-announced a live
+    // alert as if it were new — the device screamed the moment it was switched on.
+    if (id.equals(g_alert_seen)) return;
+    strncpy(g_alert_seen, id.c_str(), sizeof(g_alert_seen) - 1); g_alert_seen[sizeof(g_alert_seen) - 1] = 0;
+    Preferences pr; pr.begin("tdeckos", false); pr.putString("alrtid", g_alert_seen); pr.end();
     news_mark_new(text);
-    g_news_pending_ms = millis() - 3000;                  // alerts announce immediately
+    g_news_pending_ms = millis() - 3000;                  // a genuinely new alert announces at once
 }
 
 // v1.4 news frames (§5): !GA rev-announce / !GH headline → ephemeral inbox keyed by
@@ -2472,7 +2484,7 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lv_obj_add_event_cb(tsw, [](lv_event_t *e) {
             g_tts_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
             Preferences pr; pr.begin("tdeckos", false); pr.putBool("tts", g_tts_enabled); pr.end();
-            if (g_tts_enabled) tts_say("음성 안내를 켰습니다");
+            if (g_tts_enabled) tts_say("음성 안내");
         }, LV_EVENT_VALUE_CHANGED, NULL);
         lv_group_add_obj(g, tsw);
 
@@ -2898,6 +2910,12 @@ static void news_tick()
     if (!g_news_pending || (uint32_t)(now - g_news_pending_ms) < 2500) return;
     g_news_pending = false;
 
+    // Quiet start. Right after power-on the user is holding the device, and the first
+    // seconds are exactly when the backlog arrives — a re-broadcast alert, or a whole
+    // menu answering our own !GL. Show all of it, announce none of it: the banner and
+    // the list are already on screen, so nothing is lost by not making noise.
+    if (now < 15000) { if (g_news_list) news_show_list(); g_news_speak = ""; return; }
+
     beep_notify();
     if (g_news_speak.length()) { tts_say(g_news_speak); g_news_speak = ""; }
 
@@ -2998,6 +3016,9 @@ static void boot_restore()
     g_tts_enabled = p.getBool("tts", true);
     g_audio_vol   = p.getUChar("ttsvol", 2);   // fresh NVS must come up QUIET, not full scale
     if (g_audio_vol > 10) g_audio_vol = 10;
+    // remember which alert we already announced, so a reboot inside a live alert is silent
+    { String a = p.getString("alrtid", ""); strncpy(g_alert_seen, a.c_str(), sizeof(g_alert_seen) - 1);
+      g_alert_seen[sizeof(g_alert_seen) - 1] = 0; }
     g_screen_bright = p.getUChar("bright", 16);
     p.end();
 
