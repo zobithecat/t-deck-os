@@ -3316,11 +3316,19 @@ static void power_save_run()
     const bool wifi_was = (WiFi.status() == WL_CONNECTED);
     const int  unread0  = (int)g_lora_unread;
 
+    const bool ble_was = g_ble_inited;
+
     lv_refr_now(NULL);                        // show the toast before the screen goes
     setBrightness(0);
     setKeyboardBrightness(0);
     if (gps_was)  gps_set_enabled(false);
     if (wifi_was) { WiFi.disconnect(true); WiFi.mode(WIFI_OFF); }
+
+    // Bluedroid has to go, for two reasons. It holds ~73 KB of INTERNAL RAM -- the
+    // scarce kind -- which left barely enough to save state, and its controller keeps
+    // a power-management lock that stops the CPU from actually stopping. Released
+    // here and re-created on wake, since the user only needs it inside the BT app.
+    if (ble_was) { BLEDevice::deinit(true); g_ble_inited = false; }
 
     lora_service();                           // clear any pending IRQ, else DIO1 is
     lora_radio.startReceive();                // already high and we wake immediately
@@ -3331,6 +3339,7 @@ static void power_save_run()
 
     while (digitalRead(BOARD_BOOT_PIN) == LOW) delay(10);   // wait for the 3 s hold to end,
     delay(50);                                              // or its LOW level wakes us at once
+
 
     for (;;) {
         esp_err_t sr = esp_light_sleep_start();
@@ -3360,6 +3369,7 @@ static void power_save_run()
     setKeyboardBrightness(kb);
     if (gps_was)  gps_set_enabled(true);
     if (wifi_was) { WiFi.mode(WIFI_STA); WiFi.begin(); }    // credentials are remembered
+    if (ble_was)  { BLEDevice::init("T-Deck OS"); g_ble_inited = true; }
 
     while (digitalRead(BOARD_BOOT_PIN) == LOW) delay(10);   // swallow the wake press so it
     delay(50);                                              // does not also click a button
@@ -3382,10 +3392,6 @@ static void power_save_run()
                    " dio1=" + ps_log[i].dio1 + "\n";
         g_ps_report = rep;                       // 'i' in the self-test console re-prints it
         Serial.print(rep);
-        if (sd_init()) {
-            File f = SD.open("/powersave.log", FILE_APPEND);
-            if (f) { f.print(rep); f.close(); }
-        }
     }
     if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_OK " awake");
 }
