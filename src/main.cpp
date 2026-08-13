@@ -1050,22 +1050,19 @@ static void browser_go(lv_event_t *e)
 
 // ESP32I2SAudio::begin() is NOT re-entrant: on a second call it returns false at the
 // first line, skipping the DMA setup, the pump task and i2s_channel_enable(). So the
-// board must have exactly ONE begin(), and it has to be the speech engine's, because
-// only BackgroundAudioSpeech knows eSpeak's rate and frame size. The one thing we do
-// need to override is its DMA appetite:
-class TDeckI2S : public ESP32I2SAudio {
-public:
-    using ESP32I2SAudio::ESP32I2SAudio;
-    // Speech asks for 5 x 1324 words, which the IDF rewrites to 10 x 662 = 26 KB of
-    // DMA-capable INTERNAL RAM. With Wi-Fi and BT up there is ~20 KB left, so that
-    // allocation fails and the assert in begin() reboots the board. 3 x 1023 = 12 KB
-    // fits and still holds two eSpeak frames, which is what the pump needs to keep
-    // the ring fed. (1023 is the per-descriptor ceiling: 4092 bytes / 4-byte frame.)
-    bool setBuffers(size_t, size_t, int32_t silenceSample = 0) override {
-        return ESP32I2SAudio::setBuffers(3, 1023, silenceSample);
-    }
-};
-static TDeckI2S              g_i2s(BOARD_I2S_BCK, BOARD_I2S_WS, BOARD_I2S_DOUT);
+// board has exactly ONE begin(), and it is the speech engine's, because only
+// BackgroundAudioSpeech knows eSpeak's rate and frame size.
+//
+// It also picks the DMA geometry, and that must be left alone: it asks for 5 buffers
+// of one eSpeak frame each so every DMA boundary lands on a frame boundary. Forcing a
+// different size (we tried 3 x 1023 to save RAM) makes every buffer end mid-frame and
+// the speech stutters and clicks.
+//
+// The 26 KB it wants comes out of DMA-capable INTERNAL RAM, of which only ~8 KB is
+// left once Wi-Fi and BT are up -- the allocation would fail and the assert inside
+// begin() reboots the board. Hence the ordering invariant: **setup() claims audio
+// before boot_restore() starts the radios**, while ~114 KB is still free.
+static ESP32I2SAudio         g_i2s(BOARD_I2S_BCK, BOARD_I2S_WS, BOARD_I2S_DOUT);
 static BackgroundAudioSpeech g_tts(g_i2s);   // the single owner: it performs the one begin()
 static bool                  g_tts_ready = false;
 static void                  audio_apply_volume();
