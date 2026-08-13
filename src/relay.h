@@ -23,11 +23,14 @@
 #define RELAY_TTL_MESH   3     // text / PING / PONG — up to 2 relay hops
 
 #ifndef RELAY_SEEN_N
-#define RELAY_SEEN_N 48        // recent (src,pktid) keys kept for dedup
-#endif
+#define RELAY_SEEN_N 256       // recent (src,pktid) keys kept for dedup
+#endif                         // 48 was sized for SF12: one article is up to 34 keys
+                               // and a menu rebroadcast count+1 more, so a single
+                               // fetch+refresh wrapped the ring and late copies read
+                               // as new. PROTOCOL.md §7 requires >=256 on forwarders.
 
 // ── dedup ring buffer ───────────────────────────────────────────────────────
-struct RelaySeen { uint32_t key[RELAY_SEEN_N]; uint8_t head; bool full; };
+struct RelaySeen { uint32_t key[RELAY_SEEN_N]; uint16_t head; bool full; };
 
 static inline uint32_t relay_hash(const String &s) {
     uint32_t h = 2166136261u;                              // FNV-1a
@@ -69,6 +72,17 @@ static inline bool relay_parse(const String &line, String &src, uint32_t &pktid,
     pktid = (uint32_t)strtoul(line.substring(p1 + 1, p2).c_str(), nullptr, 10);
     ttl   = (uint8_t)line.substring(p2 + 1, p3).toInt();
     orig  = line.substring(p3 + 1);                        // verbatim
+    // Grammar validation (PROTOCOL.md §4, v1.8). CRC is off, so a symbol burst can
+    // leave "R|" intact and corrupt the middle: "3" -> "83" used to be forwarded as
+    // ttl 82 until dedup happened to stop it. This is a parse rule, not a checksum —
+    // frame integrity stays the PHY CRC's job (DOCTRINE D2).
+    if (ttl > RELAY_TTL_MESH) return false;
+    if (src.length() != 3) return false;
+    if (src[0] < 'A' || src[0] > 'Z') return false;
+    for (int i = 1; i < 3; i++) {
+        char c = src[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'))) return false;
+    }
     return true;
 }
 // re-wrap for forwarding: preserve src+pktid, decrement ttl

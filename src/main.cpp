@@ -108,6 +108,25 @@ static char          g_news_rev[8] = "";        // current revision (base36 stri
 static int           g_news_count = -1;         // expected headline count from !GA (-1 = unknown)
 static uint32_t      g_news_beep_ms = 0;        // throttle the background "news arrived" chime
 static uint32_t      g_news_gl_ms   = 0;        // rate-limit our !GL menu requests
+static uint32_t      g_news_gq_ms   = 0;        // rate-limit our !GQ body requests (a stream is expensive)
+static long          g_news_seq     = -1;       // v1.8: monotonic revision counter from !GA (-1 = none)
+// v1.8: a !GH for a rev we have no !GA for is parked here until that !GA arrives —
+// headlines alone may no longer switch revisions (a late frame from a superseded
+// revision used to wipe the inbox).
+struct NewsHold { char rev[8]; char art_id[8]; char title[62]; };
+static NewsHold      g_hold[8];
+static int           g_hold_n = 0;
+// deferred announce: a menu rebroadcast delivers N headlines in a burst, so we chime,
+// speak and hijack ONCE after the burst settles instead of N times.
+static bool          g_news_pending    = false;
+static uint32_t      g_news_pending_ms = 0;
+static String        g_news_speak;              // what the announcement should read aloud
+// v1.8 !AL disaster alert — the channel this protocol exists for.
+static char          g_alert_id[8]   = "";
+static char          g_alert_text[72] = "";
+static int           g_alert_sev     = 0;
+static uint32_t      g_alert_exp_ms  = 0;       // 0 = none active
+static lv_obj_t     *g_alert_banner  = NULL;
 static lv_obj_t     *g_news_root = NULL;        // News app content container (below the Back btn)
 static lv_obj_t     *g_news_list = NULL;        // headline list (non-NULL only in list view)
 // article body fetch/reassembly (v1.5 !GQ request / !GD chunked reply)
@@ -119,6 +138,9 @@ static bool          g_art_seen[ART_MAX_CHUNKS];
 static String        g_art_chunk[ART_MAX_CHUNKS];
 static lv_obj_t     *g_art_body = NULL;         // article body label (non-NULL only in article view)
 static lv_obj_t     *g_art_scroll = NULL;       // article scroll container — trackball scrolls this by line
+static String        g_art_crc;                 // v1.8: crc32 of the whole body, from !GR
+static uint32_t      g_art_last_ms = 0;         // last !GR/!GD seen — idle detection for !GN
+static uint32_t      g_art_gn_ms   = 0;         // rate-limit our !GN repair requests
 static String        g_lora_compose;    // committed Korean text (preview appended on display)
 static lv_obj_t     *g_kr_btn;          // Kor/Eng toggle button
 static lv_obj_t     *g_sd_list;
@@ -162,6 +184,9 @@ static int           g_sd_count;
 
 static void go_home();
 static void open_app(const char *name);
+static void news_tick();
+static void tts_say(const String &text);   // eSpeak-NG (ko) via BackgroundAudio; no-op if muted
+static bool g_tts_enabled = true;          // Settings toggle, persisted in NVS ("tts")
 static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g);
 static void kbtest_log_key(uint32_t key);
 static void back_event_cb(lv_event_t *e);
@@ -1038,6 +1063,36 @@ static void speaker_play_cb(lv_event_t *e)
 
 // Short rising two-tone "ding-dong" for an incoming LoRa message. 0 = mute.
 // Blocks ~210 ms (called from the main loop on message RX) — fine for infrequent msgs.
+// --- Text-to-speech (eSpeak-NG, Korean) --------------------------------------
+// Audio can never cross a ~1 kbps mesh, but text can: a 60-byte !AL line becomes a
+// spoken sentence locally. That is why alerts are text on the wire and speech here.
+//
+// Needs BackgroundAudio, which requires the IDF 5.x I2S API (pioarduino core). The
+// __has_include guard is not a fallback for a missing feature — it keeps the protocol
+// work buildable on either core while the platform migration is verified separately.
+#if __has_include(<BackgroundAudioSpeech.h>)
+#include <BackgroundAudioSpeech.h>
+#include <ESP32I2SAudio.h>
+#include <libespeak-ng/voice/ko.h>
+static ESP32I2SAudio         g_tts_out(BOARD_I2S_BCK, BOARD_I2S_WS, BOARD_I2S_DOUT);
+static BackgroundAudioSpeech g_tts(g_tts_out);
+static bool                  g_tts_ready = false;
+static void tts_say(const String &text)
+{
+    if (!g_tts_enabled || !text.length()) return;
+    if (!g_tts_ready) { g_tts.setVoice(voice_ko); g_tts.begin(); g_tts_ready = true; }
+    g_tts.flush();                       // a newer alert preempts whatever is being read
+    g_tts.speak(text.c_str());           // synthesis runs on interrupts — loop() keeps going
+    Serial.printf("[TTS] %s\n", text.c_str());
+}
+#else
+static void tts_say(const String &text)
+{
+    if (!g_tts_enabled) return;
+    Serial.printf("[TTS-stub] %s\n", text.c_str());   // no speech engine on this core
+}
+#endif
+
 static void beep_notify()
 {
     if (g_beep_vol == 0) return;
@@ -1097,6 +1152,7 @@ static void news_show_list();
 static void news_show_article(const char *art_id, const char *title);
 static void news_send_gq();
 static void news_send_gl();
+static void news_mark_new(const String &speak);   // arm the deferred announce (alert_handle uses it)
 
 // Upsert one headline by art_id. Returns true iff a NEW art_id was added (drives the
 // background chime + list refresh); an existing art_id is an idempotent title overwrite.
@@ -1147,11 +1203,101 @@ static void news_data_handle(const String &line)
         g_art_total = n; g_art_have = 0;
     }
     if (!g_art_seen[i]) { g_art_seen[i] = true; g_art_have++; g_art_chunk[i] = line.substring(t3 + 1); }
+    g_art_last_ms = millis();
     news_art_render();
+}
+
+// v1.8 !GR\t<art_id>\t<n>\t<crc> — reply header: chunk count + crc32 of the whole body.
+static void news_head_handle(const String &line)
+{
+    int t0 = line.indexOf('\t');         if (t0 < 0) return;
+    int t1 = line.indexOf('\t', t0 + 1); if (t1 < 0) return;
+    int t2 = line.indexOf('\t', t1 + 1); if (t2 < 0) return;
+    if (!line.substring(t0 + 1, t1).equals(g_art_id)) return;      // not the open article
+    int n = (int)strtol(line.substring(t1 + 1, t2).c_str(), NULL, 36);
+    if (n < 1 || n > ART_MAX_CHUNKS) return;
+    if (g_art_total != n) {
+        for (int k = 0; k < ART_MAX_CHUNKS; k++) { g_art_seen[k] = false; g_art_chunk[k] = ""; }
+        g_art_total = n; g_art_have = 0;
+    }
+    g_art_crc = line.substring(t2 + 1);
+    g_art_last_ms = millis();
+    news_art_render();
+}
+
+// v1.8 !GN\t<art_id>\t<bitmap> — ask only for the chunks we are missing, instead of
+// re-requesting the whole ~50 s stream (the loss -> re-request -> more loss loop).
+static void news_send_gn()
+{
+    if (!g_art_id[0] || !g_lora_ok || !g_art_total) return;
+    if (g_art_have >= g_art_total) return;
+    uint32_t now = millis();
+    if (g_art_gn_ms && (uint32_t)(now - g_art_gn_ms) < 8000) return;
+    g_art_gn_ms = now;
+    uint32_t bits = 0;                                    // ART_MAX_CHUNKS <= 48; 32 fit a word
+    for (int i = 0; i < g_art_total && i < 32; i++) if (g_art_seen[i]) bits |= (1u << i);
+    char b36[8]; int p = 0;                               // base36, LSB = chunk 0
+    if (!bits) b36[p++] = '0';
+    while (bits && p < 7) { int d = bits % 36; b36[p++] = d < 10 ? ('0' + d) : ('A' + d - 10); bits /= 36; }
+    b36[p] = 0;
+    lora_tx_line("!GN\t" + String(g_art_id) + "\t" + String(b36) + "\n");
+    lora_radio.startReceive();
+}
+
+// v1.8 !AL — disaster alert. Chime, speak, and pull the user to the News app from
+// wherever they are: an alert nobody is looking at has not been delivered.
+static void alert_handle(const String &line)
+{
+    String f[8]; int p = 0, start = line.indexOf('\t');   // 8 fixed fields, then free text
+    for (int i = 0; i < 8 && start >= 0; i++) {
+        int nx = line.indexOf('\t', start + 1);
+        if (nx < 0) { f[p++] = line.substring(start + 1); start = -1; break; }
+        f[p++] = line.substring(start + 1, nx); start = nx;
+    }
+    if (p < 8 || start < 0) return;                       // malformed
+    String id = f[0], mtype = f[1], text = line.substring(start + 1);
+    int  sev = f[2].toInt();
+    long exp = strtol(f[4].c_str(), NULL, 10);            // minutes
+    String ref = f[5];
+
+    if (mtype == "C") {                                   // cancel clears only its reference
+        if (ref.equals(g_alert_id)) { g_alert_id[0] = 0; g_alert_exp_ms = 0; g_alert_text[0] = 0; }
+        return;
+    }
+    if (id.equals(g_alert_id)) return;                    // a repeat of what we already show
+    strncpy(g_alert_id, id.c_str(), sizeof(g_alert_id) - 1);      g_alert_id[sizeof(g_alert_id) - 1] = 0;
+    strncpy(g_alert_text, text.c_str(), sizeof(g_alert_text) - 1); g_alert_text[sizeof(g_alert_text) - 1] = 0;
+    g_alert_sev = sev;
+    g_alert_exp_ms = exp > 0 ? millis() + (uint32_t)exp * 60000u : 0;
+    news_mark_new(text);
+    g_news_pending_ms = millis() - 3000;                  // alerts announce immediately
 }
 
 // v1.4 news frames (§5): !GA rev-announce / !GH headline → ephemeral inbox keyed by
 // art_id (never chat). A newer <rev> evicts the old set; dup (rev,art_id) overwrites.
+// Flag that something new arrived; the announcement itself fires once the burst
+// settles (news_tick), so a full menu rebroadcast chimes and speaks a single time.
+static void news_mark_new(const String &speak)
+{
+    g_news_pending = true;
+    g_news_pending_ms = millis();
+    if (speak.length()) g_news_speak = speak;
+}
+
+// Adopt any parked headline that belongs to the now-current revision.
+static bool news_flush_hold()
+{
+    bool added = false;
+    for (int i = 0; i < g_hold_n; i++)
+        if (!strcmp(g_hold[i].rev, g_news_rev))
+            added |= news_upsert(g_hold[i].art_id, g_hold[i].title);
+    g_hold_n = 0;
+    return added;
+}
+
+// v1.4 !GA / !GH  (+v1.8 monotonic seq, PROTOCOL.md §5).
+//   !GA\t<rev>\t<count>\t<digest>\t<seq>   — only a GREATER seq may switch revisions
+//   !GH\t<rev>\t<art_id>\t<title>          — never switches a revision on its own
 static void news_handle(bool is_ga, const String &line)
 {
     int t0 = line.indexOf('\t');           if (t0 < 0) return;
@@ -1159,20 +1305,35 @@ static void news_handle(bool is_ga, const String &line)
     int t2 = line.indexOf('\t', t1 + 1);
     String rev = line.substring(t0 + 1, t1);
     bool structural = false;
-    if (!rev.equals(g_news_rev)) {                         // new revision wins → drop old set
-        strncpy(g_news_rev, rev.c_str(), sizeof(g_news_rev) - 1);
-        g_news_rev[sizeof(g_news_rev) - 1] = 0;
-        g_news_n = 0; g_news_count = -1; structural = true;
-    }
+
     if (is_ga) {
+        int t3 = (t2 < 0) ? -1 : line.indexOf('\t', t2 + 1);          // digest | seq
+        long seq = (t3 < 0) ? -1 : strtol(line.substring(t3 + 1).c_str(), NULL, 36);
+        if (!rev.equals(g_news_rev)) {
+            // v1.8: order by seq. A v1.7 sender omits it (seq < 0) — fall back to the
+            // old "different rev wins" so the mesh keeps working during the rollout.
+            if (seq >= 0 && g_news_seq >= 0 && seq <= g_news_seq) return;   // stale/duplicate
+            strncpy(g_news_rev, rev.c_str(), sizeof(g_news_rev) - 1);
+            g_news_rev[sizeof(g_news_rev) - 1] = 0;
+            g_news_n = 0; g_news_count = -1; structural = true;
+            if (news_flush_hold()) news_mark_new(g_news_n ? g_news[0].title : "");
+        }
+        if (seq >= 0) g_news_seq = seq;
         String cnt = (t2 < 0) ? line.substring(t1 + 1) : line.substring(t1 + 1, t2);
         g_news_count = (int)strtol(cnt.c_str(), NULL, 36);
     } else {
-        if (t2 < 0) return;                               // no title boundary → malformed
-        if (news_upsert(line.substring(t1 + 1, t2), line.substring(t2 + 1))) {   // NEW headline
-            structural = true;
-            if ((uint32_t)(millis() - g_news_beep_ms) > 4000) { beep_notify(); g_news_beep_ms = millis(); }
+        if (t2 < 0) return;                                            // no title boundary
+        String art = line.substring(t1 + 1, t2), title = line.substring(t2 + 1);
+        if (!rev.equals(g_news_rev)) {                                 // unknown rev → park it
+            if (g_hold_n < (int)(sizeof(g_hold) / sizeof(g_hold[0]))) {
+                NewsHold &h = g_hold[g_hold_n++];
+                strncpy(h.rev, rev.c_str(), sizeof(h.rev) - 1);       h.rev[sizeof(h.rev) - 1] = 0;
+                strncpy(h.art_id, art.c_str(), sizeof(h.art_id) - 1); h.art_id[sizeof(h.art_id) - 1] = 0;
+                strncpy(h.title, title.c_str(), sizeof(h.title) - 1); h.title[sizeof(h.title) - 1] = 0;
+            }
+            return;
         }
+        if (news_upsert(art, title)) { structural = true; news_mark_new(title); }
     }
     if (g_news_list && structural) news_show_list();      // refresh the list view if it's up
 }
@@ -1206,8 +1367,17 @@ static void news_send_gl()
 static void news_send_gq()
 {
     if (!g_art_id[0] || !g_lora_ok) return;
+    // One stream is ~50 s of everyone's airtime, so it gets the same guard !GL has —
+    // tapping list↔article or mashing Re-req must not stack streams on the router.
+    uint32_t now = millis();
+    if (g_news_gq_ms && (uint32_t)(now - g_news_gq_ms) < 45000) {
+        if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_REFRESH " already requested - waiting");
+        return;
+    }
+    g_news_gq_ms = now;
+    g_art_gn_ms = 0;
     lora_tx_line("!GQ\t" + String(g_art_id) + "\n");      // ttl=3, reaches the multi-hop edge router
-    lora_radio.startReceive();                            // listen for the !GD stream
+    lora_radio.startReceive();                            // listen for the !GR/!GD stream
 }
 
 // LIST view: header + a tappable button per headline.
@@ -1217,6 +1387,18 @@ static void news_show_list()
     g_art_body = NULL; g_art_scroll = NULL; g_art_id[0] = 0;
     lv_obj_clean(g_news_root);
     lv_group_t *g = lv_group_get_default();
+
+    if (g_alert_text[0]) {                       // v1.8 !AL — top of the screen, unmissable
+        g_alert_banner = lv_label_create(g_news_root);
+        lv_obj_set_width(g_alert_banner, lv_pct(100));
+        lv_label_set_long_mode(g_alert_banner, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(g_alert_banner, &font_kr16, 0);
+        lv_obj_set_style_text_color(g_alert_banner, lv_color_hex(0xFCA5A5), 0);
+        lv_obj_set_style_bg_color(g_alert_banner, lv_color_hex(0x7F1D1D), 0);
+        lv_obj_set_style_bg_opa(g_alert_banner, LV_OPA_COVER, 0);
+        lv_obj_set_style_pad_all(g_alert_banner, 4, 0);
+        lv_label_set_text_fmt(g_alert_banner, LV_SYMBOL_WARNING " %s", g_alert_text);
+    }
 
     lv_obj_t *hdr = lv_label_create(g_news_root);
     lv_obj_set_style_text_font(hdr, &font_kr16, 0);
@@ -1297,6 +1479,13 @@ static void news_show_article(const char *art_id, const char *title)
     lv_label_set_text(lv_label_create(rq), LV_SYMBOL_REFRESH " Re-req");
     lv_obj_add_event_cb(rq, news_reqbtn_cb, LV_EVENT_CLICKED, NULL);
     lv_group_add_obj(g, rq);
+
+    lv_obj_t *rd = lv_btn_create(row);                       // read the body aloud
+    lv_label_set_text(lv_label_create(rd), LV_SYMBOL_AUDIO " Read");
+    lv_obj_add_event_cb(rd, [](lv_event_t *) {
+        if (g_art_body) tts_say(lv_label_get_text(g_art_body));
+    }, LV_EVENT_CLICKED, NULL);
+    lv_group_add_obj(g, rd);
     lv_group_focus_obj(lst);
     lv_label_set_text(g_toast, LV_SYMBOL_UP LV_SYMBOL_DOWN " scroll   "
                                LV_SYMBOL_LEFT LV_SYMBOL_RIGHT " buttons   press = select");
@@ -1308,9 +1497,11 @@ static void lora_l1_dispatch(const String &line)
 {
     int t1 = line.indexOf('\t');
     String type = (t1 < 0) ? line.substring(1) : line.substring(1, t1);
-    if (type == "GA") { news_handle(true,  line); return; }   // v1.4 news announce
+    if (type == "GA") { news_handle(true,  line); return; }   // v1.4 news announce (+v1.8 seq)
     if (type == "GH") { news_handle(false, line); return; }   // v1.4 news headline → inbox
+    if (type == "GR") { news_head_handle(line);   return; }   // v1.8 article reply header
     if (type == "GD") { news_data_handle(line);   return; }   // v1.5 article body chunk
+    if (type == "AL") { alert_handle(line);       return; }   // v1.8 disaster alert
     Serial.printf("[L1 %s] %s\n", type.c_str(), line.c_str()); // !CS/!SYS/!AL/… → drop
 }
 
@@ -1339,6 +1530,10 @@ static void lora_process_line(const String &line)
             lora_l1_dispatch(line);                       // L1 system → out-of-band
         return;
     }
+    // Inside an open frame everything below is user text (PROTOCOL.md §5, v1.8):
+    // the L0 and grandfather prefixes are matched only OUTSIDE a frame, otherwise a
+    // chunk that happens to start with "PING\t" or "SYS " is silently eaten mid-message.
+    if (g_lora_in_frame) { g_lora_rx_msg += line; return; }
     // L0 range ping/pong: consumed by the Range app; never a chat bubble here.
     if (line.startsWith("PING\t") || line.startsWith("PONG\t")) return;
     // Grandfather (transition, §5 migration): bare pre-v1.3 system lines → consume so
@@ -1347,7 +1542,6 @@ static void lora_process_line(const String &line)
         Serial.printf("[L1-legacy] %s\n", line.c_str());
         return;
     }
-    if (g_lora_in_frame) { g_lora_rx_msg += line; return; }
     if (line == "AT" || line == "OK" || line.startsWith("AT+") ||   // AT artifacts
         line.startsWith("EROOR") || line.startsWith("ERROR")) return;
     lora_emit_msg(line);                                            // standalone line
@@ -1486,10 +1680,13 @@ static void lora_send(const char *text)
     int n = body.length(), i = 0;
     while (i < n) {                                  // UTF-8-safe <=60-byte chunks
         int end = i, bytes = 0;
+        // Budget the L2 escape while splitting (§5, v1.8): a chunk that starts with '!'
+        // grows by one byte, so cut it at 59 — escaping after a 60 B split yields 61.
+        int cap = (body[i] == '!') ? LORA_MAX_CHUNK - 1 : LORA_MAX_CHUNK;
         while (end < n) {
             uint8_t b = (uint8_t)body[end];
             int sz = ((b & 0xE0) == 0xC0) ? 2 : ((b & 0xF0) == 0xE0) ? 3 : ((b & 0xF8) == 0xF0) ? 4 : 1;
-            if (bytes + sz > LORA_MAX_CHUNK || end + sz > n) break;
+            if (bytes + sz > cap || end + sz > n) break;
             bytes += sz; end += sz;
         }
         if (end == i) end = i + 1;
@@ -2208,6 +2405,18 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
             gps_set_enabled(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
         }, LV_EVENT_VALUE_CHANGED, NULL);
         lv_group_add_obj(g, gsw);
+
+        lv_obj_t *tlbl2 = lv_label_create(parent);
+        lv_label_set_text(tlbl2, "Speech   (read alerts + headlines aloud)");
+        lv_obj_set_style_text_color(tlbl2, lv_color_white(), 0);
+        lv_obj_t *tsw = lv_switch_create(parent);
+        if (g_tts_enabled) lv_obj_add_state(tsw, LV_STATE_CHECKED);
+        lv_obj_add_event_cb(tsw, [](lv_event_t *e) {
+            g_tts_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+            Preferences pr; pr.begin("tdeckos", false); pr.putBool("tts", g_tts_enabled); pr.end();
+            if (g_tts_enabled) tts_say("음성 안내를 켰습니다");
+        }, LV_EVENT_VALUE_CHANGED, NULL);
+        lv_group_add_obj(g, tsw);
     } else if (strcmp(name, "Wi-Fi") == 0) {
         WiFi.mode(WIFI_STA);
         WiFi.disconnect();
@@ -2548,6 +2757,7 @@ static void go_home()
     if (g_disc_timer)      { lv_timer_del(g_disc_timer);      g_disc_timer = NULL; }
     g_disc_lbl = NULL;
     g_news_root = NULL; g_news_list = NULL; g_art_body = NULL; g_art_scroll = NULL; g_art_id[0] = 0;  // News views torn down (inbox data persists)
+    g_alert_banner = NULL;
     if (g_notes_ta) {                                  // auto-save notes on leave
         Preferences p;
         p.begin("tdeckos", false);
@@ -2587,6 +2797,42 @@ static void go_home()
 }
 
 static void back_event_cb(lv_event_t *e) { go_home(); }
+
+// Deferred announcement + article repair + alert expiry. Runs from loop() so it works
+// no matter which app is open (or none).
+//
+// An alert or headline that arrives while the user is in Settings has not been
+// delivered, so the News app is opened for them — the same "hijack" a phone does for
+// an emergency alert. Announcing is deferred ~2.5 s because a menu rebroadcast lands
+// as a burst of !GH: we chime, speak and hijack once for the burst, not per headline.
+static void news_tick()
+{
+    uint32_t now = millis();
+
+    if (g_alert_exp_ms && (int32_t)(now - g_alert_exp_ms) >= 0) {   // alert expired
+        g_alert_exp_ms = 0; g_alert_id[0] = 0; g_alert_text[0] = 0;
+        if (g_news_list) news_show_list();
+    }
+
+    // an in-flight article that went quiet is missing chunks → ask for just those
+    if (g_art_id[0] && g_art_total && g_art_have < g_art_total && g_art_last_ms &&
+        (uint32_t)(now - g_art_last_ms) > 4000)
+        news_send_gn();
+
+    if (!g_news_pending || (uint32_t)(now - g_news_pending_ms) < 2500) return;
+    g_news_pending = false;
+
+    beep_notify();
+    if (g_news_speak.length()) { tts_say(g_news_speak); g_news_speak = ""; }
+
+    bool in_news = g_app_view && g_title && !strcmp(lv_label_get_text(g_title), "News");
+    if (!in_news) {                       // pull the user in from wherever they are
+        if (g_app_view) go_home();
+        open_app("News");
+    } else if (g_news_list) {
+        news_show_list();
+    }
+}
 
 static void open_app(const char *name)
 {
@@ -2673,6 +2919,7 @@ static void boot_restore()
     g_tb_accel  = p.getUChar("tbaccel", 2);
     g_beep_vol  = p.getUChar("beepvol", 7);
     g_gps_enabled = p.getBool("gpsen", true);
+    g_tts_enabled = p.getBool("tts", true);
     g_screen_bright = p.getUChar("bright", 16);
     p.end();
 
@@ -2764,5 +3011,6 @@ void loop()
     lv_timer_handler();
     gps_feed();        // keep the NMEA parser fed regardless of which app is open
     lora_service();    // always-on LoRa RX so messages arrive even with the app closed
+    news_tick();       // deferred announce (chime + speech + hijack), repair, expiry
     delay(5);
 }
