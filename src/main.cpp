@@ -20,7 +20,9 @@
 #include <BLEAdvertisedDevice.h>
 #include <Preferences.h>
 #include <sys/time.h>
-#include <driver/i2s.h>
+#include <BackgroundAudioSpeech.h>   // eSpeak-NG TTS (see tts_say)
+#include <ESP32I2SAudio.h>           // new IDF5 I2S driver — the board's single audio owner
+#include <libespeak-ng/voice/ko.h>
 #include <RadioLib.h>
 #include <TinyGPS++.h>
 
@@ -833,14 +835,15 @@ static void ble_scan_run(lv_timer_t *t)
     if (!g_bt_list) return;
     BLEScan *s = BLEDevice::getScan();
     s->setActiveScan(true);
-    BLEScanResults res = s->start(3, false);           // 3 s blocking scan
-    if (!g_bt_list) { s->clearResults(); return; }      // user left during scan
-    int n = res.getCount();
+    // Arduino-ESP32 3.x: start() returns a pointer, and getName()/toString() return String.
+    BLEScanResults *res = s->start(3, false);          // 3 s blocking scan
+    if (!g_bt_list || !res) { s->clearResults(); return; }   // user left during scan
+    int n = res->getCount();
     lv_label_set_text_fmt(g_bt_status, "%d devices", n);
     lv_group_t *grp = lv_group_get_default();
     for (int i = 0; i < n && i < 15; i++) {
-        BLEAdvertisedDevice d = res.getDevice(i);
-        std::string nm = d.haveName() ? d.getName() : d.getAddress().toString();
+        BLEAdvertisedDevice d = res->getDevice(i);
+        String nm = d.haveName() ? String(d.getName().c_str()) : String(d.getAddress().toString().c_str());
         char buf[64];
         snprintf(buf, sizeof(buf), "%s  %ddBm", nm.c_str(), d.getRSSI());
         lv_obj_t *btn = lv_list_add_btn(g_bt_list, LV_SYMBOL_BLUETOOTH, buf);
@@ -997,34 +1000,26 @@ static void browser_go(lv_event_t *e)
     if (!g_browser_timer) g_browser_timer = lv_timer_create(browser_fetch, 60, NULL);
 }
 
-// --- Speaker test (I2S to the on-board MAX98357A amp) ------------------------
+// --- Audio device (I2S to the on-board MAX98357A amp) ------------------------
+// ONE owner for the whole board. IDF 5 aborts at boot if the legacy driver/i2s.h
+// and the new i2s_std driver are both linked ("CONFLICT! The new i2s driver can't
+// work along with the legacy i2s driver"), and the speech engine needs the new one,
+// so tones are written to the same device instead of installing a second driver.
+static ESP32I2SAudio g_i2s(BOARD_I2S_BCK, BOARD_I2S_WS, BOARD_I2S_DOUT);
+
 static void audio_init()
 {
     if (g_audio_inited) return;
-    i2s_config_t cfg = {};
-    cfg.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
-    cfg.sample_rate          = 16000;
-    cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT;
-    cfg.channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT;
-    cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-    cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
-    cfg.dma_buf_count        = 8;
-    cfg.dma_buf_len          = 64;
-    cfg.tx_desc_auto_clear   = true;     // output silence on underrun (no stuck tone)
-    i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL);
-
-    i2s_pin_config_t pins = {};
-    pins.mck_io_num   = I2S_PIN_NO_CHANGE;   // ! don't route MCLK to GPIO0 (= trackball center)
-    pins.bck_io_num   = BOARD_I2S_BCK;
-    pins.ws_io_num    = BOARD_I2S_WS;
-    pins.data_out_num = BOARD_I2S_DOUT;
-    pins.data_in_num  = I2S_PIN_NO_CHANGE;
-    i2s_set_pin(I2S_NUM_0, &pins);
+    g_i2s.setBitsPerSample(16);
+    g_i2s.setFrequency(16000);
+    g_i2s.setStereo(false);
+    g_i2s.begin();
     g_audio_inited = true;
 }
 
 static void play_tone(int freq, int ms, int amp = 12000)
 {
+    audio_init();
     const int sr = 16000;
     int total = (int)((long)sr * ms / 1000);
     static double phase = 0;
@@ -1038,13 +1033,17 @@ static void play_tone(int freq, int ms, int amp = 12000)
             phase += step;
             if (phase >= TWO_PI) phase -= TWO_PI;
         }
-        size_t bw;
-        i2s_write(I2S_NUM_0, buf, n * sizeof(int16_t), &bw, portMAX_DELAY);
+        const uint8_t *p = (const uint8_t *)buf;
+        size_t left = n * sizeof(int16_t);
+        while (left) {                       // the device takes what fits; keep feeding
+            size_t w = g_i2s.write(p, left);
+            if (!w) { delay(1); continue; }
+            p += w; left -= w;
+        }
         done += n;
     }
     int16_t z[128] = {0};                 // short trailing silence so the note ends cleanly
-    size_t bw;
-    i2s_write(I2S_NUM_0, z, sizeof(z), &bw, portMAX_DELAY);
+    g_i2s.write((const uint8_t *)z, sizeof(z));
 }
 
 static void speaker_play_cb(lv_event_t *e)
@@ -1058,7 +1057,7 @@ static void speaker_play_cb(lv_event_t *e)
         const int notes[] = { 523, 587, 659, 698, 784, 880 };
         for (int i = 0; i < 6; i++) play_tone(notes[i], 160);
     }
-    i2s_zero_dma_buffer(I2S_NUM_0);      // flush so no tone lingers after playback
+    // play_tone() already writes trailing silence, so nothing lingers on the amp
 }
 
 // Short rising two-tone "ding-dong" for an incoming LoRa message. 0 = mute.
@@ -1070,28 +1069,22 @@ static void speaker_play_cb(lv_event_t *e)
 // Needs BackgroundAudio, which requires the IDF 5.x I2S API (pioarduino core). The
 // __has_include guard is not a fallback for a missing feature — it keeps the protocol
 // work buildable on either core while the platform migration is verified separately.
-#if __has_include(<BackgroundAudioSpeech.h>)
-#include <BackgroundAudioSpeech.h>
-#include <ESP32I2SAudio.h>
-#include <libespeak-ng/voice/ko.h>
-static ESP32I2SAudio         g_tts_out(BOARD_I2S_BCK, BOARD_I2S_WS, BOARD_I2S_DOUT);
-static BackgroundAudioSpeech g_tts(g_tts_out);
+static BackgroundAudioSpeech g_tts(g_i2s);       // shares the board's single I2S device
 static bool                  g_tts_ready = false;
+
 static void tts_say(const String &text)
 {
     if (!g_tts_enabled || !text.length()) return;
-    if (!g_tts_ready) { g_tts.setVoice(voice_ko); g_tts.begin(); g_tts_ready = true; }
+    if (!g_tts_ready) {
+        g_audio_inited = true;           // BackgroundAudioSpeech::begin() configures the device
+        g_tts.setVoice(voice_ko);
+        g_tts.begin();
+        g_tts_ready = true;
+    }
     g_tts.flush();                       // a newer alert preempts whatever is being read
     g_tts.speak(text.c_str());           // synthesis runs on interrupts — loop() keeps going
     Serial.printf("[TTS] %s\n", text.c_str());
 }
-#else
-static void tts_say(const String &text)
-{
-    if (!g_tts_enabled) return;
-    Serial.printf("[TTS-stub] %s\n", text.c_str());   // no speech engine on this core
-}
-#endif
 
 static void beep_notify()
 {
@@ -1100,7 +1093,6 @@ static void beep_notify()
     int amp = 1200 * g_beep_vol;         // 0..12000 (vol 10 = full scale)
     play_tone(1568, 90,  amp);           // G6
     play_tone(2093, 120, amp);           // C7
-    i2s_zero_dma_buffer(I2S_NUM_0);
 }
 
 // --- LoRa (SX1262) — pager-lora-qwerty interop -------------------------------
