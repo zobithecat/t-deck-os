@@ -23,6 +23,8 @@
 #include <BackgroundAudioSpeech.h>   // eSpeak-NG TTS (see tts_say)
 #include <ESP32I2SAudio.h>           // new IDF5 I2S driver — the board's single audio owner
 #include <libespeak-ng/voice/ko.h>
+#include <esp_sleep.h>               // power save (light sleep)
+#include <driver/gpio.h>
 #include <RadioLib.h>
 #include <TinyGPS++.h>
 
@@ -192,6 +194,7 @@ static int           g_sd_count;
 static void go_home();
 static void open_app(const char *name);
 static void news_tick();
+static volatile bool g_sleep_req = false;   // trackball long-press asked for power save
 static void tts_say(const String &text, bool urgent = false);   // eSpeak-NG (ko); queued unless urgent
 static bool    g_tts_enabled = true;       // Settings toggle, persisted in NVS ("tts")
 // loudness lives in g_audio_vol (one master control for speech AND tones) — see audio section
@@ -305,6 +308,17 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     // ---- center press: engage/release a slider, or activate a button ----
     bool pressed    = (digitalRead(BOARD_BOOT_PIN) == LOW);
     bool press_edge = pressed && !last_pressed;
+
+    // Hold the trackball for 3 s to enter power save. Only the request is made here —
+    // sleeping inside an input callback would stop LVGL mid-read.
+    static uint32_t hold_ms = 0;
+    if (press_edge)      hold_ms = millis();
+    else if (!pressed)   hold_ms = 0;
+    if (hold_ms && (uint32_t)(millis() - hold_ms) > 3000) {
+        hold_ms = 0;
+        g_sleep_req = true;
+        if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_POWER " sleeping - tap ball to wake");
+    }
     last_pressed = pressed;
 
     if (press_edge && foc_slider) {
@@ -3257,11 +3271,69 @@ static void selftest_console()
 }
 #endif
 
+// --- Power save --------------------------------------------------------------
+// LIGHT sleep, not deep: RAM, the LoRa configuration and the news inbox survive, so
+// waking resumes exactly where we stopped instead of rebooting into an empty inbox.
+//
+// Two pins can wake the CPU: the trackball (BOOT goes low) and the radio's DIO1
+// (goes high on a received packet). A radio wake is NOT the same as waking the
+// device: this mesh carries anchor telemetry every few seconds, and lighting the
+// screen for each of those would save nothing at all. So a radio wake keeps the
+// screen dark, drains the packet, and drops straight back to sleep unless what
+// arrived was worth showing — a new headline, an alert, or a message for the user.
+static void power_save_run()
+{
+    const uint8_t br = g_screen_bright, kb = g_kb_bright;
+    const bool gps_was  = g_gps_enabled;
+    const bool wifi_was = (WiFi.status() == WL_CONNECTED);
+    const int  unread0  = (int)g_lora_unread;
+
+    lv_refr_now(NULL);                        // show the toast before the screen goes
+    setBrightness(0);
+    setKeyboardBrightness(0);
+    if (gps_was)  gps_set_enabled(false);
+    if (wifi_was) { WiFi.disconnect(true); WiFi.mode(WIFI_OFF); }
+
+    lora_service();                           // clear any pending IRQ, else DIO1 is
+    lora_radio.startReceive();                // already high and we wake immediately
+
+    gpio_wakeup_enable((gpio_num_t)RADIO_DIO1_PIN, GPIO_INTR_HIGH_LEVEL);
+    gpio_wakeup_enable((gpio_num_t)BOARD_BOOT_PIN, GPIO_INTR_LOW_LEVEL);
+    esp_sleep_enable_gpio_wakeup();
+
+    while (digitalRead(BOARD_BOOT_PIN) == LOW) delay(10);   // wait for the 3 s hold to end,
+    delay(50);                                              // or its LOW level wakes us at once
+
+    for (;;) {
+        if (esp_light_sleep_start() != ESP_OK) delay(200);  // a radio stack can refuse the
+                                                            // sleep; idle rather than spin
+        if (digitalRead(BOARD_BOOT_PIN) == LOW) break;      // a tap means "wake up"
+
+        lora_service();                                     // radio wake: parse it, screen dark
+        // Only the decision is made here. The chime, the speech and the app switch are
+        // left to the normal loop, so they happen with the display already back on.
+        if (g_news_pending || (int)g_lora_unread != unread0) break;
+    }
+
+    gpio_wakeup_disable((gpio_num_t)RADIO_DIO1_PIN);
+    gpio_wakeup_disable((gpio_num_t)BOARD_BOOT_PIN);
+
+    setBrightness(br);
+    setKeyboardBrightness(kb);
+    if (gps_was)  gps_set_enabled(true);
+    if (wifi_was) { WiFi.mode(WIFI_STA); WiFi.begin(); }    // credentials are remembered
+
+    while (digitalRead(BOARD_BOOT_PIN) == LOW) delay(10);   // swallow the wake press so it
+    delay(50);                                              // does not also click a button
+    if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_OK " awake");
+}
+
 void loop()
 {
 #ifdef TDECK_SELFTEST
     selftest_console();
 #endif
+    if (g_sleep_req) { g_sleep_req = false; power_save_run(); }
     lv_timer_handler();
     gps_feed();        // keep the NMEA parser fed regardless of which app is open
     lora_service();    // always-on LoRa RX so messages arrive even with the app closed
