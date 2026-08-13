@@ -3114,6 +3114,17 @@ static void power_save_run()
 
     while (digitalRead(BOARD_BOOT_PIN) == LOW) delay(10);   // swallow the wake press so it
     delay(50);                                              // does not also click a button
+
+    // Undo what the 3 s hold did to LVGL on the way in. An encoder long-press toggles
+    // the focus group into EDIT mode (lv_indev.c: "On enter long press toggle edit
+    // mode") whenever the focused object is editable or scrollable — which every
+    // launcher tile and app view is. LVGL's threshold is ~400 ms, so the hold trips it
+    // long before we sleep, and coming back in edit mode meant clicks stopped opening
+    // apps. Also drop the press LVGL still thinks is in progress: it never saw the
+    // release, because we stopped servicing it mid-gesture.
+    lv_indev_reset(NULL, NULL);
+    lv_group_set_editing(lv_group_get_default(), false);
+
     if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_OK " awake");
 }
 
