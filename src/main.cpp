@@ -195,6 +195,8 @@ static void go_home();
 static void open_app(const char *name);
 static void news_tick();
 static volatile bool g_sleep_req = false;   // trackball long-press asked for power save
+static String        g_ps_report;           // why the last power-save session woke up
+static int           g_reset_reason = 0;    // esp_reset_reason() at boot — survives a USB reconnect
 static void tts_say(const String &text, bool urgent = false);   // eSpeak-NG (ko); queued unless urgent
 static bool    g_tts_enabled = true;       // Settings toggle, persisted in NVS ("tts")
 // loudness lives in g_audio_vol (one master control for speech AND tones) — see audio section
@@ -1068,16 +1070,22 @@ static void browser_go(lv_event_t *e)
 // board has exactly ONE begin(), and it is the speech engine's, because only
 // BackgroundAudioSpeech knows eSpeak's rate and frame size.
 //
-// It also picks the DMA geometry, and that must be left alone: it asks for 5 buffers
-// of one eSpeak frame each so every DMA boundary lands on a frame boundary. Forcing a
-// different size (we tried 3 x 1023 to save RAM) makes every buffer end mid-frame and
-// the speech stutters and clicks.
-//
-// The 26 KB it wants comes out of DMA-capable INTERNAL RAM, of which only ~8 KB is
-// left once Wi-Fi and BT are up -- the allocation would fail and the assert inside
-// begin() reboots the board. Hence the ordering invariant: **setup() claims audio
-// before boot_restore() starts the radios**, while ~114 KB is still free.
-static ESP32I2SAudio         g_i2s(BOARD_I2S_BCK, BOARD_I2S_WS, BOARD_I2S_DOUT);
+// It also picks the DMA geometry. The WIDTH must be left alone -- it asks for buffers
+// one eSpeak frame wide so every DMA boundary lands on a frame boundary, and forcing a
+// different width (we tried 1023 words) makes each buffer end mid-frame, which is
+// audible as ticking. The COUNT is ours to choose: 5 frames is ~26 KB of DMA-capable
+// INTERNAL RAM, and internal RAM is the scarcest thing on this board -- Wi-Fi takes
+// ~49 KB and Bluedroid ~73 KB after us, which left barely 2 KB free and the board
+// reset as soon as light sleep tried to save its state. 3 frames is ~16 KB, still two
+// frames of headroom for the pump, and hands ~10 KB back.
+class TDeckI2S : public ESP32I2SAudio {
+public:
+    using ESP32I2SAudio::ESP32I2SAudio;
+    bool setBuffers(size_t, size_t bufferWords, int32_t silenceSample = 0) override {
+        return ESP32I2SAudio::setBuffers(3, bufferWords, silenceSample);   // keep the width
+    }
+};
+static TDeckI2S              g_i2s(BOARD_I2S_BCK, BOARD_I2S_WS, BOARD_I2S_DOUT);
 static BackgroundAudioSpeech g_tts(g_i2s);   // the single owner: it performs the one begin()
 static bool                  g_tts_ready = false;
 static void                  audio_apply_volume();
@@ -3089,7 +3097,8 @@ static void boot_restore()
 void setup()
 {
     Serial.begin(115200);
-    Serial.println("T-Deck OS booting...");
+    g_reset_reason = (int)esp_reset_reason();
+    Serial.printf("T-Deck OS booting... (reset reason=%d)\n", g_reset_reason);
     st_heap("setup entry");
     disableLoopWDT();   // allow multi-second blocking ops (SF12 LoRa TX, BLE scan) without WDT reset
 
@@ -3236,6 +3245,20 @@ static void selftest_console()
         Serial.println("[ST] speak ko (settings phrase)");
         tts_say("음성 안내를 켰습니다");
         break;
+    case 'p':   // dump the power-save log (RAM copy + the card)
+        Serial.printf("[PS] last reset reason=%d (5=deepsleep 6=BROWNOUT 12=USB 4=panic 3=SW)\n", g_reset_reason);
+        Serial.print(g_ps_report.length() ? g_ps_report : String("[PS] no session yet\n"));
+        if (sd_init()) {
+            File f = SD.open("/powersave.log", FILE_READ);
+            if (f) { Serial.println("--- /powersave.log ---");
+                     while (f.available()) Serial.write(f.read());
+                     f.close(); }
+        }
+        break;
+    case 'z':   // PROBE: enter power save without holding the trackball
+        Serial.println("[ST] sleep requested");
+        g_sleep_req = true;
+        break;
     case 'h':
         st_heap("now");
         break;
@@ -3283,6 +3306,11 @@ static void selftest_console()
 // arrived was worth showing — a new headline, an alert, or a message for the user.
 static void power_save_run()
 {
+    // Why-did-I-wake log. USB-Serial-JTAG is powered down while we sleep, so the port
+    // disappears and anything printed in the loop is lost — and on battery there is no
+    // port at all. Collect in RAM, then write it out once we are properly awake.
+    struct { uint32_t ms; int8_t err, cause, boot, dio1; } ps_log[12];
+    int ps_n = 0; uint32_t ps_total = 0;
     const uint8_t br = g_screen_bright, kb = g_kb_bright;
     const bool gps_was  = g_gps_enabled;
     const bool wifi_was = (WiFi.status() == WL_CONNECTED);
@@ -3305,8 +3333,18 @@ static void power_save_run()
     delay(50);                                              // or its LOW level wakes us at once
 
     for (;;) {
-        if (esp_light_sleep_start() != ESP_OK) delay(200);  // a radio stack can refuse the
+        esp_err_t sr = esp_light_sleep_start();
+        if (sr != ESP_OK) delay(200);                       // a radio stack can refuse the
                                                             // sleep; idle rather than spin
+        if (ps_n < 12) {
+            ps_log[ps_n].ms    = millis();
+            ps_log[ps_n].err   = (int8_t)sr;
+            ps_log[ps_n].cause = (int8_t)esp_sleep_get_wakeup_cause();
+            ps_log[ps_n].boot  = (int8_t)digitalRead(BOARD_BOOT_PIN);
+            ps_log[ps_n].dio1  = (int8_t)digitalRead(RADIO_DIO1_PIN);
+            ps_n++;
+        }
+        ps_total++;
         if (digitalRead(BOARD_BOOT_PIN) == LOW) break;      // a tap means "wake up"
 
         lora_service();                                     // radio wake: parse it, screen dark
@@ -3336,6 +3374,19 @@ static void power_save_run()
     lv_indev_reset(NULL, NULL);
     lv_group_set_editing(lv_group_get_default(), false);
 
+    {   // one line per wake, to serial AND the card — the card is the only witness on battery
+        String rep = "[PS] session woke=" + String((unsigned long)ps_total) + "\n";
+        for (int i = 0; i < ps_n; i++)
+            rep += "[PS] " + String((unsigned long)ps_log[i].ms) + "ms err=" + ps_log[i].err +
+                   " cause=" + ps_log[i].cause + " boot=" + ps_log[i].boot +
+                   " dio1=" + ps_log[i].dio1 + "\n";
+        g_ps_report = rep;                       // 'i' in the self-test console re-prints it
+        Serial.print(rep);
+        if (sd_init()) {
+            File f = SD.open("/powersave.log", FILE_APPEND);
+            if (f) { f.print(rep); f.close(); }
+        }
+    }
     if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_OK " awake");
 }
 
