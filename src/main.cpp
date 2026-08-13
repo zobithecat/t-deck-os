@@ -124,6 +124,7 @@ static int           g_hold_n = 0;
 static bool          g_news_pending    = false;
 static uint32_t      g_news_pending_ms = 0;
 static String        g_news_speak;              // what the announcement should read aloud
+static bool          g_news_urgent = false;     // set by !AL: jump the speech queue
 // v1.8 !AL disaster alert — the channel this protocol exists for.
 static char          g_alert_id[8]   = "";
 static char          g_alert_seen[8] = "";   // last ANNOUNCED alert, kept in NVS ("alrtid"):
@@ -191,7 +192,7 @@ static int           g_sd_count;
 static void go_home();
 static void open_app(const char *name);
 static void news_tick();
-static void tts_say(const String &text);   // eSpeak-NG (ko) via BackgroundAudio; no-op if muted
+static void tts_say(const String &text, bool urgent = false);   // eSpeak-NG (ko); queued unless urgent
 static bool    g_tts_enabled = true;       // Settings toggle, persisted in NVS ("tts")
 // loudness lives in g_audio_vol (one master control for speech AND tones) — see audio section
 static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g);
@@ -1066,6 +1067,11 @@ static ESP32I2SAudio         g_i2s(BOARD_I2S_BCK, BOARD_I2S_WS, BOARD_I2S_DOUT);
 static BackgroundAudioSpeech g_tts(g_i2s);   // the single owner: it performs the one begin()
 static bool                  g_tts_ready = false;
 static void                  audio_apply_volume();
+// Speech FIFO: messages are read one after another instead of cutting each other off.
+#define TTS_Q_N 6
+static String                g_tts_q[TTS_Q_N];
+static uint8_t               g_tts_qh = 0, g_tts_qn = 0;
+static uint32_t              g_tts_spoke_ms = 0;
 
 // Tone amplitude at the current master volume (0..AUDIO_AMP_MAX).
 static int audio_tone_amp() { return (AUDIO_AMP_MAX / 10) * g_audio_vol; }
@@ -1146,14 +1152,38 @@ static void audio_apply_volume()
     if (g_tts_ready) g_tts.setGain(g_audio_vol / 10.0f);
 }
 
-static void tts_say(const String &text)
+static void tts_say(const String &text, bool urgent)   // default lives on the declaration
 {
     if (!g_tts_enabled || !text.length()) return;
     audio_init();                        // brings the engine up on first use
     if (!g_tts_ready) return;
-    g_tts.flush();                       // a newer alert preempts whatever is being read
-    g_tts.speak(text.c_str());           // synthesis runs on interrupts — loop() keeps going
-    Serial.printf("[TTS] %s\n", text.c_str());
+
+    if (urgent) {                        // an evacuation line does not wait behind a headline
+        g_tts_qn = 0;                    // whatever was queued is now stale
+        g_tts.flush();                   // and cut off what is being read
+        g_tts.speak(text.c_str());
+        g_tts_spoke_ms = millis();
+        Serial.printf("[TTS!] %s\n", text.c_str());
+        return;
+    }
+    if (g_tts_qn >= TTS_Q_N) { Serial.println("[TTS] queue full, dropped"); return; }
+    g_tts_q[(g_tts_qh + g_tts_qn) % TTS_Q_N] = text;   // tts_pump() speaks it when the line is free
+    g_tts_qn++;
+}
+
+// Speak the next queued line once the current one has finished. Without this, a burst
+// of messages each flush()ed the one before it and you heard fragments.
+static void tts_pump()
+{
+    if (!g_tts_ready || !g_tts_qn) return;
+    if ((uint32_t)(millis() - g_tts_spoke_ms) < 250) return;   // let speak() get going first
+    if (!g_tts.done()) return;                                 // still talking
+    String s = g_tts_q[g_tts_qh];
+    g_tts_qh = (g_tts_qh + 1) % TTS_Q_N;
+    g_tts_qn--;
+    g_tts.speak(s.c_str());
+    g_tts_spoke_ms = millis();
+    Serial.printf("[TTS] %s\n", s.c_str());
 }
 
 static void beep_notify()
@@ -1340,6 +1370,7 @@ static void alert_handle(const String &line)
     strncpy(g_alert_seen, id.c_str(), sizeof(g_alert_seen) - 1); g_alert_seen[sizeof(g_alert_seen) - 1] = 0;
     Preferences pr; pr.begin("tdeckos", false); pr.putString("alrtid", g_alert_seen); pr.end();
     news_mark_new(text);
+    g_news_urgent = true;                                 // preempts anything being read
     g_news_pending_ms = millis() - 3000;                  // a genuinely new alert announces at once
 }
 
@@ -2501,7 +2532,7 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
             audio_apply_volume();
         }, LV_EVENT_VALUE_CHANGED, NULL);
         lv_obj_add_event_cb(vslider, [](lv_event_t *e) {       // preview the new level
-            if (g_tts_enabled) tts_say("음성 안내");            // two syllables, no waiting
+            if (g_tts_enabled) tts_say("음성 안내", true);      // preview now, not after the queue
             else               play_tone(1000, 120);           // speech off: a tick still lands
         }, LV_EVENT_RELEASED, NULL);
         lv_group_add_obj(g, vslider);
@@ -2896,6 +2927,7 @@ static void back_event_cb(lv_event_t *e) { go_home(); }
 static void news_tick()
 {
     uint32_t now = millis();
+    tts_pump();                     // keep the speech queue moving, one line at a time
 
     if (g_alert_exp_ms && (int32_t)(now - g_alert_exp_ms) >= 0) {   // alert expired
         g_alert_exp_ms = 0; g_alert_id[0] = 0; g_alert_text[0] = 0;
@@ -2914,10 +2946,11 @@ static void news_tick()
     // seconds are exactly when the backlog arrives — a re-broadcast alert, or a whole
     // menu answering our own !GL. Show all of it, announce none of it: the banner and
     // the list are already on screen, so nothing is lost by not making noise.
-    if (now < 15000) { if (g_news_list) news_show_list(); g_news_speak = ""; return; }
+    if (now < 15000) { if (g_news_list) news_show_list(); g_news_speak = ""; g_news_urgent = false; return; }
 
     beep_notify();
-    if (g_news_speak.length()) { tts_say(g_news_speak); g_news_speak = ""; }
+    if (g_news_speak.length()) { tts_say(g_news_speak, g_news_urgent); g_news_speak = ""; }
+    g_news_urgent = false;
 
     bool in_news = g_app_view && g_title && !strcmp(lv_label_get_text(g_title), "News");
     if (!in_news) {                       // pull the user in from wherever they are
