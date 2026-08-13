@@ -1045,34 +1045,44 @@ static void browser_go(lv_event_t *e)
 // every later i2s_channel_write() returns "The channel is not enabled" and the
 // speaker goes dead. Keeping one rate means BackgroundAudioSpeech::begin()'s own
 // setFrequency() call sees _sampleRate == freq and skips the whole dance.
-#define AUDIO_RATE      22050
+#define AUDIO_RATE      22050     // eSpeak-NG's synthesis rate; the device runs at it
 #define AUDIO_AMP_MAX   30000     // int16 full scale, with a little headroom
-static ESP32I2SAudio g_i2s(BOARD_I2S_BCK, BOARD_I2S_WS, BOARD_I2S_DOUT);
+
+// ESP32I2SAudio::begin() is NOT re-entrant: on a second call it returns false at the
+// first line, skipping the DMA setup, the pump task and i2s_channel_enable(). So the
+// board must have exactly ONE begin(), and it has to be the speech engine's, because
+// only BackgroundAudioSpeech knows eSpeak's rate and frame size. The one thing we do
+// need to override is its DMA appetite:
+class TDeckI2S : public ESP32I2SAudio {
+public:
+    using ESP32I2SAudio::ESP32I2SAudio;
+    // Speech asks for 5 x 1324 words, which the IDF rewrites to 10 x 662 = 26 KB of
+    // DMA-capable INTERNAL RAM. With Wi-Fi and BT up there is ~20 KB left, so that
+    // allocation fails and the assert in begin() reboots the board. 3 x 1023 = 12 KB
+    // fits and still holds two eSpeak frames, which is what the pump needs to keep
+    // the ring fed. (1023 is the per-descriptor ceiling: 4092 bytes / 4-byte frame.)
+    bool setBuffers(size_t, size_t, int32_t silenceSample = 0) override {
+        return ESP32I2SAudio::setBuffers(3, 1023, silenceSample);
+    }
+};
+static TDeckI2S              g_i2s(BOARD_I2S_BCK, BOARD_I2S_WS, BOARD_I2S_DOUT);
+static BackgroundAudioSpeech g_tts(g_i2s);   // the single owner: it performs the one begin()
+static bool                  g_tts_ready = false;
+static void                  audio_apply_volume();
 
 // Tone amplitude at the current master volume (0..AUDIO_AMP_MAX).
 static int audio_tone_amp() { return (AUDIO_AMP_MAX / 10) * g_audio_vol; }
 
+// Bring the board's single audio owner up. Everything that makes sound goes through
+// here, so there is never a second begin() to lose against.
 static void audio_init()
 {
     if (g_audio_inited) return;
-    // The I2S DMA buffers come out of DMA-capable INTERNAL RAM, and by the time
-    // the first sound plays, Wi-Fi + BT have taken ~120 KB of it: about 20 KB is
-    // left. BackgroundAudioSpeech asks for 5 x 1324 words, which setBuffers()
-    // rewrites to 10 x 662 = 26 KB, so i2s_alloc_dma_desc() failed and the
-    // assert in ESP32I2SAudio::begin() rebooted the board on the first tone or
-    // the first spoken line. 3 x 1023 words = 12 KB fits and still holds two
-    // eSpeak frames (framelen 1324 stereo frames each), which is what pump()
-    // needs to keep the ring fed. 1023 is the per-descriptor ceiling: a DMA
-    // descriptor tops out at 4092 bytes and a stereo 16-bit frame is 4.
-    //
-    // This has to run BEFORE BackgroundAudioSpeech::begin() - its own
-    // setBuffers() call is silently ignored once the device is running, which
-    // is exactly how we keep our size instead of its oversized default.
-    g_i2s.setBuffers(3, 1023);
-    g_i2s.setBitsPerSample(16);
-    g_i2s.setFrequency(AUDIO_RATE);
-    g_i2s.begin();
-    g_audio_inited = true;
+    g_audio_inited = true;               // set first: begin() is slow, don't re-enter
+    g_tts.setVoice(voice_ko);
+    g_tts_ready = g_tts.begin();         // creates the channel, the pump task, enables it
+    if (!g_tts_ready) Serial.println("[audio] speech engine failed to start");
+    audio_apply_volume();                // begin() leaves gain at 1.0 — never full scale
 }
 
 static void play_tone(int freq, int ms, int amp = -1)   // amp < 0 = the master volume
@@ -1131,8 +1141,6 @@ static void speaker_play_cb(lv_event_t *e)
 // Needs BackgroundAudio, which requires the IDF 5.x I2S API (pioarduino core). The
 // __has_include guard is not a fallback for a missing feature — it keeps the protocol
 // work buildable on either core while the platform migration is verified separately.
-static BackgroundAudioSpeech g_tts(g_i2s);       // shares the board's single I2S device
-static bool                  g_tts_ready = false;
 
 // One master volume for everything the device can blurt out. Tones read
 // audio_tone_amp() per call; the speech engine keeps its own gain, so push it.
@@ -1144,13 +1152,8 @@ static void audio_apply_volume()
 static void tts_say(const String &text)
 {
     if (!g_tts_enabled || !text.length()) return;
-    if (!g_tts_ready) {
-        audio_init();                    // claim the device (and OUR DMA size) first;
-        g_tts.setVoice(voice_ko);        // begin() then only re-clocks it to eSpeak's rate
-        g_tts.begin();
-        g_tts_ready = true;
-        audio_apply_volume();            // begin() resets gain to 1.0; never speak at full scale
-    }
+    audio_init();                        // brings the engine up on first use
+    if (!g_tts_ready) return;
     g_tts.flush();                       // a newer alert preempts whatever is being read
     g_tts.speak(text.c_str());           // synthesis runs on interrupts — loop() keeps going
     Serial.printf("[TTS] %s\n", text.c_str());
