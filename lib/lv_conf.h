@@ -60,10 +60,22 @@
 #endif
 
 #else       /*LV_MEM_CUSTOM*/
-#define LV_MEM_CUSTOM_INCLUDE <stdlib.h>   /*Header for the dynamic memory function*/
-#define LV_MEM_CUSTOM_ALLOC   malloc
-#define LV_MEM_CUSTOM_FREE    free
-#define LV_MEM_CUSTOM_REALLOC realloc
+/* LVGL objects live in PSRAM, not in the 320 kB of internal DRAM.
+ *
+ * Internal RAM is the scarce resource on this board and several things can ONLY
+ * live there: Wi-Fi (~49 kB), Bluedroid BLE (~73 kB) and the I2S DMA ring +
+ * service task for the speaker (~23 kB). With plain malloc() the launcher UI
+ * alone took ~20 kB of that and the three together overran the heap - Wi-Fi and
+ * BLE came up, then i2s_channel_enable() failed for want of a few kB and speech
+ * went silent. LVGL has no such constraint: nothing here is DMA'd (the flush
+ * path copies with the CPU) and the draw buffer is already ps_malloc'd, so the
+ * widget tree goes to the 8 MB of PSRAM and internal RAM is left for the radios
+ * and the audio DMA. This also stops every newly opened app from eating into
+ * that same internal heap. */
+#define LV_MEM_CUSTOM_INCLUDE "esp_heap_caps.h"
+#define LV_MEM_CUSTOM_ALLOC(size)             heap_caps_malloc((size), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#define LV_MEM_CUSTOM_FREE                    heap_caps_free
+#define LV_MEM_CUSTOM_REALLOC(ptr, new_size)  heap_caps_realloc((ptr), (new_size), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #endif     /*LV_MEM_CUSTOM*/
 
 /*Number of the intermediate memory buffer used during rendering and other internal processing mechanisms.

@@ -52,6 +52,7 @@ static int16_t       tp_x[5], tp_y[5];
 static lv_indev_t   *enc_indev;     // trackball (encoder)
 static int           g_tb_accel = 2;     // trackball scroll accel level 0..5 (Settings / NVS)
 static uint8_t       g_beep_vol = 7;     // incoming-message beep volume 0..10 (0=mute; Settings/NVS)
+static uint8_t       g_audio_vol = 2;    // MASTER loudness 0..10 for speech + tones (Settings/NVS "ttsvol")
 static uint8_t       g_screen_bright = 16;   // display brightness 1..16 (Settings/NVS "bright")
 static lv_obj_t     *g_toast;       // bottom status / selection-feedback line
 static lv_obj_t     *g_home_list;   // launcher app list
@@ -224,10 +225,27 @@ static void setKeyboardBrightness(uint8_t value)
 // ---------------------------------------------------------------------------
 // LVGL glue
 // ---------------------------------------------------------------------------
+#ifdef TDECK_SELFTEST
+volatile uint32_t g_st_flushes = 0;
+volatile uint32_t g_st_px      = 0;
+static void st_heap(const char *tag)
+{
+    Serial.printf("[HEAP] %-22s int=%7u dma=%7u dma_big=%7u  psram=%8u\n", tag,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+#else
+#define st_heap(t) do {} while (0)
+#endif
 static void disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p)
 {
     uint32_t w = area->x2 - area->x1 + 1;
     uint32_t h = area->y2 - area->y1 + 1;
+#ifdef TDECK_SELFTEST
+    g_st_flushes++; g_st_px += w * h;
+#endif
     tft.startWrite();
     tft.setAddrWindow(area->x1, area->y1, w, h);
     tft.pushColors((uint16_t *)&color_p->full, w * h, false);
@@ -1005,36 +1023,76 @@ static void browser_go(lv_event_t *e)
 // and the new i2s_std driver are both linked ("CONFLICT! The new i2s driver can't
 // work along with the legacy i2s driver"), and the speech engine needs the new one,
 // so tones are written to the same device instead of installing a second driver.
+// ESP32I2SAudio is 16-bit STEREO only (setStereo(false) is a no-op that returns
+// false), unlike the legacy driver's I2S_CHANNEL_FMT_ONLY_LEFT, so every writer
+// must interleave L/R. Sample rate is per-use: tones want 16 kHz, eSpeak clocks
+// the device to its own rate, and setFrequency() re-clocks a running device.
+//
+// Loudness: the MAX98357A drives a small speaker a hand's width from the user's
+// face, so full scale is unpleasant. ONE master volume (Settings > Volume,
+// g_audio_vol 0..10, NVS "ttsvol") governs both speech and tones, so the chime
+// can never be loud while speech is quiet. It defaults to 2 (~20%): a fresh NVS
+// must come up quiet.
+//
+// ONE sample rate for the whole device, and it is eSpeak-NG's, measured on
+// hardware (espeak_Initialize returns 22050). Tones are synthesised at that rate
+// too. Re-clocking a *running* i2s_std channel means
+// disable -> reconfig -> enable, and on IDF 5.5 the channel does not come back:
+// every later i2s_channel_write() returns "The channel is not enabled" and the
+// speaker goes dead. Keeping one rate means BackgroundAudioSpeech::begin()'s own
+// setFrequency() call sees _sampleRate == freq and skips the whole dance.
+#define AUDIO_RATE      22050
+#define AUDIO_AMP_MAX   30000     // int16 full scale, with a little headroom
 static ESP32I2SAudio g_i2s(BOARD_I2S_BCK, BOARD_I2S_WS, BOARD_I2S_DOUT);
+
+// Tone amplitude at the current master volume (0..AUDIO_AMP_MAX).
+static int audio_tone_amp() { return (AUDIO_AMP_MAX / 10) * g_audio_vol; }
 
 static void audio_init()
 {
     if (g_audio_inited) return;
+    // The I2S DMA buffers come out of DMA-capable INTERNAL RAM, and by the time
+    // the first sound plays, Wi-Fi + BT have taken ~120 KB of it: about 20 KB is
+    // left. BackgroundAudioSpeech asks for 5 x 1324 words, which setBuffers()
+    // rewrites to 10 x 662 = 26 KB, so i2s_alloc_dma_desc() failed and the
+    // assert in ESP32I2SAudio::begin() rebooted the board on the first tone or
+    // the first spoken line. 3 x 1023 words = 12 KB fits and still holds two
+    // eSpeak frames (framelen 1324 stereo frames each), which is what pump()
+    // needs to keep the ring fed. 1023 is the per-descriptor ceiling: a DMA
+    // descriptor tops out at 4092 bytes and a stereo 16-bit frame is 4.
+    //
+    // This has to run BEFORE BackgroundAudioSpeech::begin() - its own
+    // setBuffers() call is silently ignored once the device is running, which
+    // is exactly how we keep our size instead of its oversized default.
+    g_i2s.setBuffers(3, 1023);
     g_i2s.setBitsPerSample(16);
-    g_i2s.setFrequency(16000);
-    g_i2s.setStereo(false);
+    g_i2s.setFrequency(AUDIO_RATE);
     g_i2s.begin();
     g_audio_inited = true;
 }
 
-static void play_tone(int freq, int ms, int amp = 12000)
+static void play_tone(int freq, int ms, int amp = -1)   // amp < 0 = the master volume
 {
+    if (amp < 0) amp = audio_tone_amp();
+    if (amp == 0) return;
     audio_init();
-    const int sr = 16000;
-    int total = (int)((long)sr * ms / 1000);
+    const int sr = AUDIO_RATE;           // never re-clock a running channel; see AUDIO_RATE
+    int total = (int)((long)sr * ms / 1000);   // frames, not samples
     static double phase = 0;
     double step = TWO_PI * freq / sr;
-    int16_t buf[256];
+    int16_t buf[256];                          // 128 stereo frames
     int done = 0;
     while (done < total) {
-        int n = (total - done < 256) ? (total - done) : 256;
+        int n = (total - done < 128) ? (total - done) : 128;
         for (int i = 0; i < n; i++) {
-            buf[i] = (int16_t)(sin(phase) * (double)amp);
+            int16_t s = (int16_t)(sin(phase) * (double)amp);
+            buf[2 * i]     = s;                // L
+            buf[2 * i + 1] = s;                // R - the device is stereo-only
             phase += step;
             if (phase >= TWO_PI) phase -= TWO_PI;
         }
         const uint8_t *p = (const uint8_t *)buf;
-        size_t left = n * sizeof(int16_t);
+        size_t left = (size_t)n * 2 * sizeof(int16_t);
         while (left) {                       // the device takes what fits; keep feeding
             size_t w = g_i2s.write(p, left);
             if (!w) { delay(1); continue; }
@@ -1042,7 +1100,7 @@ static void play_tone(int freq, int ms, int amp = 12000)
         }
         done += n;
     }
-    int16_t z[128] = {0};                 // short trailing silence so the note ends cleanly
+    int16_t z[128] = {0};                 // 64 frames of trailing silence, so the note ends cleanly
     g_i2s.write((const uint8_t *)z, sizeof(z));
 }
 
@@ -1072,14 +1130,22 @@ static void speaker_play_cb(lv_event_t *e)
 static BackgroundAudioSpeech g_tts(g_i2s);       // shares the board's single I2S device
 static bool                  g_tts_ready = false;
 
+// One master volume for everything the device can blurt out. Tones read
+// audio_tone_amp() per call; the speech engine keeps its own gain, so push it.
+static void audio_apply_volume()
+{
+    if (g_tts_ready) g_tts.setGain(g_audio_vol / 10.0f);
+}
+
 static void tts_say(const String &text)
 {
     if (!g_tts_enabled || !text.length()) return;
     if (!g_tts_ready) {
-        g_audio_inited = true;           // BackgroundAudioSpeech::begin() configures the device
-        g_tts.setVoice(voice_ko);
+        audio_init();                    // claim the device (and OUR DMA size) first;
+        g_tts.setVoice(voice_ko);        // begin() then only re-clocks it to eSpeak's rate
         g_tts.begin();
         g_tts_ready = true;
+        audio_apply_volume();            // begin() resets gain to 1.0; never speak at full scale
     }
     g_tts.flush();                       // a newer alert preempts whatever is being read
     g_tts.speak(text.c_str());           // synthesis runs on interrupts — loop() keeps going
@@ -1090,7 +1156,7 @@ static void beep_notify()
 {
     if (g_beep_vol == 0) return;
     audio_init();
-    int amp = 1200 * g_beep_vol;         // 0..12000 (vol 10 = full scale)
+    int amp = (audio_tone_amp() / 10) * g_beep_vol;   // beep level, capped by the master volume
     play_tone(1568, 90,  amp);           // G6
     play_tone(2093, 120, amp);           // C7
 }
@@ -2409,6 +2475,24 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
             if (g_tts_enabled) tts_say("음성 안내를 켰습니다");
         }, LV_EVENT_VALUE_CHANGED, NULL);
         lv_group_add_obj(g, tsw);
+
+        lv_obj_t *vlbl = lv_label_create(parent);
+        lv_label_set_text(vlbl, "Volume   (speech + chime, 0 = mute)");
+        lv_obj_set_style_text_color(vlbl, lv_color_white(), 0);
+        lv_obj_t *vslider = lv_slider_create(parent);
+        lv_obj_set_width(vslider, 260);
+        lv_slider_set_range(vslider, 0, 10);
+        lv_slider_set_value(vslider, g_audio_vol, LV_ANIM_OFF);
+        lv_obj_add_event_cb(vslider, [](lv_event_t *e) {       // save on each step
+            g_audio_vol = (uint8_t)lv_slider_get_value(lv_event_get_target(e));
+            Preferences p; p.begin("tdeckos", false); p.putUChar("ttsvol", g_audio_vol); p.end();
+            audio_apply_volume();
+        }, LV_EVENT_VALUE_CHANGED, NULL);
+        lv_obj_add_event_cb(vslider, [](lv_event_t *e) {       // preview the new level
+            if (g_tts_enabled) tts_say("음성 안내");            // two syllables, no waiting
+            else               play_tone(1000, 120);           // speech off: a tick still lands
+        }, LV_EVENT_RELEASED, NULL);
+        lv_group_add_obj(g, vslider);
     } else if (strcmp(name, "Wi-Fi") == 0) {
         WiFi.mode(WIFI_STA);
         WiFi.disconnect();
@@ -2912,6 +2996,8 @@ static void boot_restore()
     g_beep_vol  = p.getUChar("beepvol", 7);
     g_gps_enabled = p.getBool("gpsen", true);
     g_tts_enabled = p.getBool("tts", true);
+    g_audio_vol   = p.getUChar("ttsvol", 2);   // fresh NVS must come up QUIET, not full scale
+    if (g_audio_vol > 10) g_audio_vol = 10;
     g_screen_bright = p.getUChar("bright", 16);
     p.end();
 
@@ -2923,17 +3009,20 @@ static void boot_restore()
         WiFi.begin(ssid.c_str(), pass.c_str());
         g_wifi_autoconn_timer = lv_timer_create(wifi_autoconn_poll, 500, NULL);
     }
+    st_heap("  after wifi");
     if (bt && !g_ble_inited) {
         BLEDevice::init("T-Deck OS");
         g_ble_inited = true;
         g_bt_on = true;
     }
+    st_heap("  after ble");
 }
 
 void setup()
 {
     Serial.begin(115200);
     Serial.println("T-Deck OS booting...");
+    st_heap("setup entry");
     disableLoopWDT();   // allow multi-second blocking ops (SF12 LoRa TX, BLE scan) without WDT reset
 
     // Peripheral power rail MUST be high before touching any peripheral
@@ -2983,14 +3072,31 @@ void setup()
         touch.setMirrorXY(false, true);
     }
 
+    st_heap("after touch");
     setupLvgl();
+    st_heap("after setupLvgl");
     build_launcher_ui();
+    st_heap("after launcher ui");
     setup_trackball_indev();
     setup_keyboard_indev();
     lv_timer_create(status_update_cb, 1000, NULL);
     lv_timer_create(gps_probe_cb, 1000, NULL);   // auto-detect GPS baud (u-blox/L76K)
     lora_init();      // bring the radio up at boot so LoRa RX runs in the background
+    st_heap("after lora_init");
+    // Claim the audio device BEFORE the radios. Its DMA ring and its service
+    // task both need DMA-capable INTERNAL RAM, ~21 KB of it, and Wi-Fi + BLE
+    // take ~122 KB of the ~149 KB that is left at this point. Initialised
+    // lazily on the first sound it used to find ~20 KB: the DMA ring fitted but
+    // xTaskCreate() for the service task did not, and ESP32I2SAudio::begin()
+    // does not check that, so it reported success while _taskHandle stayed
+    // null. Nothing ever notified the task, availableForWrite() stayed at 0,
+    // and BackgroundAudioSpeech's pump never generated a frame: speech queued
+    // the text and went silent forever. Wi-Fi/BLE can spill into PSRAM, an I2S
+    // DMA descriptor cannot, so audio goes first.
+    audio_init();
+    st_heap("after audio_init");
     boot_restore();   // auto-reconnect saved Wi-Fi + restore BT state
+    st_heap("after boot_restore");
 
     pinMode(BOARD_BL_PIN, OUTPUT);
     setBrightness(g_screen_bright);   // restore saved brightness (boot_restore loaded it above)
@@ -2998,8 +3104,110 @@ void setup()
     Serial.println("T-Deck OS ready.");
 }
 
+#ifdef TDECK_SELFTEST
+extern "C" int samplerate;   // eSpeak-NG's synthesis rate (libespeak-ng/synthesize.h)
+// TEMPORARY hardware self-test console (build with -DTDECK_SELFTEST). Not for main.
+static void selftest_console()
+{
+    if (!Serial.available()) return;
+    int c = Serial.read();
+    switch (c) {
+    case 'i': {
+        static uint32_t last_f = 0, last_p = 0;
+        Serial.printf("[ST] _spi_user=%p _spi_cmd=%p SPI_PORT=%d\n",
+                      (void *)_spi_user, (void *)_spi_cmd, (int)SPI_PORT);
+        Serial.printf("[ST] tft %dx%d rot=%d  flushes=%lu (+%lu) px=%lu (+%lu)\n",
+                      tft.width(), tft.height(), (int)tft.getRotation(),
+                      (unsigned long)g_st_flushes,
+                      (unsigned long)(g_st_flushes - last_f),
+                      (unsigned long)g_st_px,
+                      (unsigned long)(g_st_px - last_p));
+        last_f = g_st_flushes; last_p = g_st_px;
+        Serial.printf("[ST] scr=%p children=%d  heap=%lu psram=%lu\n",
+                      (void *)lv_scr_act(),
+                      (int)lv_obj_get_child_cnt(lv_scr_act()),
+                      (unsigned long)ESP.getFreeHeap(),
+                      (unsigned long)ESP.getFreePsram());
+        Serial.printf("[ST] tts_enabled=%d tts_ready=%d audio_inited=%d\n",
+                      (int)g_tts_enabled, (int)g_tts_ready, (int)g_audio_inited);
+        break;
+    }
+    case 'r':   // force a full repaint through the real LVGL -> TFT path
+        lv_obj_invalidate(lv_scr_act());
+        Serial.println("[ST] screen invalidated");
+        break;
+    case 'd': { // read the panel back over MISO (proves 2-way SPI to the ST7789)
+        uint8_t id1 = tft.readcommand8(0x04, 1);
+        uint8_t id2 = tft.readcommand8(0x04, 2);
+        uint8_t id3 = tft.readcommand8(0x04, 3);
+        uint8_t st  = tft.readcommand8(0x09, 1);
+        Serial.printf("[ST] RDDID=%02X %02X %02X  RDDST=%02X\n", id1, id2, id3, st);
+        break;
+    }
+    case 'c': { // solid colour sweep straight through TFT_eSPI (bypasses LVGL)
+        const uint16_t cols[] = { TFT_RED, TFT_GREEN, TFT_BLUE, TFT_WHITE, TFT_BLACK };
+        for (int i = 0; i < 5; i++) { tft.fillScreen(cols[i]); delay(400); }
+        lv_obj_invalidate(lv_scr_act());
+        Serial.println("[ST] colour sweep done, screen restored");
+        break;
+    }
+    case 't':
+        Serial.println("[ST] tone 1 kHz 250 ms (quiet)");
+        play_tone(1000, 250, 2500);   // bench volume - the user is sitting next to it
+        Serial.println("[ST] tone done");
+        break;
+    case 's': {
+        Serial.println("[ST] speak ko");
+        st_heap("before speak");
+        tts_say("안녕하세요. 티덱 오에스 한국어 음성 시험입니다.");
+        st_heap("after speak");
+        Serial.printf("[ST] espeak samplerate=%d\n", samplerate);
+        break;
+    }
+    case 'S':
+        Serial.println("[ST] speak ko (settings phrase)");
+        tts_say("음성 안내를 켰습니다");
+        break;
+    case 'h':
+        st_heap("now");
+        break;
+    case 'f': {  // PROBE: does re-clocking a running channel kill it?
+        uint32_t f0 = g_i2s.frames();
+        Serial.printf("[ST] pre-reclock  frames=%lu afw=%d\n", (unsigned long)f0,
+                      g_i2s.availableForWrite());
+        g_i2s.setFrequency(16000);          // different from AUDIO_RATE on purpose
+        delay(400);
+        Serial.printf("[ST] post-reclock frames=%lu (+%lu) afw=%d\n",
+                      (unsigned long)g_i2s.frames(),
+                      (unsigned long)(g_i2s.frames() - f0), g_i2s.availableForWrite());
+        g_i2s.setFrequency(AUDIO_RATE);     // put it back
+        delay(400);
+        Serial.printf("[ST] restored     frames=%lu afw=%d\n",
+                      (unsigned long)g_i2s.frames(), g_i2s.availableForWrite());
+        break;
+    }
+    case 'a':
+        // NB g_tts.frames() is dead in the library (declared, never incremented);
+        // g_i2s.frames() counts DMA blocks actually clocked out to the amp.
+        Serial.printf("[ST] tts playing=%d done=%d shifts=%lu avail=%u under=%lu err=%lu | i2s frames=%lu afw=%d under=%lu\n",
+                      (int)g_tts.playing(), (int)g_tts.done(),
+                      (unsigned long)g_tts.shifts(), (unsigned)g_tts.available(),
+                      (unsigned long)g_tts.underflows(), (unsigned long)g_tts.errors(),
+                      (unsigned long)g_i2s.frames(), (int)g_i2s.availableForWrite(),
+                      (unsigned long)g_i2s.underflows());
+        Serial.printf("[ST] i2s irqs=%lu running=%d\n",
+                      (unsigned long)g_i2s.irqs(), (int)g_audio_inited);
+        break;
+    default: break;
+    }
+}
+#endif
+
 void loop()
 {
+#ifdef TDECK_SELFTEST
+    selftest_console();
+#endif
     lv_timer_handler();
     gps_feed();        // keep the NMEA parser fed regardless of which app is open
     lora_service();    // always-on LoRa RX so messages arrive even with the app closed
