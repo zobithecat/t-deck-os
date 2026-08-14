@@ -345,8 +345,14 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     // While the alert screen is up, a press means "확인" and nothing else. This is the
     // one screen that has to be dismissable one-handed no matter what has focus, so it
     // does not go through the group: the press is taken here and consumed.
-    if (g_alert_scr && press_edge) {
-        g_alert_dismiss_req = true;
+    static bool swallow = false;                 // hold the press until it is let go
+    if (g_alert_scr && press_edge) { g_alert_dismiss_req = true; swallow = true; }
+    if (swallow) {
+        // Swallow the WHOLE press, not just its edge. Closing on the edge alone left the
+        // finger still down, and by the next read the takeover was gone — so the press
+        // reached the Alert list underneath, and letting go clicked the row and opened
+        // the very dialog that had just been dismissed.
+        if (!pressed) swallow = false;
         last_pressed = pressed;
         data->key = 0; data->state = LV_INDEV_STATE_RELEASED;
         return;
@@ -3653,7 +3659,7 @@ static void power_save_run()
     // the audio engine. The CPU stays awake, which costs ~40 mA we would rather not
     // spend, but the radio keeps receiving through the ordinary path -- no DIO1 wake
     // wiring needed -- so a headline or an alert still brings the screen back.
-    enum { WOKE_BALL, WOKE_ALERT, WOKE_NEWS, WOKE_MSG } woke = WOKE_BALL;
+    enum { WOKE_BALL, WOKE_ALERT, WOKE_CLEAR, WOKE_NEWS, WOKE_MSG } woke = WOKE_BALL;
     for (;;) {
         delay(50);
         if (digitalRead(BOARD_BOOT_PIN) == LOW) { woke = WOKE_BALL; break; }
@@ -3662,6 +3668,12 @@ static void power_save_run()
         // the news machinery took it out of g_news_pending, which is all this loop was
         // watching. Of everything that can arrive, this is the one that must get through.
         if (g_alert_announce_req)              { woke = WOKE_ALERT; break; }
+        // The all-clear wakes too. Being woken for the alarm and then left asleep
+        // through "it is over" is the worse half of the pair: whoever moved because of
+        // it is the person waiting to hear this. g_alert_clear_req is only set when the
+        // cancel names the alert this device was actually holding, so a cancel for
+        // something we never saw stays silent.
+        if (g_alert_clear_req)                 { woke = WOKE_CLEAR; break; }
         if (g_news_pending)                    { woke = WOKE_NEWS; break; }
         if (g_msg_arrived)                     { woke = WOKE_MSG;  break; }
         ps_total++;
@@ -3679,6 +3691,8 @@ static void power_save_run()
     const char *why = "trackball";
     if (woke == WOKE_ALERT) {
         why = "alert";                         // news_tick() sounds it and puts it on screen
+    } else if (woke == WOKE_CLEAR) {
+        why = "all-clear";
     } else if (woke == WOKE_NEWS) {
         why = "news";
         g_news_pending_ms = millis() - 3000;   // announce on the next tick, do not sit
