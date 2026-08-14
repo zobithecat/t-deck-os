@@ -138,6 +138,12 @@ static char          g_alert_text[72] = "";
 static int           g_alert_sev     = 0;
 static uint32_t      g_alert_exp_ms  = 0;       // 0 = none active
 static lv_obj_t     *g_alert_banner  = NULL;
+static char          g_alert_area[8]  = "";     // floor / zone code, "0" = whole building
+static bool          g_alert_drill    = false;  // mtype 'T', or text marked [훈련]
+static bool          g_alert_show_req = false;  // RX asked for the overlay; loop() builds it
+static lv_obj_t     *g_alert_scr      = NULL;   // full-screen takeover, on the top layer
+static lv_obj_t     *g_alert_left     = NULL;   // "N분 남음" countdown
+static lv_timer_t   *g_alert_timer    = NULL;
 static lv_obj_t     *g_news_root = NULL;        // News app content container (below the Back btn)
 static lv_obj_t     *g_news_list = NULL;        // headline list (non-NULL only in list view)
 // article body fetch/reassembly (v1.5 !GQ request / !GD chunked reply)
@@ -1377,6 +1383,11 @@ static void alert_handle(const String &line)
     if (p < 8 || start < 0) return;                       // malformed
     String id = f[0], mtype = f[1], text = line.substring(start + 1);
     int  sev = f[2].toInt();
+    String area = f[3];
+    // A drill has to be unmistakable in both directions: mistaken for real it teaches
+    // people to ignore alarms, mistaken for a drill it gets someone hurt. mtype 'T' is
+    // the reliable signal; the text prefix is a stopgap until senders emit it.
+    bool  drill = (mtype == "T") || text.startsWith("[훈련]");
     long exp = strtol(f[4].c_str(), NULL, 10);            // minutes
     String ref = f[5];
 
@@ -1388,8 +1399,14 @@ static void alert_handle(const String &line)
     strncpy(g_alert_id, id.c_str(), sizeof(g_alert_id) - 1);      g_alert_id[sizeof(g_alert_id) - 1] = 0;
     strncpy(g_alert_text, text.c_str(), sizeof(g_alert_text) - 1); g_alert_text[sizeof(g_alert_text) - 1] = 0;
     g_alert_sev = sev;
+    g_alert_drill = drill;
+    strncpy(g_alert_area, area.c_str(), sizeof(g_alert_area) - 1);
+    g_alert_area[sizeof(g_alert_area) - 1] = 0;
     g_alert_exp_ms = exp > 0 ? millis() + (uint32_t)exp * 60000u : 0;
     if (g_news_list) news_show_list();                    // banner always updates
+    // Below sev 5 an alert is information, not an interruption: it stays a banner and a
+    // short chime. From 5 up it takes the screen, because that is the entire point.
+    if (sev >= 5) g_alert_show_req = true;
 
     // Announce ONCE per alert, ever. !AL is repeated on the mesh by design, and the
     // display state is RAM-only, so without this every power-on re-announced a live
@@ -2954,10 +2971,102 @@ static void back_event_cb(lv_event_t *e) { go_home(); }
 // delivered, so the News app is opened for them — the same "hijack" a phone does for
 // an emergency alert. Announcing is deferred ~2.5 s because a menu rebroadcast lands
 // as a burst of !GH: we chime, speak and hijack once for the burst, not per headline.
+// The alert siren. Deliberately unlike the message chime: that one is a short rising
+// pair, this alternates two tones several times so it reads as an alarm even from the
+// next room. Severity buys repetitions, not volume — the master control still rules.
+static void beep_alert(int sev)
+{
+    if (g_audio_vol == 0) return;
+    int amp = audio_tone_amp();
+    for (int i = 0, rounds = (sev >= 8 ? 4 : 2); i < rounds; i++) {
+        play_tone(1760, 170, amp);        // A6
+        play_tone(1175, 170, amp);        // D6
+    }
+}
+
+static void alert_close()
+{
+    if (g_alert_timer) { lv_timer_del(g_alert_timer); g_alert_timer = NULL; }
+    if (g_alert_scr)   { lv_obj_del(g_alert_scr);     g_alert_scr = NULL; }
+    g_alert_left = NULL;
+    lv_indev_reset(NULL, NULL);           // the press that dismissed it stops here
+}
+
+// Tick the countdown, and take the alert away by itself when it expires. Nobody is
+// coming to clear it: exp is the whole mechanism, so a stale warning cannot outlive
+// the situation it describes.
+static void alert_tick_cb(lv_timer_t *)
+{
+    if (!g_alert_exp_ms) return;
+    int32_t left = (int32_t)(g_alert_exp_ms - millis());
+    if (left <= 0) { g_alert_id[0] = 0; g_alert_text[0] = 0; g_alert_exp_ms = 0;
+                     alert_close(); if (g_news_list) news_show_list(); return; }
+    if (g_alert_left)
+        lv_label_set_text_fmt(g_alert_left, "%s · %ld분 남음",
+                              g_alert_drill ? "훈련" : "미확인", (long)(left / 60000 + 1));
+}
+
+// Full-screen takeover on the top layer, so it covers whatever app is open. An alert
+// nobody is looking at has not been delivered.
+static void alert_show()
+{
+    alert_close();
+    uint32_t bg = g_alert_drill ? 0x334155           // a drill must not look like the real thing
+                : (g_alert_sev >= 8 ? 0xB91C1C : 0xC2410C);
+
+    g_alert_scr = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(g_alert_scr, 320, 240);
+    lv_obj_center(g_alert_scr);
+    lv_obj_set_style_bg_color(g_alert_scr, lv_color_hex(bg), 0);
+    lv_obj_set_style_border_width(g_alert_scr, 0, 0);
+    lv_obj_set_style_pad_all(g_alert_scr, 10, 0);
+    lv_obj_set_flex_flow(g_alert_scr, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(g_alert_scr, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(g_alert_scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *head = lv_label_create(g_alert_scr);   // severity + which floor
+    lv_obj_set_style_text_font(head, &font_kr16, 0);
+    lv_obj_set_style_text_color(head, lv_color_white(), 0);
+    lv_label_set_text_fmt(head, LV_SYMBOL_WARNING " %s        %s",
+                          g_alert_drill ? "훈련" : (g_alert_sev >= 8 ? "긴급" : "경보"),
+                          (g_alert_area[0] && strcmp(g_alert_area, "0")) ? g_alert_area : "전체");
+
+    lv_obj_t *body = lv_label_create(g_alert_scr);   // what to do, as sent
+    lv_obj_set_width(body, 296);
+    lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(body, &font_kr16, 0);
+    lv_obj_set_style_text_color(body, lv_color_white(), 0);
+    lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(body, g_alert_text);
+
+    g_alert_left = lv_label_create(g_alert_scr);     // trust tier + expiry
+    lv_obj_set_style_text_font(g_alert_left, &font_kr16, 0);
+    lv_obj_set_style_text_color(g_alert_left, lv_color_hex(0xE2E8F0), 0);
+    lv_label_set_text(g_alert_left, g_alert_drill ? "훈련" : "미확인");
+
+    lv_obj_t *ok = lv_btn_create(g_alert_scr);       // one-handed: trackball press works
+    lv_obj_set_style_bg_color(ok, lv_color_hex(0x1F2937), 0);
+    lv_obj_t *okl = lv_label_create(ok);
+    lv_obj_set_style_text_font(okl, &font_kr16, 0);
+    lv_label_set_text(okl, LV_SYMBOL_OK "  확인");
+    lv_obj_add_event_cb(ok, [](lv_event_t *) { alert_close(); }, LV_EVENT_CLICKED, NULL);
+    lv_group_add_obj(lv_group_get_default(), ok);
+    lv_group_focus_obj(ok);
+
+    g_alert_timer = lv_timer_create(alert_tick_cb, 1000, NULL);
+    alert_tick_cb(NULL);
+}
+
 static void news_tick()
 {
     uint32_t now = millis();
     tts_pump();                     // keep the speech queue moving, one line at a time
+
+    if (g_alert_show_req) {         // built here, never from the RX path
+        g_alert_show_req = false;
+        alert_show();
+    }
 
     // !GA says how many headlines the revision has, and a flood without acknowledgement
     // loses one now and then — 4 of 5 arrive and the set just sits there incomplete.
@@ -2990,7 +3099,8 @@ static void news_tick()
     // the list are already on screen, so nothing is lost by not making noise.
     if (now < 15000) { if (g_news_list) news_show_list(); g_news_speak = ""; g_news_urgent = false; return; }
 
-    beep_notify();
+    if (g_news_urgent) beep_alert(g_alert_sev);   // alarm, not a notification
+    else               beep_notify();
     if (g_news_speak.length()) { tts_say(g_news_speak, g_news_urgent); g_news_speak = ""; }
     g_news_urgent = false;
 
