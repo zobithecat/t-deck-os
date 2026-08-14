@@ -366,6 +366,7 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     if (hold_ms && (uint32_t)(millis() - hold_ms) > 3000) {
         hold_ms = 0;
         g_sleep_req = true;
+        swallow = true;                          // the rest of this press belongs to us
         if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_POWER " sleeping - tap ball to wake");
     }
     last_pressed = pressed;
@@ -3759,7 +3760,17 @@ void loop()
 #ifdef TDECK_SELFTEST
     selftest_console();
 #endif
-    if (g_sleep_req) { g_sleep_req = false; power_save_run(); }
+    if (g_sleep_req) {
+        g_sleep_req = false;
+        // Abort the hold before going down. LVGL has been holding a press on whatever
+        // had focus for the whole three seconds, and a press that ends on an object is
+        // a click — so letting go opened the launcher tile under the cursor, and the
+        // wake landed in that app. This runs before lv_timer_handler(), so the gesture
+        // is discarded before LVGL can finish it.
+        lv_indev_reset(NULL, NULL);
+        lv_group_set_editing(lv_group_get_default(), false);
+        power_save_run();
+    }
     lv_timer_handler();
     gps_feed();        // keep the NMEA parser fed regardless of which app is open
     lora_service();    // always-on LoRa RX so messages arrive even with the app closed
