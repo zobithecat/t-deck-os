@@ -1374,13 +1374,20 @@ static void news_send_gn()
 // wherever they are: an alert nobody is looking at has not been delivered.
 static void alert_handle(const String &line)
 {
-    String f[8]; int p = 0, start = line.indexOf('\t');   // 8 fixed fields, then free text
-    for (int i = 0; i < 8 && start >= 0; i++) {
+    // !AL <id> <mtype> <sev> <area> <exp> <ref> <keyid> <text>
+    // Seven fixed fields, then the instruction — which is last and may contain tabs, so
+    // it is whatever follows the seventh. The previous version collected eight fields
+    // and then demanded another tab after them, which no well-formed alert has: every
+    // alert was being thrown away as malformed.
+    String f[7];
+    int start = line.indexOf('\t');
+    if (start < 0) return;
+    for (int i = 0; i < 7; i++) {
         int nx = line.indexOf('\t', start + 1);
-        if (nx < 0) { f[p++] = line.substring(start + 1); start = -1; break; }
-        f[p++] = line.substring(start + 1, nx); start = nx;
+        if (nx < 0) return;                               // truncated before the text
+        f[i] = line.substring(start + 1, nx);
+        start = nx;
     }
-    if (p < 8 || start < 0) return;                       // malformed
     String id = f[0], mtype = f[1], text = line.substring(start + 1);
     int  sev = f[2].toInt();
     String area = f[3];
