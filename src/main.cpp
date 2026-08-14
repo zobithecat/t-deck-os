@@ -3436,6 +3436,11 @@ void loop()
         g_wake_show_lora = false;
         if (g_app_view) go_home();
         open_app("LoRa");
+        // Drop the input state HERE, once the screen we mean to keep exists. Resetting
+        // earlier (it used to happen back in power_save_run) leaves the stale gesture
+        // to arrive after this, where it clicks Back and closes what we just opened.
+        lv_indev_reset(NULL, NULL);
+        lv_group_set_editing(lv_group_get_default(), false);
     }
     lv_timer_handler();
     gps_feed();        // keep the NMEA parser fed regardless of which app is open
