@@ -160,6 +160,7 @@ static lv_obj_t     *g_alert_list = NULL;   // Alert app list (non-NULL while it
 static bool          g_alert_clear_req = false;  // a cancel landed; loop() sounds the all-clear
 static char          g_alert_say[72]   = "";   // what to read aloud for a new alert
 static bool          g_alert_announce_req = false;
+static volatile bool g_alert_dismiss_req = false;  // trackball press while the takeover is up
 static int           g_alert_show_idx  = -1;    // history entry the takeover should show
 static int           g_alert_shown     = -1;    // history entry it is showing
 static lv_obj_t     *g_news_root = NULL;        // News app content container (below the Back btn)
@@ -340,6 +341,16 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     // ---- center press: engage/release a slider, or activate a button ----
     bool pressed    = (digitalRead(BOARD_BOOT_PIN) == LOW);
     bool press_edge = pressed && !last_pressed;
+
+    // While the alert screen is up, a press means "확인" and nothing else. This is the
+    // one screen that has to be dismissable one-handed no matter what has focus, so it
+    // does not go through the group: the press is taken here and consumed.
+    if (g_alert_scr && press_edge) {
+        g_alert_dismiss_req = true;
+        last_pressed = pressed;
+        data->key = 0; data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
 
     // Hold the trackball for 3 s to enter power save. Only the request is made here —
     // sleeping inside an input callback would stop LVGL mid-read.
@@ -3215,6 +3226,10 @@ static void news_tick()
     if (g_alert_show_req) {         // built here, never from the RX path
         g_alert_show_req = false;
         alert_show(g_alert_show_idx);
+    }
+    if (g_alert_dismiss_req) {      // 확인 — from the ball, closed at loop level
+        g_alert_dismiss_req = false;
+        alert_close();
     }
     if (g_alert_clear_req) {        // an alert was cancelled: say so, and stop shouting
         g_alert_clear_req = false;
