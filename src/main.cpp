@@ -3644,6 +3644,13 @@ static void power_save_run()
     lora_service();                           // clear any pending IRQ, else DIO1 is
     lora_radio.startReceive();                // already high and we wake immediately
 
+    // Idle slower. The CPU has to stay awake here (light sleep resets this build), but it
+    // has nothing to do between packets, and current scales with the clock. 80 MHz is the
+    // floor, not 40: the APB bus follows the CPU down, and USB-Serial-JTAG and the I2S the
+    // speech engine is still holding both need it at 80.
+    const uint32_t cpu_mhz = getCpuFrequencyMhz();
+    setCpuFrequencyMhz(80);
+
     while (digitalRead(BOARD_BOOT_PIN) == LOW) delay(10);   // wait for the 3 s hold to end
     delay(50);
 
@@ -3680,6 +3687,7 @@ static void power_save_run()
     }
 
 
+    setCpuFrequencyMhz(cpu_mhz);              // full speed back before any of the UI work
     setBrightness(br);
     setKeyboardBrightness(kb);
 
