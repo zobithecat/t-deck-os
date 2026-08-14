@@ -196,6 +196,7 @@ static void open_app(const char *name);
 static void news_tick();
 static volatile bool g_sleep_req = false;   // trackball long-press asked for power save
 static String        g_ps_report;           // why the last power-save session woke up
+static volatile bool g_msg_arrived = false; // an incoming message landed, app open or not
 static int           g_reset_reason = 0;    // esp_reset_reason() at boot — survives a USB reconnect
 static void tts_say(const String &text, bool urgent = false);   // eSpeak-NG (ko); queued unless urgent
 static bool    g_tts_enabled = true;       // Settings toggle, persisted in NVS ("tts")
@@ -1244,7 +1245,10 @@ static void lora_log_print(const char *prefix, const String &msg)
     } else if (prefix[0] == '<') {                 // a real message arrived in the background
         g_lora_unread++;
     }
-    if (prefix[0] == '<') beep_notify();           // audible alert on any incoming message
+    if (prefix[0] == '<') {                        // audible alert on any incoming message
+        g_msg_arrived = true;                      // ...and a wake signal that does not depend
+        beep_notify();                             // on the LoRa app being closed (g_lora_unread
+    }                                              // only counts while it is)
 }
 
 static void lora_emit_msg(String msg)
@@ -3323,7 +3327,7 @@ static void power_save_run()
     const uint8_t br = g_screen_bright, kb = g_kb_bright;
     const bool gps_was  = g_gps_enabled;
     const bool wifi_was = (WiFi.status() == WL_CONNECTED);
-    const int  unread0  = (int)g_lora_unread;
+    g_msg_arrived = false;                    // only messages from here on count as a wake
 
     const bool ble_was = g_ble_inited;
 
@@ -3363,7 +3367,7 @@ static void power_save_run()
         if (digitalRead(BOARD_BOOT_PIN) == LOW) { woke = WOKE_BALL; break; }
         lora_service();                                     // stay on the mesh, screen dark
         if (g_news_pending)                    { woke = WOKE_NEWS; break; }
-        if ((int)g_lora_unread != unread0)     { woke = WOKE_MSG;  break; }
+        if (g_msg_arrived)                     { woke = WOKE_MSG;  break; }
         ps_total++;
     }
 
