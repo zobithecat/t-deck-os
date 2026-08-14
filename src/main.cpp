@@ -3183,6 +3183,10 @@ void setup()
     setBrightness(g_screen_bright);   // restore saved brightness (boot_restore loaded it above)
 
     Serial.println("T-Deck OS ready.");
+    // Leave the reset cause where it can be read without a serial cable: if the device
+    // reboots instead of waking, this is the first line in the LoRa log afterwards.
+    // 1=power-on 3=sw 4=panic 5=int-wdt 6=task-wdt 9=brownout 11=usb
+    lora_log_print("* ", "boot  reset=" + String(g_reset_reason));
 }
 
 #ifdef TDECK_SELFTEST
