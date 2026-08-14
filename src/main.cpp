@@ -3381,16 +3381,6 @@ static void power_save_run()
     while (digitalRead(BOARD_BOOT_PIN) == LOW) delay(10);   // swallow the wake press so it
     delay(50);                                              // does not also click a button
 
-    // Undo what the 3 s hold did to LVGL on the way in. An encoder long-press toggles
-    // the focus group into EDIT mode (lv_indev.c: "On enter long press toggle edit
-    // mode") whenever the focused object is editable or scrollable — which every
-    // launcher tile and app view is. LVGL's threshold is ~400 ms, so the hold trips it
-    // long before we sleep, and coming back in edit mode meant clicks stopped opening
-    // apps. Also drop the press LVGL still thinks is in progress: it never saw the
-    // release, because we stopped servicing it mid-gesture.
-    lv_indev_reset(NULL, NULL);
-    lv_group_set_editing(lv_group_get_default(), false);
-
     // Act on WHY we woke. Waking silently and leaving the user to hunt for what caused
     // it is the same as not waking: a chime with nothing on screen tells them nothing.
     const char *why = "trackball";
@@ -3405,6 +3395,17 @@ static void power_save_run()
         if (g_app_view) go_home();             // show the message that woke us; it only
         open_app("LoRa");                      // lives in the LoRa app's history
     }
+    // Only now drop the input state, once the screen we are keeping is built. An
+    // encoder long-press toggles the focus group into EDIT mode (lv_indev.c: "On enter
+    // long press toggle edit mode") for any focused object that is editable or
+    // scrollable, which every launcher tile and app view is, and LVGL never saw the
+    // release of the hold because we stopped servicing it mid-gesture. Resetting
+    // BEFORE the app switch left that stale gesture to be delivered afterwards, where
+    // it clicked Back and then the launcher tile under the cursor — which is how a
+    // wake ended up in the Notes app instead of the one it opened.
+    lv_indev_reset(NULL, NULL);
+    lv_group_set_editing(lv_group_get_default(), false);
+
     g_ps_report = "[PS] idled " + String((unsigned long)ps_total * 50 / 1000) + "s, woke by " +
                   why + "\n";
     Serial.print(g_ps_report);
