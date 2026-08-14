@@ -80,7 +80,21 @@ SPI3_HOST = 2
   #elif CONFIG_IDF_TARGET_ESP32S2
     #define SPI_PORT 2 //FSPI(ESP32 S2)
   #elif CONFIG_IDF_TARGET_ESP32S3
-    #define SPI_PORT FSPI
+    // SPI_PORT is a *register-file index* fed to REG_SPI_BASE(i), NOT an
+    // Arduino SPI bus id. On the S3 the peripheral is GPSPI2, so the index is 2
+    // (same literal the S2/USE_FSPI_PORT branches above use).
+    //
+    // This used to say FSPI, which is 0 in esp32-hal-spi.h. Under IDF 4.x that
+    // was harmless because REG_SPI_BASE(i) was
+    //     (DR_REG_SPI2_BASE + (((i)>2) ? ((i)-2)*0x1000 : 0))
+    // i.e. index 0 also landed on SPI2's base. IDF 5.x (Arduino core 3.x)
+    // tightened it to
+    //     (((i)>=2) ? (DR_REG_SPI2_BASE + ((i)-2)*0x1000) : (0))
+    // so REG_SPI_BASE(0) == 0 and every _spi_* pointer below became a raw
+    // offset: _spi_user == 0x10. The first SET_BUS_WRITE_MODE in
+    // begin_tft_write() then stored to 0x10 -> Guru Meditation
+    // (StoreProhibited), EXCVADDR 0x10, during tft.begin().
+    #define SPI_PORT 2 // GPSPI2 register file (ESP32 S3)
   #endif
 #endif
 

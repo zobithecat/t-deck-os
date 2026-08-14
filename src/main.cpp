@@ -20,8 +20,10 @@
 #include <BLEAdvertisedDevice.h>
 #include <Preferences.h>
 #include <sys/time.h>
-#include <driver/i2s.h>
-#include <esp_sleep.h>
+#include <BackgroundAudioSpeech.h>   // eSpeak-NG TTS (see tts_say)
+#include <ESP32I2SAudio.h>           // new IDF5 I2S driver — the board's single audio owner
+#include <libespeak-ng/voice/ko.h>
+#include <esp_sleep.h>               // power save (light sleep)
 #include <driver/gpio.h>
 #include <RadioLib.h>
 #include <TinyGPS++.h>
@@ -52,6 +54,7 @@ static int16_t       tp_x[5], tp_y[5];
 static lv_indev_t   *enc_indev;     // trackball (encoder)
 static int           g_tb_accel = 2;     // trackball scroll accel level 0..5 (Settings / NVS)
 static uint8_t       g_beep_vol = 7;     // incoming-message beep volume 0..10 (0=mute; Settings/NVS)
+static uint8_t       g_audio_vol = 2;    // MASTER loudness 0..10 for speech + tones (Settings/NVS "ttsvol")
 static uint8_t       g_screen_bright = 16;   // display brightness 1..16 (Settings/NVS "bright")
 static lv_obj_t     *g_toast;       // bottom status / selection-feedback line
 static lv_obj_t     *g_home_list;   // launcher app list
@@ -109,6 +112,8 @@ static int           g_news_n = 0;
 static char          g_news_rev[8] = "";        // current revision (base36 string)
 static int           g_news_count = -1;         // expected headline count from !GA (-1 = unknown)
 static uint32_t      g_news_beep_ms = 0;        // throttle the background "news arrived" chime
+static uint32_t      g_news_last_ms = 0;        // last !GA/!GH seen — a quiet gap means the burst ended
+static uint32_t      g_news_fix_ms  = 0;        // last automatic repair request
 static uint32_t      g_news_gl_ms   = 0;        // rate-limit our !GL menu requests
 static uint32_t      g_news_gq_ms   = 0;        // rate-limit our !GQ body requests (a stream is expensive)
 static long          g_news_seq     = -1;       // v1.8: monotonic revision counter from !GA (-1 = none)
@@ -123,6 +128,7 @@ static int           g_hold_n = 0;
 static bool          g_news_pending    = false;
 static uint32_t      g_news_pending_ms = 0;
 static String        g_news_speak;              // what the announcement should read aloud
+static bool          g_news_urgent = false;     // set by !AL: jump the speech queue
 // v1.8 !AL disaster alert — the channel this protocol exists for.
 static char          g_alert_id[8]   = "";
 static char          g_alert_seen[8] = "";   // last ANNOUNCED alert, kept in NVS ("alrtid"):
@@ -191,11 +197,12 @@ static void go_home();
 static void open_app(const char *name);
 static void news_tick();
 static volatile bool g_sleep_req = false;   // trackball long-press asked for power save
-static void tts_say(const String &text);   // eSpeak-NG (ko) via BackgroundAudio; no-op if muted
+static String        g_ps_report;           // why the last power-save session woke up
+static volatile bool g_msg_arrived = false; // an incoming message landed, app open or not
+static int           g_reset_reason = 0;    // esp_reset_reason() at boot — survives a USB reconnect
+static void tts_say(const String &text, bool urgent = false);   // eSpeak-NG (ko); queued unless urgent
 static bool    g_tts_enabled = true;       // Settings toggle, persisted in NVS ("tts")
-static uint8_t g_tts_vol     = 2;          // speech volume 0..10, NVS "ttsvol". Quiet by default:
-                                           // this device talks unprompted, so full scale is the
-                                           // wrong thing to do to whoever is holding it.
+// loudness lives in g_audio_vol (one master control for speech AND tones) — see audio section
 static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g);
 static void kbtest_log_key(uint32_t key);
 static void back_event_cb(lv_event_t *e);
@@ -231,10 +238,27 @@ static void setKeyboardBrightness(uint8_t value)
 // ---------------------------------------------------------------------------
 // LVGL glue
 // ---------------------------------------------------------------------------
+#ifdef TDECK_SELFTEST
+volatile uint32_t g_st_flushes = 0;
+volatile uint32_t g_st_px      = 0;
+static void st_heap(const char *tag)
+{
+    Serial.printf("[HEAP] %-22s int=%7u dma=%7u dma_big=%7u  psram=%8u\n", tag,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+#else
+#define st_heap(t) do {} while (0)
+#endif
 static void disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p)
 {
     uint32_t w = area->x2 - area->x1 + 1;
     uint32_t h = area->y2 - area->y1 + 1;
+#ifdef TDECK_SELFTEST
+    g_st_flushes++; g_st_px += w * h;
+#endif
     tft.startWrite();
     tft.setAddrWindow(area->x1, area->y1, w, h);
     tft.pushColors((uint16_t *)&color_p->full, w * h, false);
@@ -853,14 +877,15 @@ static void ble_scan_run(lv_timer_t *t)
     if (!g_bt_list) return;
     BLEScan *s = BLEDevice::getScan();
     s->setActiveScan(true);
-    BLEScanResults res = s->start(3, false);           // 3 s blocking scan
-    if (!g_bt_list) { s->clearResults(); return; }      // user left during scan
-    int n = res.getCount();
+    // Arduino-ESP32 3.x: start() returns a pointer, and getName()/toString() return String.
+    BLEScanResults *res = s->start(3, false);          // 3 s blocking scan
+    if (!g_bt_list || !res) { s->clearResults(); return; }   // user left during scan
+    int n = res->getCount();
     lv_label_set_text_fmt(g_bt_status, "%d devices", n);
     lv_group_t *grp = lv_group_get_default();
     for (int i = 0; i < n && i < 15; i++) {
-        BLEAdvertisedDevice d = res.getDevice(i);
-        std::string nm = d.haveName() ? d.getName() : d.getAddress().toString();
+        BLEAdvertisedDevice d = res->getDevice(i);
+        String nm = d.haveName() ? String(d.getName().c_str()) : String(d.getAddress().toString().c_str());
         char buf[64];
         snprintf(buf, sizeof(buf), "%s  %ddBm", nm.c_str(), d.getRSSI());
         lv_obj_t *btn = lv_list_add_btn(g_bt_list, LV_SYMBOL_BLUETOOTH, buf);
@@ -1017,54 +1042,108 @@ static void browser_go(lv_event_t *e)
     if (!g_browser_timer) g_browser_timer = lv_timer_create(browser_fetch, 60, NULL);
 }
 
-// --- Speaker test (I2S to the on-board MAX98357A amp) ------------------------
+// --- Audio device (I2S to the on-board MAX98357A amp) ------------------------
+// ONE owner for the whole board. IDF 5 aborts at boot if the legacy driver/i2s.h
+// and the new i2s_std driver are both linked ("CONFLICT! The new i2s driver can't
+// work along with the legacy i2s driver"), and the speech engine needs the new one,
+// so tones are written to the same device instead of installing a second driver.
+// ESP32I2SAudio is 16-bit STEREO only (setStereo(false) is a no-op that returns
+// false), unlike the legacy driver's I2S_CHANNEL_FMT_ONLY_LEFT, so every writer
+// must interleave L/R. Sample rate is per-use: tones want 16 kHz, eSpeak clocks
+// the device to its own rate, and setFrequency() re-clocks a running device.
+//
+// Loudness: the MAX98357A drives a small speaker a hand's width from the user's
+// face, so full scale is unpleasant. ONE master volume (Settings > Volume,
+// g_audio_vol 0..10, NVS "ttsvol") governs both speech and tones, so the chime
+// can never be loud while speech is quiet. It defaults to 2 (~20%): a fresh NVS
+// must come up quiet.
+//
+// ONE sample rate for the whole device, and it is eSpeak-NG's, measured on
+// hardware (espeak_Initialize returns 22050). Tones are synthesised at that rate
+// too. Re-clocking a *running* i2s_std channel means
+// disable -> reconfig -> enable, and on IDF 5.5 the channel does not come back:
+// every later i2s_channel_write() returns "The channel is not enabled" and the
+// speaker goes dead. Keeping one rate means BackgroundAudioSpeech::begin()'s own
+// setFrequency() call sees _sampleRate == freq and skips the whole dance.
+#define AUDIO_RATE      22050     // eSpeak-NG's synthesis rate; the device runs at it
+#define AUDIO_AMP_MAX   30000     // int16 full scale, with a little headroom
+
+// ESP32I2SAudio::begin() is NOT re-entrant: on a second call it returns false at the
+// first line, skipping the DMA setup, the pump task and i2s_channel_enable(). So the
+// board has exactly ONE begin(), and it is the speech engine's, because only
+// BackgroundAudioSpeech knows eSpeak's rate and frame size.
+//
+// It also picks the DMA geometry. The WIDTH must be left alone -- it asks for buffers
+// one eSpeak frame wide so every DMA boundary lands on a frame boundary, and forcing a
+// different width (we tried 1023 words) makes each buffer end mid-frame, which is
+// audible as ticking. The COUNT is ours to choose: 5 frames is ~26 KB of DMA-capable
+// INTERNAL RAM, and internal RAM is the scarcest thing on this board -- Wi-Fi takes
+// ~49 KB and Bluedroid ~73 KB after us, which left barely 2 KB free and the board
+// reset as soon as light sleep tried to save its state. 3 frames is ~16 KB, still two
+// frames of headroom for the pump, and hands ~10 KB back.
+class TDeckI2S : public ESP32I2SAudio {
+public:
+    using ESP32I2SAudio::ESP32I2SAudio;
+    bool setBuffers(size_t, size_t bufferWords, int32_t silenceSample = 0) override {
+        return ESP32I2SAudio::setBuffers(3, bufferWords, silenceSample);   // keep the width
+    }
+};
+static TDeckI2S              g_i2s(BOARD_I2S_BCK, BOARD_I2S_WS, BOARD_I2S_DOUT);
+static BackgroundAudioSpeech g_tts(g_i2s);   // the single owner: it performs the one begin()
+static bool                  g_tts_ready = false;
+static void                  audio_apply_volume();
+// Speech FIFO: messages are read one after another instead of cutting each other off.
+#define TTS_Q_N 6
+static String                g_tts_q[TTS_Q_N];
+static uint8_t               g_tts_qh = 0, g_tts_qn = 0;
+static uint32_t              g_tts_spoke_ms = 0;
+
+// Tone amplitude at the current master volume (0..AUDIO_AMP_MAX).
+static int audio_tone_amp() { return (AUDIO_AMP_MAX / 10) * g_audio_vol; }
+
+// Bring the board's single audio owner up. Everything that makes sound goes through
+// here, so there is never a second begin() to lose against.
 static void audio_init()
 {
     if (g_audio_inited) return;
-    i2s_config_t cfg = {};
-    cfg.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
-    cfg.sample_rate          = 16000;
-    cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT;
-    cfg.channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT;
-    cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-    cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
-    cfg.dma_buf_count        = 8;
-    cfg.dma_buf_len          = 64;
-    cfg.tx_desc_auto_clear   = true;     // output silence on underrun (no stuck tone)
-    i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL);
-
-    i2s_pin_config_t pins = {};
-    pins.mck_io_num   = I2S_PIN_NO_CHANGE;   // ! don't route MCLK to GPIO0 (= trackball center)
-    pins.bck_io_num   = BOARD_I2S_BCK;
-    pins.ws_io_num    = BOARD_I2S_WS;
-    pins.data_out_num = BOARD_I2S_DOUT;
-    pins.data_in_num  = I2S_PIN_NO_CHANGE;
-    i2s_set_pin(I2S_NUM_0, &pins);
-    g_audio_inited = true;
+    g_audio_inited = true;               // set first: begin() is slow, don't re-enter
+    g_tts.setVoice(voice_ko);
+    g_tts_ready = g_tts.begin();         // creates the channel, the pump task, enables it
+    if (!g_tts_ready) Serial.println("[audio] speech engine failed to start");
+    audio_apply_volume();                // begin() leaves gain at 1.0 — never full scale
 }
 
-static void play_tone(int freq, int ms, int amp = 12000)
+static void play_tone(int freq, int ms, int amp = -1)   // amp < 0 = the master volume
 {
-    const int sr = 16000;
-    int total = (int)((long)sr * ms / 1000);
+    if (amp < 0) amp = audio_tone_amp();
+    if (amp == 0) return;
+    audio_init();
+    const int sr = AUDIO_RATE;           // never re-clock a running channel; see AUDIO_RATE
+    int total = (int)((long)sr * ms / 1000);   // frames, not samples
     static double phase = 0;
     double step = TWO_PI * freq / sr;
-    int16_t buf[256];
+    int16_t buf[256];                          // 128 stereo frames
     int done = 0;
     while (done < total) {
-        int n = (total - done < 256) ? (total - done) : 256;
+        int n = (total - done < 128) ? (total - done) : 128;
         for (int i = 0; i < n; i++) {
-            buf[i] = (int16_t)(sin(phase) * (double)amp);
+            int16_t s = (int16_t)(sin(phase) * (double)amp);
+            buf[2 * i]     = s;                // L
+            buf[2 * i + 1] = s;                // R - the device is stereo-only
             phase += step;
             if (phase >= TWO_PI) phase -= TWO_PI;
         }
-        size_t bw;
-        i2s_write(I2S_NUM_0, buf, n * sizeof(int16_t), &bw, portMAX_DELAY);
+        const uint8_t *p = (const uint8_t *)buf;
+        size_t left = (size_t)n * 2 * sizeof(int16_t);
+        while (left) {                       // the device takes what fits; keep feeding
+            size_t w = g_i2s.write(p, left);
+            if (!w) { delay(1); continue; }
+            p += w; left -= w;
+        }
         done += n;
     }
-    int16_t z[128] = {0};                 // short trailing silence so the note ends cleanly
-    size_t bw;
-    i2s_write(I2S_NUM_0, z, sizeof(z), &bw, portMAX_DELAY);
+    int16_t z[128] = {0};                 // 64 frames of trailing silence, so the note ends cleanly
+    g_i2s.write((const uint8_t *)z, sizeof(z));
 }
 
 static void speaker_play_cb(lv_event_t *e)
@@ -1078,7 +1157,7 @@ static void speaker_play_cb(lv_event_t *e)
         const int notes[] = { 523, 587, 659, 698, 784, 880 };
         for (int i = 0; i < 6; i++) play_tone(notes[i], 160);
     }
-    i2s_zero_dma_buffer(I2S_NUM_0);      // flush so no tone lingers after playback
+    // play_tone() already writes trailing silence, so nothing lingers on the amp
 }
 
 // Short rising two-tone "ding-dong" for an incoming LoRa message. 0 = mute.
@@ -1090,37 +1169,55 @@ static void speaker_play_cb(lv_event_t *e)
 // Needs BackgroundAudio, which requires the IDF 5.x I2S API (pioarduino core). The
 // __has_include guard is not a fallback for a missing feature — it keeps the protocol
 // work buildable on either core while the platform migration is verified separately.
-#if __has_include(<BackgroundAudioSpeech.h>)
-#include <BackgroundAudioSpeech.h>
-#include <ESP32I2SAudio.h>
-#include <libespeak-ng/voice/ko.h>
-static ESP32I2SAudio         g_tts_out(BOARD_I2S_BCK, BOARD_I2S_WS, BOARD_I2S_DOUT);
-static BackgroundAudioSpeech g_tts(g_tts_out);
-static bool                  g_tts_ready = false;
-static void tts_say(const String &text)
+
+// One master volume for everything the device can blurt out. Tones read
+// audio_tone_amp() per call; the speech engine keeps its own gain, so push it.
+static void audio_apply_volume()
+{
+    if (g_tts_ready) g_tts.setGain(g_audio_vol / 10.0f);
+}
+
+static void tts_say(const String &text, bool urgent)   // default lives on the declaration
 {
     if (!g_tts_enabled || !text.length()) return;
-    if (!g_tts_ready) { g_tts.setVoice(voice_ko); g_tts.begin(); g_tts_ready = true; }
-    g_tts.flush();                       // a newer alert preempts whatever is being read
-    g_tts.speak(text.c_str());           // synthesis runs on interrupts — loop() keeps going
-    Serial.printf("[TTS] %s\n", text.c_str());
+    audio_init();                        // brings the engine up on first use
+    if (!g_tts_ready) return;
+
+    if (urgent) {                        // an evacuation line does not wait behind a headline
+        g_tts_qn = 0;                    // whatever was queued is now stale
+        g_tts.flush();                   // and cut off what is being read
+        g_tts.speak(text.c_str());
+        g_tts_spoke_ms = millis();
+        Serial.printf("[TTS!] %s\n", text.c_str());
+        return;
+    }
+    if (g_tts_qn >= TTS_Q_N) { Serial.println("[TTS] queue full, dropped"); return; }
+    g_tts_q[(g_tts_qh + g_tts_qn) % TTS_Q_N] = text;   // tts_pump() speaks it when the line is free
+    g_tts_qn++;
 }
-#else
-static void tts_say(const String &text)
+
+// Speak the next queued line once the current one has finished. Without this, a burst
+// of messages each flush()ed the one before it and you heard fragments.
+static void tts_pump()
 {
-    if (!g_tts_enabled || !g_tts_vol) return;
-    Serial.printf("[TTS-stub vol=%u] %s\n", g_tts_vol, text.c_str());   // no speech engine on this core
+    if (!g_tts_ready || !g_tts_qn) return;
+    if ((uint32_t)(millis() - g_tts_spoke_ms) < 250) return;   // let speak() get going first
+    if (!g_tts.done()) return;                                 // still talking
+    String s = g_tts_q[g_tts_qh];
+    g_tts_qh = (g_tts_qh + 1) % TTS_Q_N;
+    g_tts_qn--;
+    g_tts.speak(s.c_str());
+    g_tts_spoke_ms = millis();
+    Serial.printf("[TTS] %s\n", s.c_str());
 }
-#endif
 
 static void beep_notify()
 {
     if (g_beep_vol == 0) return;
     audio_init();
-    int amp = 1200 * g_beep_vol;         // 0..12000 (vol 10 = full scale)
+    int amp = (audio_tone_amp() / 10) * g_beep_vol;   // beep level, capped by the master volume
     play_tone(1568, 90,  amp);           // G6
     play_tone(2093, 120, amp);           // C7
-    i2s_zero_dma_buffer(I2S_NUM_0);
 }
 
 // --- LoRa (SX1262) — pager-lora-qwerty interop -------------------------------
@@ -1150,7 +1247,10 @@ static void lora_log_print(const char *prefix, const String &msg)
     } else if (prefix[0] == '<') {                 // a real message arrived in the background
         g_lora_unread++;
     }
-    if (prefix[0] == '<') beep_notify();           // audible alert on any incoming message
+    if (prefix[0] == '<') {                        // audible alert on any incoming message
+        g_msg_arrived = true;                      // ...and a wake signal that does not depend
+        beep_notify();                             // on the LoRa app being closed (g_lora_unread
+    }                                              // only counts while it is)
 }
 
 static void lora_emit_msg(String msg)
@@ -1298,6 +1398,7 @@ static void alert_handle(const String &line)
     strncpy(g_alert_seen, id.c_str(), sizeof(g_alert_seen) - 1); g_alert_seen[sizeof(g_alert_seen) - 1] = 0;
     Preferences pr; pr.begin("tdeckos", false); pr.putString("alrtid", g_alert_seen); pr.end();
     news_mark_new(text);
+    g_news_urgent = true;                                 // preempts anything being read
     g_news_pending_ms = millis() - 3000;                  // a genuinely new alert announces at once
 }
 
@@ -1383,7 +1484,9 @@ static void news_send_gl()
 {
     if (!g_lora_ok) return;
     uint32_t now = millis();
-    if (g_news_gl_ms && (uint32_t)(now - g_news_gl_ms) < 8000) return;   // too soon
+    // Router coalesces repeat requests for ~30 s (PROTOCOL.md §5), so asking more often
+    // than that only burns airtime for an answer that will not come.
+    if (g_news_gl_ms && (uint32_t)(now - g_news_gl_ms) < 30000) return;   // too soon
     g_news_gl_ms = now;
     bool complete = g_news_rev[0] && g_news_count >= 0 && g_news_n >= g_news_count;
     lora_tx_line(String("!GL\t") + (complete ? g_news_rev : "-") + "\n");
@@ -2446,21 +2549,23 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         }, LV_EVENT_VALUE_CHANGED, NULL);
         lv_group_add_obj(g, tsw);
 
-        lv_obj_t *tvlbl = lv_label_create(parent);
-        lv_label_set_text(tvlbl, "Speech volume");
-        lv_obj_set_style_text_color(tvlbl, lv_color_white(), 0);
-        lv_obj_t *tvsl = lv_slider_create(parent);
-        lv_obj_set_width(tvsl, 260);
-        lv_slider_set_range(tvsl, 0, 10);
-        lv_slider_set_value(tvsl, g_tts_vol, LV_ANIM_OFF);
-        lv_obj_add_event_cb(tvsl, [](lv_event_t *e) {
-            g_tts_vol = (uint8_t)lv_slider_get_value(lv_event_get_target(e));
-            Preferences pr; pr.begin("tdeckos", false); pr.putUChar("ttsvol", g_tts_vol); pr.end();
+        lv_obj_t *vlbl = lv_label_create(parent);
+        lv_label_set_text(vlbl, "Volume   (speech + chime, 0 = mute)");
+        lv_obj_set_style_text_color(vlbl, lv_color_white(), 0);
+        lv_obj_t *vslider = lv_slider_create(parent);
+        lv_obj_set_width(vslider, 260);
+        lv_slider_set_range(vslider, 0, 10);
+        lv_slider_set_value(vslider, g_audio_vol, LV_ANIM_OFF);
+        lv_obj_add_event_cb(vslider, [](lv_event_t *e) {       // save on each step
+            g_audio_vol = (uint8_t)lv_slider_get_value(lv_event_get_target(e));
+            Preferences p; p.begin("tdeckos", false); p.putUChar("ttsvol", g_audio_vol); p.end();
+            audio_apply_volume();
         }, LV_EVENT_VALUE_CHANGED, NULL);
-        lv_obj_add_event_cb(tvsl, [](lv_event_t *) {
-            tts_say("음성 안내");        // short sample so the level can be set by ear
+        lv_obj_add_event_cb(vslider, [](lv_event_t *e) {       // preview the new level
+            if (g_tts_enabled) tts_say("음성 안내", true);      // preview now, not after the queue
+            else               play_tone(1000, 120);           // speech off: a tick still lands
         }, LV_EVENT_RELEASED, NULL);
-        lv_group_add_obj(g, tvsl);
+        lv_group_add_obj(g, vslider);
     } else if (strcmp(name, "Wi-Fi") == 0) {
         WiFi.mode(WIFI_STA);
         WiFi.disconnect();
@@ -2852,6 +2957,19 @@ static void back_event_cb(lv_event_t *e) { go_home(); }
 static void news_tick()
 {
     uint32_t now = millis();
+    tts_pump();                     // keep the speech queue moving, one line at a time
+
+    // !GA says how many headlines the revision has, and a flood without acknowledgement
+    // loses one now and then — 4 of 5 arrive and the set just sits there incomplete.
+    // Once the burst has been quiet for a few seconds, ask for the menu again; the
+    // guard inside news_send_gl() keeps this from turning into a request storm.
+    if (g_news_count > 0 && g_news_n < g_news_count && g_news_last_ms &&
+        (uint32_t)(now - g_news_last_ms) > 5000 &&
+        (!g_news_fix_ms || (uint32_t)(now - g_news_fix_ms) > 60000)) {
+        g_news_fix_ms = now;
+        Serial.printf("[news] have %d of %d, asking again\n", g_news_n, g_news_count);
+        news_send_gl();
+    }
 
     if (g_alert_exp_ms && (int32_t)(now - g_alert_exp_ms) >= 0) {   // alert expired
         g_alert_exp_ms = 0; g_alert_id[0] = 0; g_alert_text[0] = 0;
@@ -2870,10 +2988,11 @@ static void news_tick()
     // seconds are exactly when the backlog arrives — a re-broadcast alert, or a whole
     // menu answering our own !GL. Show all of it, announce none of it: the banner and
     // the list are already on screen, so nothing is lost by not making noise.
-    if (now < 15000) { if (g_news_list) news_show_list(); g_news_speak = ""; return; }
+    if (now < 15000) { if (g_news_list) news_show_list(); g_news_speak = ""; g_news_urgent = false; return; }
 
     beep_notify();
-    if (g_news_speak.length()) { tts_say(g_news_speak); g_news_speak = ""; }
+    if (g_news_speak.length()) { tts_say(g_news_speak, g_news_urgent); g_news_speak = ""; }
+    g_news_urgent = false;
 
     bool in_news = g_app_view && g_title && !strcmp(lv_label_get_text(g_title), "News");
     if (!in_news) {                       // pull the user in from wherever they are
@@ -2970,7 +3089,8 @@ static void boot_restore()
     g_beep_vol  = p.getUChar("beepvol", 7);
     g_gps_enabled = p.getBool("gpsen", true);
     g_tts_enabled = p.getBool("tts", true);
-    g_tts_vol     = p.getUChar("ttsvol", 2);
+    g_audio_vol   = p.getUChar("ttsvol", 2);   // fresh NVS must come up QUIET, not full scale
+    if (g_audio_vol > 10) g_audio_vol = 10;
     // remember which alert we already announced, so a reboot inside a live alert is silent
     { String a = p.getString("alrtid", ""); strncpy(g_alert_seen, a.c_str(), sizeof(g_alert_seen) - 1);
       g_alert_seen[sizeof(g_alert_seen) - 1] = 0; }
@@ -2985,17 +3105,21 @@ static void boot_restore()
         WiFi.begin(ssid.c_str(), pass.c_str());
         g_wifi_autoconn_timer = lv_timer_create(wifi_autoconn_poll, 500, NULL);
     }
+    st_heap("  after wifi");
     if (bt && !g_ble_inited) {
         BLEDevice::init("T-Deck OS");
         g_ble_inited = true;
         g_bt_on = true;
     }
+    st_heap("  after ble");
 }
 
 void setup()
 {
     Serial.begin(115200);
-    Serial.println("T-Deck OS booting...");
+    g_reset_reason = (int)esp_reset_reason();
+    Serial.printf("T-Deck OS booting... (reset reason=%d)\n", g_reset_reason);
+    st_heap("setup entry");
     disableLoopWDT();   // allow multi-second blocking ops (SF12 LoRa TX, BLE scan) without WDT reset
 
     // Peripheral power rail MUST be high before touching any peripheral
@@ -3045,20 +3169,167 @@ void setup()
         touch.setMirrorXY(false, true);
     }
 
+    st_heap("after touch");
     setupLvgl();
+    st_heap("after setupLvgl");
     build_launcher_ui();
+    st_heap("after launcher ui");
     setup_trackball_indev();
     setup_keyboard_indev();
     lv_timer_create(status_update_cb, 1000, NULL);
     lv_timer_create(gps_probe_cb, 1000, NULL);   // auto-detect GPS baud (u-blox/L76K)
     lora_init();      // bring the radio up at boot so LoRa RX runs in the background
+    st_heap("after lora_init");
+    // Claim the audio device BEFORE the radios. Its DMA ring and its service
+    // task both need DMA-capable INTERNAL RAM, ~21 KB of it, and Wi-Fi + BLE
+    // take ~122 KB of the ~149 KB that is left at this point. Initialised
+    // lazily on the first sound it used to find ~20 KB: the DMA ring fitted but
+    // xTaskCreate() for the service task did not, and ESP32I2SAudio::begin()
+    // does not check that, so it reported success while _taskHandle stayed
+    // null. Nothing ever notified the task, availableForWrite() stayed at 0,
+    // and BackgroundAudioSpeech's pump never generated a frame: speech queued
+    // the text and went silent forever. Wi-Fi/BLE can spill into PSRAM, an I2S
+    // DMA descriptor cannot, so audio goes first.
+    audio_init();
+    st_heap("after audio_init");
     boot_restore();   // auto-reconnect saved Wi-Fi + restore BT state
+    st_heap("after boot_restore");
 
     pinMode(BOARD_BL_PIN, OUTPUT);
     setBrightness(g_screen_bright);   // restore saved brightness (boot_restore loaded it above)
 
     Serial.println("T-Deck OS ready.");
+    // Leave the reset cause where it can be read without a serial cable: if the device
+    // reboots instead of waking, this is the first line in the LoRa log afterwards.
+    // 1=power-on 3=sw 4=panic 5=int-wdt 6=task-wdt 9=brownout 11=usb
+    lora_log_print("* ", "boot  reset=" + String(g_reset_reason));
 }
+
+#ifdef TDECK_SELFTEST
+extern "C" int samplerate;   // eSpeak-NG's synthesis rate (libespeak-ng/synthesize.h)
+// TEMPORARY hardware self-test console (build with -DTDECK_SELFTEST). Not for main.
+static void selftest_console()
+{
+    if (!Serial.available()) return;
+    int c = Serial.read();
+    switch (c) {
+    case 'i': {
+        static uint32_t last_f = 0, last_p = 0;
+        Serial.printf("[ST] _spi_user=%p _spi_cmd=%p SPI_PORT=%d\n",
+                      (void *)_spi_user, (void *)_spi_cmd, (int)SPI_PORT);
+        Serial.printf("[ST] tft %dx%d rot=%d  flushes=%lu (+%lu) px=%lu (+%lu)\n",
+                      tft.width(), tft.height(), (int)tft.getRotation(),
+                      (unsigned long)g_st_flushes,
+                      (unsigned long)(g_st_flushes - last_f),
+                      (unsigned long)g_st_px,
+                      (unsigned long)(g_st_px - last_p));
+        last_f = g_st_flushes; last_p = g_st_px;
+        Serial.printf("[ST] scr=%p children=%d  heap=%lu psram=%lu\n",
+                      (void *)lv_scr_act(),
+                      (int)lv_obj_get_child_cnt(lv_scr_act()),
+                      (unsigned long)ESP.getFreeHeap(),
+                      (unsigned long)ESP.getFreePsram());
+        Serial.printf("[ST] tts_enabled=%d tts_ready=%d audio_inited=%d\n",
+                      (int)g_tts_enabled, (int)g_tts_ready, (int)g_audio_inited);
+        break;
+    }
+    case 'r':   // force a full repaint through the real LVGL -> TFT path
+        lv_obj_invalidate(lv_scr_act());
+        Serial.println("[ST] screen invalidated");
+        break;
+    case 'd': { // read the panel back over MISO (proves 2-way SPI to the ST7789)
+        uint8_t id1 = tft.readcommand8(0x04, 1);
+        uint8_t id2 = tft.readcommand8(0x04, 2);
+        uint8_t id3 = tft.readcommand8(0x04, 3);
+        uint8_t st  = tft.readcommand8(0x09, 1);
+        Serial.printf("[ST] RDDID=%02X %02X %02X  RDDST=%02X\n", id1, id2, id3, st);
+        break;
+    }
+    case 'c': { // solid colour sweep straight through TFT_eSPI (bypasses LVGL)
+        const uint16_t cols[] = { TFT_RED, TFT_GREEN, TFT_BLUE, TFT_WHITE, TFT_BLACK };
+        for (int i = 0; i < 5; i++) { tft.fillScreen(cols[i]); delay(400); }
+        lv_obj_invalidate(lv_scr_act());
+        Serial.println("[ST] colour sweep done, screen restored");
+        break;
+    }
+    case 't':
+        Serial.println("[ST] tone 1 kHz 250 ms (quiet)");
+        play_tone(1000, 250, 2500);   // bench volume - the user is sitting next to it
+        Serial.println("[ST] tone done");
+        break;
+    case 's': {
+        Serial.println("[ST] speak ko");
+        st_heap("before speak");
+        tts_say("안녕하세요. 티덱 오에스 한국어 음성 시험입니다.");
+        st_heap("after speak");
+        Serial.printf("[ST] espeak samplerate=%d\n", samplerate);
+        break;
+    }
+    case 'S':
+        Serial.println("[ST] speak ko (settings phrase)");
+        tts_say("음성 안내를 켰습니다");
+        break;
+    case 'p':   // dump the power-save log (RAM copy + the card)
+        Serial.printf("[PS] last reset reason=%d (4=panic 5=INT_WDT 6=TASK_WDT 9=brownout 11=USB)\n", g_reset_reason);
+        Serial.print(g_ps_report.length() ? g_ps_report : String("[PS] no session yet\n"));
+        if (sd_init()) {
+            File f = SD.open("/powersave.log", FILE_READ);
+            if (f) { Serial.println("--- /powersave.log ---");
+                     while (f.available()) Serial.write(f.read());
+                     f.close(); }
+        }
+        break;
+    case 'x': {  // PROBE: is plain light sleep possible at all here? No GPIO wake, no
+                 // teardown, nothing but a 2 s timer. Splits "our power-save code is
+                 // wrong" from "light sleep does not work in this build".
+        Serial.println("[ST] plain light sleep, 2s timer, no GPIO");
+        Serial.flush(); delay(20);
+        esp_sleep_enable_timer_wakeup(2000000ULL);
+        uint32_t t0 = millis();
+        esp_err_t r = esp_light_sleep_start();
+        Serial.printf("[ST] returned r=%d after %lums cause=%d\n",
+                      (int)r, (unsigned long)(millis() - t0),
+                      (int)esp_sleep_get_wakeup_cause());
+        break;
+    }
+    case 'z':   // PROBE: enter power save without holding the trackball
+        Serial.println("[ST] sleep requested");
+        g_sleep_req = true;
+        break;
+    case 'h':
+        st_heap("now");
+        break;
+    case 'f': {  // PROBE: does re-clocking a running channel kill it?
+        uint32_t f0 = g_i2s.frames();
+        Serial.printf("[ST] pre-reclock  frames=%lu afw=%d\n", (unsigned long)f0,
+                      g_i2s.availableForWrite());
+        g_i2s.setFrequency(16000);          // different from AUDIO_RATE on purpose
+        delay(400);
+        Serial.printf("[ST] post-reclock frames=%lu (+%lu) afw=%d\n",
+                      (unsigned long)g_i2s.frames(),
+                      (unsigned long)(g_i2s.frames() - f0), g_i2s.availableForWrite());
+        g_i2s.setFrequency(AUDIO_RATE);     // put it back
+        delay(400);
+        Serial.printf("[ST] restored     frames=%lu afw=%d\n",
+                      (unsigned long)g_i2s.frames(), g_i2s.availableForWrite());
+        break;
+    }
+    case 'a':
+        // NB g_tts.frames() is dead in the library (declared, never incremented);
+        // g_i2s.frames() counts DMA blocks actually clocked out to the amp.
+        Serial.printf("[ST] tts playing=%d done=%d shifts=%lu avail=%u under=%lu err=%lu | i2s frames=%lu afw=%d under=%lu\n",
+                      (int)g_tts.playing(), (int)g_tts.done(),
+                      (unsigned long)g_tts.shifts(), (unsigned)g_tts.available(),
+                      (unsigned long)g_tts.underflows(), (unsigned long)g_tts.errors(),
+                      (unsigned long)g_i2s.frames(), (int)g_i2s.availableForWrite(),
+                      (unsigned long)g_i2s.underflows());
+        Serial.printf("[ST] i2s irqs=%lu running=%d\n",
+                      (unsigned long)g_i2s.irqs(), (int)g_audio_inited);
+        break;
+    default: break;
+    }
+}
+#endif
 
 // --- Power save --------------------------------------------------------------
 // LIGHT sleep, not deep: RAM, the LoRa configuration and the news inbox survive, so
@@ -3072,10 +3343,12 @@ void setup()
 // arrived was worth showing — a new headline, an alert, or a message for the user.
 static void power_save_run()
 {
+    uint32_t ps_total = 0;                     // idle ticks, for the wake report
     const uint8_t br = g_screen_bright, kb = g_kb_bright;
     const bool gps_was  = g_gps_enabled;
     const bool wifi_was = (WiFi.status() == WL_CONNECTED);
-    const int  unread0  = (int)g_lora_unread;
+    g_msg_arrived = false;                    // only messages from here on count as a wake
+
 
     lv_refr_now(NULL);                        // show the toast before the screen goes
     setBrightness(0);
@@ -3083,53 +3356,95 @@ static void power_save_run()
     if (gps_was)  gps_set_enabled(false);
     if (wifi_was) { WiFi.disconnect(true); WiFi.mode(WIFI_OFF); }
 
+
     lora_service();                           // clear any pending IRQ, else DIO1 is
     lora_radio.startReceive();                // already high and we wake immediately
 
-    gpio_wakeup_enable((gpio_num_t)RADIO_DIO1_PIN, GPIO_INTR_HIGH_LEVEL);
-    gpio_wakeup_enable((gpio_num_t)BOARD_BOOT_PIN, GPIO_INTR_LOW_LEVEL);
-    esp_sleep_enable_gpio_wakeup();
+    while (digitalRead(BOARD_BOOT_PIN) == LOW) delay(10);   // wait for the 3 s hold to end
+    delay(50);
 
-    while (digitalRead(BOARD_BOOT_PIN) == LOW) delay(10);   // wait for the 3 s hold to end,
-    delay(50);                                              // or its LOW level wakes us at once
-
+    // Screen-off idle, NOT esp_light_sleep_start(). Light sleep does not work in this
+    // build: a bare call with nothing but a 2 s timer wake -- no GPIO sources, no
+    // teardown of ours -- never returns and the interrupt watchdog resets the board
+    // (reset reason 5). That is a platform problem (USB-Serial-JTAG holding the CPU
+    // up, octal PSRAM) and belongs in its own investigation, not in the middle of a
+    // feature the user needs to work today.
+    //
+    // What is left still turns off everything that actually drains this board: the
+    // display backlight above all, plus the keyboard light, GPS, Wi-Fi, Bluedroid and
+    // the audio engine. The CPU stays awake, which costs ~40 mA we would rather not
+    // spend, but the radio keeps receiving through the ordinary path -- no DIO1 wake
+    // wiring needed -- so a headline or an alert still brings the screen back.
+    enum { WOKE_BALL, WOKE_NEWS, WOKE_MSG } woke = WOKE_BALL;
     for (;;) {
-        if (esp_light_sleep_start() != ESP_OK) delay(200);  // a radio stack can refuse the
-                                                            // sleep; idle rather than spin
-        if (digitalRead(BOARD_BOOT_PIN) == LOW) break;      // a tap means "wake up"
-
-        lora_service();                                     // radio wake: parse it, screen dark
-        // Only the decision is made here. The chime, the speech and the app switch are
-        // left to the normal loop, so they happen with the display already back on.
-        if (g_news_pending || (int)g_lora_unread != unread0) break;
+        delay(50);
+        if (digitalRead(BOARD_BOOT_PIN) == LOW) { woke = WOKE_BALL; break; }
+        lora_service();                                     // stay on the mesh, screen dark
+        if (g_news_pending)                    { woke = WOKE_NEWS; break; }
+        if (g_msg_arrived)                     { woke = WOKE_MSG;  break; }
+        ps_total++;
     }
 
-    gpio_wakeup_disable((gpio_num_t)RADIO_DIO1_PIN);
-    gpio_wakeup_disable((gpio_num_t)BOARD_BOOT_PIN);
 
     setBrightness(br);
     setKeyboardBrightness(kb);
-    if (gps_was)  gps_set_enabled(true);
-    if (wifi_was) { WiFi.mode(WIFI_STA); WiFi.begin(); }    // credentials are remembered
 
     while (digitalRead(BOARD_BOOT_PIN) == LOW) delay(10);   // swallow the wake press so it
     delay(50);                                              // does not also click a button
 
-    // Undo what the 3 s hold did to LVGL on the way in. An encoder long-press toggles
-    // the focus group into EDIT mode (lv_indev.c: "On enter long press toggle edit
-    // mode") whenever the focused object is editable or scrollable — which every
-    // launcher tile and app view is. LVGL's threshold is ~400 ms, so the hold trips it
-    // long before we sleep, and coming back in edit mode meant clicks stopped opening
-    // apps. Also drop the press LVGL still thinks is in progress: it never saw the
-    // release, because we stopped servicing it mid-gesture.
+    // Act on WHY we woke. Waking silently and leaving the user to hunt for what caused
+    // it is the same as not waking: a chime with nothing on screen tells them nothing.
+    const char *why = "trackball";
+    if (woke == WOKE_NEWS) {
+        why = "news";
+        g_news_pending_ms = millis() - 3000;   // announce on the next tick, do not sit
+                                               // through the 2.5 s settle we already spent
+                                               // idling — that race is why the chime and
+                                               // the speech went missing on a news wake
+    } else if (woke == WOKE_MSG) {
+        why = "message";
+        // No app switch here. Opening the LoRa app on a message wake cost a panic, a
+        // watchdog reset and two rounds of stale-gesture bugs, for a convenience the
+        // chime and the log already cover: the message is stored and announced, and
+        // the user opens the app when they want it.
+    }
+    // Only now drop the input state, once the screen we are keeping is built. An
+    // encoder long-press toggles the focus group into EDIT mode (lv_indev.c: "On enter
+    // long press toggle edit mode") for any focused object that is editable or
+    // scrollable, which every launcher tile and app view is, and LVGL never saw the
+    // release of the hold because we stopped servicing it mid-gesture. Resetting
+    // BEFORE the app switch left that stale gesture to be delivered afterwards, where
+    // it clicked Back and then the launcher tile under the cursor — which is how a
+    // wake ended up in the Notes app instead of the one it opened.
     lv_indev_reset(NULL, NULL);
     lv_group_set_editing(lv_group_get_default(), false);
 
-    if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_OK " awake");
+    g_ps_report = "[PS] idled " + String((unsigned long)ps_total * 50 / 1000) + "s, woke by " +
+                  why + "\n";
+    Serial.print(g_ps_report);
+    if (g_toast) lv_label_set_text_fmt(g_toast, LV_SYMBOL_OK " awake (%s)", why);
+    // Also into the LoRa log, which is where the user is actually looking after a wake:
+    // the status line is one small row at the bottom and easy to miss. '*' keeps it out
+    // of the chime path ('<' is what rings) while still being kept in the history.
+    lora_log_print("* ", String("woke by ") + why);
+
+    // Radios last. Bringing Bluedroid back costs ~73 KB and a stack restart, and it sat
+    // in front of everything the user actually sees: the screen came back, then this
+    // blocked, and the toast, the app switch and the log below it never ran. Whatever
+    // the user is meant to look at goes up first; the radios can take their time.
+    if (gps_was)  gps_set_enabled(true);
+    if (wifi_was) { WiFi.mode(WIFI_STA); WiFi.begin(); }    // credentials are remembered
+    // Bluedroid is deliberately left alone. Tearing it down and re-creating it existed
+    // only to make light sleep possible, and light sleep is gone; what it left behind
+    // was a stack restart in the wake path, which is where the interrupt watchdog kept
+    // firing (reset reason 5). It costs some current to leave running. It works.
 }
 
 void loop()
 {
+#ifdef TDECK_SELFTEST
+    selftest_console();
+#endif
     if (g_sleep_req) { g_sleep_req = false; power_save_run(); }
     lv_timer_handler();
     gps_feed();        // keep the NMEA parser fed regardless of which app is open
