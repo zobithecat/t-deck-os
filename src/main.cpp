@@ -3409,6 +3409,10 @@ static void power_save_run()
                   why + "\n";
     Serial.print(g_ps_report);
     if (g_toast) lv_label_set_text_fmt(g_toast, LV_SYMBOL_OK " awake (%s)", why);
+    // Also into the LoRa log, which is where the user is actually looking after a wake:
+    // the status line is one small row at the bottom and easy to miss. '*' keeps it out
+    // of the chime path ('<' is what rings) while still being kept in the history.
+    lora_log_print("* ", String("woke by ") + why);
 }
 
 void loop()
