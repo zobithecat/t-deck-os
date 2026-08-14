@@ -3371,7 +3371,6 @@ static void power_save_run()
     if (gps_was)  gps_set_enabled(true);
     if (wifi_was) { WiFi.mode(WIFI_STA); WiFi.begin(); }    // credentials are remembered
     if (ble_was)  { BLEDevice::init("T-Deck OS"); g_ble_inited = true; }
-    audio_init();                                          // bring the speech engine back
 
     while (digitalRead(BOARD_BOOT_PIN) == LOW) delay(10);   // swallow the wake press so it
     delay(50);                                              // does not also click a button
