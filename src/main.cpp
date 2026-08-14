@@ -3106,7 +3106,7 @@ static void alert_tick_cb(lv_timer_t *)
         return;
     }
     if (g_alert_left)
-        lv_label_set_text_fmt(g_alert_left, "%s · %ld분 남음",
+        lv_label_set_text_fmt(g_alert_left, "%s / %ld분 남음",
                               a.drill ? "훈련" : "미확인", (long)(left / 60000 + 1));
 }
 
@@ -3196,7 +3196,7 @@ static void alert_list_render()
             int32_t left = (int32_t)(a.exp_ms - millis());
             state += " " + String((long)(left > 0 ? left / 60000 + 1 : 0)) + "분";
         }
-        String row = state + " · " + (a.drill ? "훈련" : "실제") + " · " +
+        String row = state + " / " + (a.drill ? "훈련" : "실제") + " / " +
                      ((a.area[0] && strcmp(a.area, "0")) ? String(a.area) + "층" : String("전체")) +
                      "\n" + a.text;
         lv_obj_t *b = lv_list_add_btn(g_alert_list, icon, row.c_str());
