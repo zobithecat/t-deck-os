@@ -112,6 +112,8 @@ static int           g_news_n = 0;
 static char          g_news_rev[8] = "";        // current revision (base36 string)
 static int           g_news_count = -1;         // expected headline count from !GA (-1 = unknown)
 static uint32_t      g_news_beep_ms = 0;        // throttle the background "news arrived" chime
+static uint32_t      g_news_last_ms = 0;        // last !GA/!GH seen — a quiet gap means the burst ended
+static uint32_t      g_news_fix_ms  = 0;        // last automatic repair request
 static uint32_t      g_news_gl_ms   = 0;        // rate-limit our !GL menu requests
 static uint32_t      g_news_gq_ms   = 0;        // rate-limit our !GQ body requests (a stream is expensive)
 static long          g_news_seq     = -1;       // v1.8: monotonic revision counter from !GA (-1 = none)
@@ -1482,7 +1484,9 @@ static void news_send_gl()
 {
     if (!g_lora_ok) return;
     uint32_t now = millis();
-    if (g_news_gl_ms && (uint32_t)(now - g_news_gl_ms) < 8000) return;   // too soon
+    // Router coalesces repeat requests for ~30 s (PROTOCOL.md §5), so asking more often
+    // than that only burns airtime for an answer that will not come.
+    if (g_news_gl_ms && (uint32_t)(now - g_news_gl_ms) < 30000) return;   // too soon
     g_news_gl_ms = now;
     bool complete = g_news_rev[0] && g_news_count >= 0 && g_news_n >= g_news_count;
     lora_tx_line(String("!GL\t") + (complete ? g_news_rev : "-") + "\n");
@@ -2954,6 +2958,18 @@ static void news_tick()
 {
     uint32_t now = millis();
     tts_pump();                     // keep the speech queue moving, one line at a time
+
+    // !GA says how many headlines the revision has, and a flood without acknowledgement
+    // loses one now and then — 4 of 5 arrive and the set just sits there incomplete.
+    // Once the burst has been quiet for a few seconds, ask for the menu again; the
+    // guard inside news_send_gl() keeps this from turning into a request storm.
+    if (g_news_count > 0 && g_news_n < g_news_count && g_news_last_ms &&
+        (uint32_t)(now - g_news_last_ms) > 5000 &&
+        (!g_news_fix_ms || (uint32_t)(now - g_news_fix_ms) > 60000)) {
+        g_news_fix_ms = now;
+        Serial.printf("[news] have %d of %d, asking again\n", g_news_n, g_news_count);
+        news_send_gl();
+    }
 
     if (g_alert_exp_ms && (int32_t)(now - g_alert_exp_ms) >= 0) {   // alert expired
         g_alert_exp_ms = 0; g_alert_id[0] = 0; g_alert_text[0] = 0;
