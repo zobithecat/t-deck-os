@@ -128,7 +128,6 @@ static int           g_hold_n = 0;
 static bool          g_news_pending    = false;
 static uint32_t      g_news_pending_ms = 0;
 static String        g_news_speak;              // what the announcement should read aloud
-static bool          g_news_urgent = false;     // set by !AL: jump the speech queue
 // v1.8 !AL disaster alert — the channel this protocol exists for.
 static char          g_alert_id[8]   = "";
 static char          g_alert_seen[8] = "";   // last ANNOUNCED alert, kept in NVS ("alrtid"):
@@ -137,7 +136,6 @@ static char          g_alert_seen[8] = "";   // last ANNOUNCED alert, kept in NV
 static char          g_alert_text[72] = "";
 static int           g_alert_sev     = 0;
 static uint32_t      g_alert_exp_ms  = 0;       // 0 = none active
-static lv_obj_t     *g_alert_banner  = NULL;
 static char          g_alert_area[8]  = "";     // floor / zone code, "0" = whole building
 static bool          g_alert_drill    = false;  // mtype 'T', or text marked [훈련]
 static bool          g_alert_show_req = false;  // RX asked for the overlay; loop() builds it
@@ -160,6 +158,8 @@ static AlertItem     g_alerts[ALERT_N];
 static int           g_alerts_n = 0;
 static lv_obj_t     *g_alert_list = NULL;   // Alert app list (non-NULL while it is open)
 static bool          g_alert_clear_req = false;  // a cancel landed; loop() sounds the all-clear
+static char          g_alert_say[72]   = "";   // what to read aloud for a new alert
+static bool          g_alert_announce_req = false;
 static int           g_alert_show_idx  = -1;    // history entry the takeover should show
 static int           g_alert_shown     = -1;    // history entry it is showing
 static lv_obj_t     *g_news_root = NULL;        // News app content container (below the Back btn)
@@ -1457,9 +1457,9 @@ static void alert_handle(const String &line)
     if (id.equals(g_alert_seen)) return;
     strncpy(g_alert_seen, id.c_str(), sizeof(g_alert_seen) - 1); g_alert_seen[sizeof(g_alert_seen) - 1] = 0;
     Preferences pr; pr.begin("tdeckos", false); pr.putString("alrtid", g_alert_seen); pr.end();
-    news_mark_new(text);
-    g_news_urgent = true;                                 // preempts anything being read
-    g_news_pending_ms = millis() - 3000;                  // a genuinely new alert announces at once
+    strncpy(g_alert_say, text.c_str(), sizeof(g_alert_say) - 1);
+    g_alert_say[sizeof(g_alert_say) - 1] = 0;
+    g_alert_announce_req = true;          // its own path — alerts are not news
 }
 
 // v1.4 news frames (§5): !GA rev-announce / !GH headline → ephemeral inbox keyed by
@@ -1579,17 +1579,6 @@ static void news_show_list()
     lv_obj_clean(g_news_root);
     lv_group_t *g = lv_group_get_default();
 
-    if (g_alert_text[0]) {                       // v1.8 !AL — top of the screen, unmissable
-        g_alert_banner = lv_label_create(g_news_root);
-        lv_obj_set_width(g_alert_banner, lv_pct(100));
-        lv_label_set_long_mode(g_alert_banner, LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_text_font(g_alert_banner, &font_kr16, 0);
-        lv_obj_set_style_text_color(g_alert_banner, lv_color_hex(0xFCA5A5), 0);
-        lv_obj_set_style_bg_color(g_alert_banner, lv_color_hex(0x7F1D1D), 0);
-        lv_obj_set_style_bg_opa(g_alert_banner, LV_OPA_COVER, 0);
-        lv_obj_set_style_pad_all(g_alert_banner, 4, 0);
-        lv_label_set_text_fmt(g_alert_banner, LV_SYMBOL_WARNING " %s", g_alert_text);
-    }
 
     lv_obj_t *hdr = lv_label_create(g_news_root);
     lv_obj_set_style_text_font(hdr, &font_kr16, 0);
@@ -2984,7 +2973,6 @@ static void go_home()
     g_disc_lbl = NULL;
     g_alert_list = NULL;
     g_news_root = NULL; g_news_list = NULL; g_art_body = NULL; g_art_scroll = NULL; g_art_id[0] = 0;  // News views torn down (inbox data persists)
-    g_alert_banner = NULL;
     if (g_notes_ta) {                                  // auto-save notes on leave
         Preferences p;
         p.begin("tdeckos", false);
@@ -3214,6 +3202,16 @@ static void news_tick()
     uint32_t now = millis();
     tts_pump();                     // keep the speech queue moving, one line at a time
 
+    if (g_alert_announce_req) {
+        g_alert_announce_req = false;
+        // An alert belongs to the Alert app, so that is what comes up behind the
+        // takeover and what the user is left in after dismissing it.
+        if (!g_alert_list) { if (g_app_view) go_home(); open_app("Alert"); }
+        if (now >= 15000) {                  // the quiet start applies here too
+            beep_alert(g_alert_sev);
+            tts_say(g_alert_say, true);
+        }
+    }
     if (g_alert_show_req) {         // built here, never from the RX path
         g_alert_show_req = false;
         alert_show(g_alert_show_idx);
@@ -3254,12 +3252,10 @@ static void news_tick()
     // seconds are exactly when the backlog arrives — a re-broadcast alert, or a whole
     // menu answering our own !GL. Show all of it, announce none of it: the banner and
     // the list are already on screen, so nothing is lost by not making noise.
-    if (now < 15000) { if (g_news_list) news_show_list(); g_news_speak = ""; g_news_urgent = false; return; }
+    if (now < 15000) { if (g_news_list) news_show_list(); g_news_speak = ""; return; }
 
-    if (g_news_urgent) beep_alert(g_alert_sev);   // alarm, not a notification
-    else               beep_notify();
-    if (g_news_speak.length()) { tts_say(g_news_speak, g_news_urgent); g_news_speak = ""; }
-    g_news_urgent = false;
+    beep_notify();                               // headlines only; alerts have their own path
+    if (g_news_speak.length()) { tts_say(g_news_speak); g_news_speak = ""; }
 
     bool in_news = g_app_view && g_title && !strcmp(lv_label_get_text(g_title), "News");
     if (!in_news) {                       // pull the user in from wherever they are
