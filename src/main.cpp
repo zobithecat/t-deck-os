@@ -3374,9 +3374,6 @@ static void power_save_run()
 
     setBrightness(br);
     setKeyboardBrightness(kb);
-    if (gps_was)  gps_set_enabled(true);
-    if (wifi_was) { WiFi.mode(WIFI_STA); WiFi.begin(); }    // credentials are remembered
-    if (ble_was)  { BLEDevice::init("T-Deck OS"); g_ble_inited = true; }
 
     while (digitalRead(BOARD_BOOT_PIN) == LOW) delay(10);   // swallow the wake press so it
     delay(50);                                              // does not also click a button
@@ -3414,6 +3411,17 @@ static void power_save_run()
     // the status line is one small row at the bottom and easy to miss. '*' keeps it out
     // of the chime path ('<' is what rings) while still being kept in the history.
     lora_log_print("* ", String("woke by ") + why);
+
+    // Radios last. Bringing Bluedroid back costs ~73 KB and a stack restart, and it sat
+    // in front of everything the user actually sees: the screen came back, then this
+    // blocked, and the toast, the app switch and the log below it never ran. Whatever
+    // the user is meant to look at goes up first; the radios can take their time.
+    if (gps_was)  gps_set_enabled(true);
+    if (wifi_was) { WiFi.mode(WIFI_STA); WiFi.begin(); }    // credentials are remembered
+    if (ble_was)  {
+        BLEDevice::init("T-Deck OS");
+        g_ble_inited = true;
+    }
 }
 
 void loop()
