@@ -3357,11 +3357,13 @@ static void power_save_run()
     // the audio engine. The CPU stays awake, which costs ~40 mA we would rather not
     // spend, but the radio keeps receiving through the ordinary path -- no DIO1 wake
     // wiring needed -- so a headline or an alert still brings the screen back.
+    enum { WOKE_BALL, WOKE_NEWS, WOKE_MSG } woke = WOKE_BALL;
     for (;;) {
         delay(50);
-        if (digitalRead(BOARD_BOOT_PIN) == LOW) break;      // a tap means "wake up"
+        if (digitalRead(BOARD_BOOT_PIN) == LOW) { woke = WOKE_BALL; break; }
         lora_service();                                     // stay on the mesh, screen dark
-        if (g_news_pending || (int)g_lora_unread != unread0) break;
+        if (g_news_pending)                    { woke = WOKE_NEWS; break; }
+        if ((int)g_lora_unread != unread0)     { woke = WOKE_MSG;  break; }
         ps_total++;
     }
 
@@ -3385,10 +3387,24 @@ static void power_save_run()
     lv_indev_reset(NULL, NULL);
     lv_group_set_editing(lv_group_get_default(), false);
 
+    // Act on WHY we woke. Waking silently and leaving the user to hunt for what caused
+    // it is the same as not waking: a chime with nothing on screen tells them nothing.
+    const char *why = "trackball";
+    if (woke == WOKE_NEWS) {
+        why = "news";
+        g_news_pending_ms = millis() - 3000;   // announce on the next tick, do not sit
+                                               // through the 2.5 s settle we already spent
+                                               // idling — that race is why the chime and
+                                               // the speech went missing on a news wake
+    } else if (woke == WOKE_MSG) {
+        why = "message";
+        if (g_app_view) go_home();             // show the message that woke us; it only
+        open_app("LoRa");                      // lives in the LoRa app's history
+    }
     g_ps_report = "[PS] idled " + String((unsigned long)ps_total * 50 / 1000) + "s, woke by " +
-                  (digitalRead(BOARD_BOOT_PIN) == LOW ? "trackball" : "traffic") + "\n";
+                  why + "\n";
     Serial.print(g_ps_report);
-    if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_OK " awake");
+    if (g_toast) lv_label_set_text_fmt(g_toast, LV_SYMBOL_OK " awake (%s)", why);
 }
 
 void loop()
