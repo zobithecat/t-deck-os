@@ -3246,7 +3246,7 @@ static void selftest_console()
         tts_say("음성 안내를 켰습니다");
         break;
     case 'p':   // dump the power-save log (RAM copy + the card)
-        Serial.printf("[PS] last reset reason=%d (5=deepsleep 6=BROWNOUT 12=USB 4=panic 3=SW)\n", g_reset_reason);
+        Serial.printf("[PS] last reset reason=%d (4=panic 5=INT_WDT 6=TASK_WDT 9=brownout 11=USB)\n", g_reset_reason);
         Serial.print(g_ps_report.length() ? g_ps_report : String("[PS] no session yet\n"));
         if (sd_init()) {
             File f = SD.open("/powersave.log", FILE_READ);
@@ -3255,6 +3255,19 @@ static void selftest_console()
                      f.close(); }
         }
         break;
+    case 'x': {  // PROBE: is plain light sleep possible at all here? No GPIO wake, no
+                 // teardown, nothing but a 2 s timer. Splits "our power-save code is
+                 // wrong" from "light sleep does not work in this build".
+        Serial.println("[ST] plain light sleep, 2s timer, no GPIO");
+        Serial.flush(); delay(20);
+        esp_sleep_enable_timer_wakeup(2000000ULL);
+        uint32_t t0 = millis();
+        esp_err_t r = esp_light_sleep_start();
+        Serial.printf("[ST] returned r=%d after %lums cause=%d\n",
+                      (int)r, (unsigned long)(millis() - t0),
+                      (int)esp_sleep_get_wakeup_cause());
+        break;
+    }
     case 'z':   // PROBE: enter power save without holding the trackball
         Serial.println("[ST] sleep requested");
         g_sleep_req = true;
@@ -3306,11 +3319,7 @@ static void selftest_console()
 // arrived was worth showing — a new headline, an alert, or a message for the user.
 static void power_save_run()
 {
-    // Why-did-I-wake log. USB-Serial-JTAG is powered down while we sleep, so the port
-    // disappears and anything printed in the loop is lost — and on battery there is no
-    // port at all. Collect in RAM, then write it out once we are properly awake.
-    struct { uint32_t ms; int8_t err, cause, boot, dio1; } ps_log[12];
-    int ps_n = 0; uint32_t ps_total = 0;
+    uint32_t ps_total = 0;                     // idle ticks, for the wake report
     const uint8_t br = g_screen_bright, kb = g_kb_bright;
     const bool gps_was  = g_gps_enabled;
     const bool wifi_was = (WiFi.status() == WL_CONNECTED);
@@ -3333,43 +3342,36 @@ static void power_save_run()
     lora_service();                           // clear any pending IRQ, else DIO1 is
     lora_radio.startReceive();                // already high and we wake immediately
 
-    gpio_wakeup_enable((gpio_num_t)RADIO_DIO1_PIN, GPIO_INTR_HIGH_LEVEL);
-    gpio_wakeup_enable((gpio_num_t)BOARD_BOOT_PIN, GPIO_INTR_LOW_LEVEL);
-    esp_sleep_enable_gpio_wakeup();
+    while (digitalRead(BOARD_BOOT_PIN) == LOW) delay(10);   // wait for the 3 s hold to end
+    delay(50);
 
-    while (digitalRead(BOARD_BOOT_PIN) == LOW) delay(10);   // wait for the 3 s hold to end,
-    delay(50);                                              // or its LOW level wakes us at once
-
-
+    // Screen-off idle, NOT esp_light_sleep_start(). Light sleep does not work in this
+    // build: a bare call with nothing but a 2 s timer wake -- no GPIO sources, no
+    // teardown of ours -- never returns and the interrupt watchdog resets the board
+    // (reset reason 5). That is a platform problem (USB-Serial-JTAG holding the CPU
+    // up, octal PSRAM) and belongs in its own investigation, not in the middle of a
+    // feature the user needs to work today.
+    //
+    // What is left still turns off everything that actually drains this board: the
+    // display backlight above all, plus the keyboard light, GPS, Wi-Fi, Bluedroid and
+    // the audio engine. The CPU stays awake, which costs ~40 mA we would rather not
+    // spend, but the radio keeps receiving through the ordinary path -- no DIO1 wake
+    // wiring needed -- so a headline or an alert still brings the screen back.
     for (;;) {
-        esp_err_t sr = esp_light_sleep_start();
-        if (sr != ESP_OK) delay(200);                       // a radio stack can refuse the
-                                                            // sleep; idle rather than spin
-        if (ps_n < 12) {
-            ps_log[ps_n].ms    = millis();
-            ps_log[ps_n].err   = (int8_t)sr;
-            ps_log[ps_n].cause = (int8_t)esp_sleep_get_wakeup_cause();
-            ps_log[ps_n].boot  = (int8_t)digitalRead(BOARD_BOOT_PIN);
-            ps_log[ps_n].dio1  = (int8_t)digitalRead(RADIO_DIO1_PIN);
-            ps_n++;
-        }
-        ps_total++;
+        delay(50);
         if (digitalRead(BOARD_BOOT_PIN) == LOW) break;      // a tap means "wake up"
-
-        lora_service();                                     // radio wake: parse it, screen dark
-        // Only the decision is made here. The chime, the speech and the app switch are
-        // left to the normal loop, so they happen with the display already back on.
+        lora_service();                                     // stay on the mesh, screen dark
         if (g_news_pending || (int)g_lora_unread != unread0) break;
+        ps_total++;
     }
 
-    gpio_wakeup_disable((gpio_num_t)RADIO_DIO1_PIN);
-    gpio_wakeup_disable((gpio_num_t)BOARD_BOOT_PIN);
 
     setBrightness(br);
     setKeyboardBrightness(kb);
     if (gps_was)  gps_set_enabled(true);
     if (wifi_was) { WiFi.mode(WIFI_STA); WiFi.begin(); }    // credentials are remembered
     if (ble_was)  { BLEDevice::init("T-Deck OS"); g_ble_inited = true; }
+    audio_init();                                          // bring the speech engine back
 
     while (digitalRead(BOARD_BOOT_PIN) == LOW) delay(10);   // swallow the wake press so it
     delay(50);                                              // does not also click a button
@@ -3384,15 +3386,9 @@ static void power_save_run()
     lv_indev_reset(NULL, NULL);
     lv_group_set_editing(lv_group_get_default(), false);
 
-    {   // one line per wake, to serial AND the card — the card is the only witness on battery
-        String rep = "[PS] session woke=" + String((unsigned long)ps_total) + "\n";
-        for (int i = 0; i < ps_n; i++)
-            rep += "[PS] " + String((unsigned long)ps_log[i].ms) + "ms err=" + ps_log[i].err +
-                   " cause=" + ps_log[i].cause + " boot=" + ps_log[i].boot +
-                   " dio1=" + ps_log[i].dio1 + "\n";
-        g_ps_report = rep;                       // 'i' in the self-test console re-prints it
-        Serial.print(rep);
-    }
+    g_ps_report = "[PS] idled " + String((unsigned long)ps_total * 50 / 1000) + "s, woke by " +
+                  (digitalRead(BOARD_BOOT_PIN) == LOW ? "trackball" : "traffic") + "\n";
+    Serial.print(g_ps_report);
     if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_OK " awake");
 }
 
