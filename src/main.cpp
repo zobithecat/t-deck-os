@@ -3637,6 +3637,11 @@ static void power_save_run()
     lv_refr_now(NULL);                        // show the toast before the screen goes
     setBrightness(0);
     setKeyboardBrightness(0);
+    // Dark is not off. The backlight is the big number, but the panel controller and the
+    // touch chip keep drawing after it goes out, and neither is needed while nobody is
+    // looking. GRAM survives SLPIN, so the frame is still there when we come back.
+    tft.writecommand(0x10);                   // ST7789 SLPIN
+    touch.sleep();                            // GT911 low-power; wakeup() toggles INT to return
     if (gps_was)  gps_set_enabled(false);
     if (wifi_was) { WiFi.disconnect(true); WiFi.mode(WIFI_OFF); }
 
@@ -3688,7 +3693,10 @@ static void power_save_run()
 
 
     setCpuFrequencyMhz(cpu_mhz);              // full speed back before any of the UI work
-    setBrightness(br);
+    touch.wakeup();
+    tft.writecommand(0x11);                   // SLPOUT
+    delay(120);                               // ST7789 needs this before it will accept drawing
+    setBrightness(br);                        // light it only once the panel is awake
     setKeyboardBrightness(kb);
 
     while (digitalRead(BOARD_BOOT_PIN) == LOW) delay(10);   // swallow the wake press so it
