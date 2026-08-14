@@ -3334,7 +3334,6 @@ static void power_save_run()
     const bool wifi_was = (WiFi.status() == WL_CONNECTED);
     g_msg_arrived = false;                    // only messages from here on count as a wake
 
-    const bool ble_was = g_ble_inited;
 
     lv_refr_now(NULL);                        // show the toast before the screen goes
     setBrightness(0);
@@ -3342,11 +3341,6 @@ static void power_save_run()
     if (gps_was)  gps_set_enabled(false);
     if (wifi_was) { WiFi.disconnect(true); WiFi.mode(WIFI_OFF); }
 
-    // Bluedroid has to go, for two reasons. It holds ~73 KB of INTERNAL RAM -- the
-    // scarce kind -- which left barely enough to save state, and its controller keeps
-    // a power-management lock that stops the CPU from actually stopping. Released
-    // here and re-created on wake, since the user only needs it inside the BT app.
-    if (ble_was) { BLEDevice::deinit(true); g_ble_inited = false; }
 
     lora_service();                           // clear any pending IRQ, else DIO1 is
     lora_radio.startReceive();                // already high and we wake immediately
@@ -3426,10 +3420,10 @@ static void power_save_run()
     // the user is meant to look at goes up first; the radios can take their time.
     if (gps_was)  gps_set_enabled(true);
     if (wifi_was) { WiFi.mode(WIFI_STA); WiFi.begin(); }    // credentials are remembered
-    if (ble_was)  {
-        BLEDevice::init("T-Deck OS");
-        g_ble_inited = true;
-    }
+    // Bluedroid is deliberately left alone. Tearing it down and re-creating it existed
+    // only to make light sleep possible, and light sleep is gone; what it left behind
+    // was a stack restart in the wake path, which is where the interrupt watchdog kept
+    // firing (reset reason 5). It costs some current to leave running. It works.
 }
 
 void loop()
