@@ -197,7 +197,6 @@ static void news_tick();
 static volatile bool g_sleep_req = false;   // trackball long-press asked for power save
 static String        g_ps_report;           // why the last power-save session woke up
 static volatile bool g_msg_arrived = false; // an incoming message landed, app open or not
-static bool          g_wake_show_lora = false; // wake asked for the LoRa app; loop() opens it
 static int           g_reset_reason = 0;    // esp_reset_reason() at boot — survives a USB reconnect
 static void tts_say(const String &text, bool urgent = false);   // eSpeak-NG (ko); queued unless urgent
 static bool    g_tts_enabled = true;       // Settings toggle, persisted in NVS ("tts")
@@ -3388,11 +3387,10 @@ static void power_save_run()
                                                // the speech went missing on a news wake
     } else if (woke == WOKE_MSG) {
         why = "message";
-        // Ask loop() to do the switch instead of building it from here. Rebuilding the
-        // whole UI several calls deep inside power_save_run() is what panicked the
-        // device (reset reason 4) — news_tick() does its own hijack from the top of
-        // loop() and has never had this problem.
-        g_wake_show_lora = true;
+        // No app switch here. Opening the LoRa app on a message wake cost a panic, a
+        // watchdog reset and two rounds of stale-gesture bugs, for a convenience the
+        // chime and the log already cover: the message is stored and announced, and
+        // the user opens the app when they want it.
     }
     // Only now drop the input state, once the screen we are keeping is built. An
     // encoder long-press toggles the focus group into EDIT mode (lv_indev.c: "On enter
@@ -3432,16 +3430,6 @@ void loop()
     selftest_console();
 #endif
     if (g_sleep_req) { g_sleep_req = false; power_save_run(); }
-    if (g_wake_show_lora) {                 // deferred out of the wake path on purpose
-        g_wake_show_lora = false;
-        if (g_app_view) go_home();
-        open_app("LoRa");
-        // Drop the input state HERE, once the screen we mean to keep exists. Resetting
-        // earlier (it used to happen back in power_save_run) leaves the stale gesture
-        // to arrive after this, where it clicks Back and closes what we just opened.
-        lv_indev_reset(NULL, NULL);
-        lv_group_set_editing(lv_group_get_default(), false);
-    }
     lv_timer_handler();
     gps_feed();        // keep the NMEA parser fed regardless of which app is open
     lora_service();    // always-on LoRa RX so messages arrive even with the app closed
