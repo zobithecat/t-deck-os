@@ -3653,11 +3653,15 @@ static void power_save_run()
     // the audio engine. The CPU stays awake, which costs ~40 mA we would rather not
     // spend, but the radio keeps receiving through the ordinary path -- no DIO1 wake
     // wiring needed -- so a headline or an alert still brings the screen back.
-    enum { WOKE_BALL, WOKE_NEWS, WOKE_MSG } woke = WOKE_BALL;
+    enum { WOKE_BALL, WOKE_ALERT, WOKE_NEWS, WOKE_MSG } woke = WOKE_BALL;
     for (;;) {
         delay(50);
         if (digitalRead(BOARD_BOOT_PIN) == LOW) { woke = WOKE_BALL; break; }
         lora_service();                                     // stay on the mesh, screen dark
+        // An alert has its own path now, so it needs its own wake: separating it from
+        // the news machinery took it out of g_news_pending, which is all this loop was
+        // watching. Of everything that can arrive, this is the one that must get through.
+        if (g_alert_announce_req)              { woke = WOKE_ALERT; break; }
         if (g_news_pending)                    { woke = WOKE_NEWS; break; }
         if (g_msg_arrived)                     { woke = WOKE_MSG;  break; }
         ps_total++;
@@ -3673,7 +3677,9 @@ static void power_save_run()
     // Act on WHY we woke. Waking silently and leaving the user to hunt for what caused
     // it is the same as not waking: a chime with nothing on screen tells them nothing.
     const char *why = "trackball";
-    if (woke == WOKE_NEWS) {
+    if (woke == WOKE_ALERT) {
+        why = "alert";                         // news_tick() sounds it and puts it on screen
+    } else if (woke == WOKE_NEWS) {
         why = "news";
         g_news_pending_ms = millis() - 3000;   // announce on the next tick, do not sit
                                                // through the 2.5 s settle we already spent
