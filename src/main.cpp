@@ -416,8 +416,42 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     // While the alert screen is up, a press means "확인" and nothing else. This is the
     // one screen that has to be dismissable one-handed no matter what has focus, so it
     // does not go through the group: the press is taken here and consumed.
-    static bool swallow = false;                 // hold the press until it is let go
+    static bool     swallow    = false;          // hold the press until it is let go
+    static uint32_t hold_ms    = 0;
+    static bool     back_armed = false;
     if (g_alert_scr && press_edge) { g_alert_dismiss_req = true; swallow = true; }
+
+    // One press, three possible meanings, decided by how long it is held. The deciding
+    // has to happen WHILE it is held, not on release: a press that reaches a second has
+    // already stopped being a click, and if LVGL is still allowed to see it, letting go
+    // both goes back AND activates whatever was under the cursor. That is what opened a
+    // book and then immediately walked out of the app again.
+    if (!g_alert_scr) {
+        if (press_edge) { hold_ms = millis(); back_armed = false; }
+        uint32_t held = hold_ms ? (uint32_t)(millis() - hold_ms) : 0;
+
+        // 1 s, in Books only: from here the press belongs to the hold, not to the button
+        // under it. What it does is settled on release — let go now and you go back a
+        // level, keep holding and the 3 s rule below takes it instead.
+        if (hold_ms && held > 1000 && !back_armed && g_book_root && !swallow) {
+            back_armed = true;
+            swallow    = true;
+            if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_LEFT " 놓으면 뒤로 - 더 누르면 절전");
+        }
+        // 3 s: power save, and it outranks going back. Only the request is made here —
+        // sleeping inside an input callback would stop LVGL mid-read.
+        if (hold_ms && held > 3000) {
+            hold_ms = 0; back_armed = false;
+            g_sleep_req = true;
+            swallow = true;                      // the rest of this press belongs to us
+            if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_POWER " sleeping - tap ball to wake");
+        }
+        if (!pressed) {
+            if (back_armed) g_book_back_req = true;
+            back_armed = false; hold_ms = 0;
+        }
+    }
+
     if (swallow) {
         // Swallow the WHOLE press, not just its edge. Closing on the edge alone left the
         // finger still down, and by the next read the takeover was gone — so the press
@@ -429,28 +463,6 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
         data->key = 0;               // motion belongs to nothing and must not be banked
         data->state = LV_INDEV_STATE_RELEASED;
         return;
-    }
-
-    // Hold the trackball for 3 s to enter power save. Only the request is made here —
-    // sleeping inside an input callback would stop LVGL mid-read.
-    static uint32_t hold_ms = 0;
-    if (press_edge)      hold_ms = millis();
-    // Books has no Back button, so a one-second hold is the way out: reader -> shelf ->
-    // home. It fires on RELEASE, not at one second, which is what keeps it out of the
-    // way of the three-second hold for power save — hold on past three and you sleep,
-    // and going back is not also waiting for you when you wake.
-    else if (!pressed) {
-        if (hold_ms && g_book_root) {
-            uint32_t held = (uint32_t)(millis() - hold_ms);
-            if (held > 1000 && held <= 3000) g_book_back_req = true;
-        }
-        hold_ms = 0;
-    }
-    if (hold_ms && (uint32_t)(millis() - hold_ms) > 3000) {
-        hold_ms = 0;
-        g_sleep_req = true;
-        swallow = true;                          // the rest of this press belongs to us
-        if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_POWER " sleeping - tap ball to wake");
     }
     last_pressed = pressed;
 
