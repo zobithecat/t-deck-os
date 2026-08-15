@@ -379,7 +379,8 @@ static void tb_flush()   // drop motion made while nothing was watching (wake, v
 #define TB_SCROLL_PX(a)  (3 + 2 * (a))
 #define TB_FOCUS_DIV(a)  (5 - (a) > 1 ? 5 - (a) : 1)
 #define TB_SCROLL_MAX_PX 72     // ceiling per read: a flick may not throw the page away
-#define TB_PAGE_DWELL_MS 350    // hold at the edge this long before the page turns
+#define TB_PAGE_OVER_PX  120    // roll this far past the end of a page and it turns
+#define TB_PAGE_IDLE_MS  1200   // ...counted across flicks, until the ball rests this long
 static lv_obj_t *g_edit_slider = NULL;   // slider engaged for left/right adjust
 static lv_obj_t *g_sd_view_ta  = NULL;   // file-viewer textarea: trackball scrolls it by line
 
@@ -487,27 +488,33 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
         if ((dy < 0 ? -dy : dy) > room) dy = (dy < 0) ? -room : room;
         if (dy) lv_obj_scroll_by(scroll_tgt, 0, dy, LV_ANIM_OFF);
 
-        // Keep rolling once the page has nowhere left to go and it turns. The dwell is
-        // what makes that safe: one flick reaches the bottom and would otherwise turn
-        // the page in the same motion, throwing away the lines it just brought into
-        // view. Only on a whole page — advancing off a half-received one would skip
-        // text that is still on its way.
-        // Only a read that actually saw motion may touch this state. A still ball gives
-        // vy == 0, which makes `room` the room in the OTHER direction — testing it then
-        // would clear the dwell on every quiet read, and a slow roller pressing at the
-        // bottom would never reach 350 ms of them.
-        static int8_t   edge_dir = 0;
-        static uint32_t edge_ms = 0, edge_last = 0;
+        // Keep rolling once the page has nowhere left to go and it turns. What counts is
+        // the travel THROWN AWAY at the end, not time spent there. A flick that only just
+        // reaches the bottom must not also turn the page and take the lines it has this
+        // moment brought into view — but nor may the reader be made to hold one unbroken
+        // roll: real flicks are short and come in twos and threes, and measuring time
+        // started the wait over on every one of them, so the page never turned at all.
+        // Over-travel adds up across flicks; a pause of TB_PAGE_IDLE_MS ends the gesture.
+        //
+        // Only a read that saw motion may touch this. A still ball gives vy == 0, which
+        // makes `room` the room in the OTHER direction, so testing it on a quiet read
+        // would throw the count away in the gap between two flicks.
+        static int8_t   over_dir = 0;
+        static int16_t  over     = 0;   // scroll pixels asked for past the end of the page
+        static uint32_t over_ms  = 0;
         if (vy && scroll_tgt == g_rd_scroll && g_rd_n && g_rd_have >= g_rd_n) {
             int8_t d = (vy > 0) ? +1 : -1;
             if (room > 0) {
-                edge_dir = 0;                                     // still text left to read
+                over = 0; over_dir = 0;                 // still text to read: nothing wasted
             } else {
-                // A gap longer than this is a new push, not the same one continuing.
-                if (edge_dir != d || (uint32_t)(now - edge_last) > 400) { edge_dir = d; edge_ms = now; }
-                edge_last = now;
-                if ((uint32_t)(now - edge_ms) > TB_PAGE_DWELL_MS) {
-                    edge_ms = now;                                // one turn per dwell
+                if (over_dir != d || (uint32_t)(now - over_ms) > TB_PAGE_IDLE_MS) {
+                    over_dir = d; over = 0;
+                }
+                over_ms = now;
+                over   += (int16_t)(px < 0 ? -px : px);
+                if (over >= TB_PAGE_OVER_PX) {
+                    over = 0;
+                    Serial.printf("[book] rolled %s past the end -> turn\n", d > 0 ? "down" : "up");
                     if (d > 0)                 g_rd_next_req = true;
                     else if (g_rd_page > 0)    g_rd_prev_req = true;
                 }
@@ -1814,6 +1821,7 @@ static String        g_rd_chunk[BOOK_PAGE_MAX];
 static bool          g_rd_seen[BOOK_PAGE_MAX];
 static uint32_t      g_rd_last_ms = 0;    // last !BD, for the quiet-gap test
 static uint8_t       g_rd_bn_try  = 0;
+static uint8_t       g_rd_bq_try  = 0;    // !BQ sent for this page and never answered
 static uint32_t      g_rd_bn_due  = 0;    // scheduled !BN (slot rule, PROTOCOL.md §8)
 static lv_obj_t     *g_book_list  = NULL; // shelf list   (non-NULL only on the shelf)
 static lv_obj_t     *g_rd_body    = NULL; // page text    (non-NULL only in the reader)
@@ -1891,7 +1899,7 @@ static void book_page_reset()
 {
     for (int i = 0; i < BOOK_PAGE_MAX; i++) { g_rd_seen[i] = false; g_rd_chunk[i] = ""; }
     g_rd_n = 0; g_rd_have = 0; g_rd_crc[0] = 0;
-    g_rd_bn_try = 0; g_rd_bn_due = 0; g_rd_last_ms = millis();
+    g_rd_bn_try = 0; g_rd_bq_try = 0; g_rd_bn_due = 0; g_rd_last_ms = millis();
 }
 
 static void book_store(const String &rev, const String &id, uint16_t pages,
@@ -2028,6 +2036,7 @@ static void book_send_bq(const char *id, int page)
     if (g_rd_scroll && !g_rd_land_bottom) lv_obj_scroll_to_y(g_rd_scroll, 0, LV_ANIM_OFF);
     lora_tx_line("!BQ\t" + String(id) + "\t" + b36((uint32_t)page) + "\n");
     lora_radio.startReceive();
+    Serial.printf("[book] BQ %s p%d\n", id, page);
     book_render_page();
 }
 
@@ -2057,10 +2066,29 @@ static void book_tick()
         g_rd_land_bottom = true;    // going back means resuming at the end of that page
         book_turn(-1);
     }
-    if (!g_rd_id[0] || !g_rd_n || g_rd_have >= g_rd_n) return;
+    if (!g_rd_id[0]) return;
     uint32_t now = millis();
     uint32_t toa = (uint32_t)(lora_radio.getTimeOnAir(79) / 1000);
     if (toa < 200) toa = 200;
+
+    // Nothing came back at all. Without !BR there is no n, so the bitmap repair below
+    // has nothing it can ask for and never runs — the reader sat on "쪽 요청 중..."
+    // for ever, with no button left on this screen to ask again. So the page is
+    // re-requested, on a slow backoff, and a router that was busy or briefly out of
+    // range heals by itself. g_rd_last_ms is the later of "asked" and "last chunk in",
+    // so a stream still trickling in is never interrupted.
+    if (!g_rd_n) {
+        if ((uint32_t)(now - g_rd_last_ms) > (g_rd_bq_try ? 20000u : 12000u)) {
+            uint8_t t = g_rd_bq_try + 1;
+            Serial.printf("[book] no reply for %s p%d, asking again (%u)\n",
+                          g_rd_id, g_rd_page, (unsigned)t);
+            book_send_bq(g_rd_id, g_rd_page);
+            g_rd_bq_try = t;                  // survives the reset book_send_bq does
+            book_render_page();
+        }
+        return;
+    }
+    if (g_rd_have >= g_rd_n) return;
 
     if (!g_rd_bn_due) {
         uint32_t quiet = 3 * toa;
@@ -2135,7 +2163,7 @@ static void book_render_page()
     while (upto < n && g_rd_seen[upto]) upto++;
 
     String out;
-    if (!upto) out = "쪽 요청 중...";
+    if (!upto) out = g_rd_bq_try ? "응답 없음 - 다시 요청 중..." : "쪽 요청 중...";
     else {
         String t;
         for (int i = 0; i < upto; i++) t += g_rd_chunk[i];
@@ -2173,9 +2201,13 @@ static void book_render_page()
 static void book_turn(int delta)
 {
     int idx = book_find(String(g_rd_id));
-    if (idx < 0) return;
+    if (idx < 0) { Serial.printf("[book] turn: %s not in the catalogue\n", g_rd_id); return; }
     int np = g_rd_page + delta;
-    if (np < 0 || np >= (int)g_books[idx].pages) return;   // last page: forward does nothing
+    if (np < 0 || np >= (int)g_books[idx].pages) {         // last page: forward does nothing
+        Serial.printf("[book] turn: p%d outside 0..%u\n", np, (unsigned)g_books[idx].pages - 1);
+        if (g_rd_foot) lv_label_set_text(g_rd_foot, delta > 0 ? "마지막 쪽" : "첫 쪽");
+        return;
+    }
     book_send_bq(g_rd_id, np);
 }
 
