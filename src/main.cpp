@@ -301,6 +301,16 @@ static void disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *c
     lv_disp_flush_ready(disp);
 }
 
+// What a repaint actually costs, printed from loop() while the screen is busy. Guessing
+// at this is how the scroll ended up being read once a frame from a callback that was
+// being starved by the frame: the numbers say whether the panel or the input is the
+// limit, and there is no other way to see it from here.
+static volatile uint32_t g_perf_frames, g_perf_ms, g_perf_px;
+static void disp_monitor(lv_disp_drv_t *d, uint32_t time_ms, uint32_t px)
+{
+    g_perf_frames++; g_perf_ms += time_ms; g_perf_px += px;
+}
+
 static void touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
     data->state = LV_INDEV_STATE_REL;
@@ -324,18 +334,58 @@ static void touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 // Trackball:  up/down = focus navigation; center press on a slider engages it
 // (accent outline), then left/right adjusts its value; press again to release.
 // While engaged, up/down navigation is locked so you stay on the slider.
-// Axes kept separate (mixing caused "jumps backward"); quick opposite pulses
-// within TB_REVERSE_MS are dropped as cross-talk; vertical has accel (Settings).
-#define TB_REVERSE_MS  60
+// Axes kept separate (mixing caused "jumps backward"); vertical has accel (Settings).
+//
+// The four lines are counted in ISRs, not sampled. LVGL reads an input device every
+// 30 ms at best, and a full-screen push holds the read off for longer than that, so a
+// poll caught at most ONE edge per frame no matter how far the ball had actually
+// turned — and threw the motion away entirely whenever the up and the down line had
+// both moved since the last look. That is what made a roll land somewhere other than
+// where the ball said: not noise, undersampling. Counting every edge in the ISR makes
+// the read exact regardless of how long a frame takes.
+static portMUX_TYPE      g_tb_mux = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint16_t g_tb_up_c, g_tb_dn_c, g_tb_rt_c, g_tb_lf_c;
+static void IRAM_ATTR tb_isr_up()    { g_tb_up_c++; }
+static void IRAM_ATTR tb_isr_down()  { g_tb_dn_c++; }
+static void IRAM_ATTR tb_isr_right() { g_tb_rt_c++; }
+static void IRAM_ATTR tb_isr_left()  { g_tb_lf_c++; }
+
+// Take the accumulated motion and clear it in one step. Opposite edges cancel, which
+// is the cross-talk suppression the old TB_REVERSE_MS window was reaching for — but
+// arithmetic instead of a deadline, so real motion never gets dropped with the noise.
+static uint32_t g_perf_tb;              // edges seen since the last [perf] line
+static void tb_take(int16_t *vy, int16_t *vx)
+{
+    portENTER_CRITICAL(&g_tb_mux);
+    uint16_t u = g_tb_up_c, d = g_tb_dn_c, r = g_tb_rt_c, l = g_tb_lf_c;
+    g_tb_up_c = g_tb_dn_c = g_tb_rt_c = g_tb_lf_c = 0;
+    portEXIT_CRITICAL(&g_tb_mux);
+    g_perf_tb += (uint32_t)u + d + r + l;
+    *vy = (int16_t)d - (int16_t)u;      // + = down / toward the end of the text
+    *vx = (int16_t)r - (int16_t)l;      // + = right
+}
+
+static void tb_flush()   // drop motion made while nothing was watching (wake, view change)
+{
+    int16_t dummy_y, dummy_x;
+    tb_take(&dummy_y, &dummy_x);
+}
+
+// Per-edge feel, both scaled by the Settings "trackball accel" 0..5 (default 2):
+//   reading views  — pixels of text per edge. Sub-line so the page glides instead of
+//                    teleporting a whole line at a time.
+//   everything else— edges per focus step. One edge per step is far too fast now that
+//                    none of them are being lost.
+#define TB_SCROLL_PX(a)  (3 + 2 * (a))
+#define TB_FOCUS_DIV(a)  (5 - (a) > 1 ? 5 - (a) : 1)
+#define TB_SCROLL_MAX_PX 72     // ceiling per read: a flick may not throw the page away
+#define TB_PAGE_DWELL_MS 350    // hold at the edge this long before the page turns
 static lv_obj_t *g_edit_slider = NULL;   // slider engaged for left/right adjust
 static lv_obj_t *g_sd_view_ta  = NULL;   // file-viewer textarea: trackball scrolls it by line
 
 static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
-    static bool     last_up = true, last_down = true, last_left = true, last_right = true;
-    static bool     last_pressed = false;
-    static int8_t   last_dir = 0,  last_hdir = 0;
-    static uint32_t last_ms  = 0,  last_hms  = 0;
+    static bool last_pressed = false;
 
     lv_obj_t *foc = lv_group_get_focused(lv_group_get_default());
     bool foc_slider = foc && lv_obj_check_type(foc, &lv_slider_class);
@@ -361,7 +411,9 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
         // the very dialog that had just been dismissed.
         if (!pressed) swallow = false;
         last_pressed = pressed;
-        data->key = 0; data->state = LV_INDEV_STATE_RELEASED;
+        tb_flush();                  // the ball still turns under a swallowed press; that
+        data->key = 0;               // motion belongs to nothing and must not be banked
+        data->state = LV_INDEV_STATE_RELEASED;
         return;
     }
 
@@ -395,79 +447,100 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
         data->state = (pressed && !foc_slider) ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
     }
 
-    // ---- vertical -> focus navigation (locked while a slider is engaged) ----
-    int8_t dir = 0;
-    bool up = digitalRead(BOARD_TBOX_G01);
-    if (up != last_up)     { last_up = up;     dir = -1; }
-    bool down = digitalRead(BOARD_TBOX_G03);
-    if (down != last_down) { last_down = down; dir = (dir != 0) ? 0 : +1; }
+    // ---- how far the ball has turned since the last read ----
+    int16_t vy, vx;
+    tb_take(&vy, &vx);
+    uint32_t now = millis();
 
-    int16_t diff = 0;
-    if (dir != 0) {
-        uint32_t now = millis();
-        uint32_t dt  = now - last_ms;
-        if (!(dir == -last_dir && dt < TB_REVERSE_MS)) {
-            int step = 1;
-            if (g_tb_accel > 0 && dt < 100)
-                step += (int)((long)g_tb_accel * (100 - (long)dt) / 100);
-            diff     = dir * step;
-            last_dir = dir;
-            last_ms  = now;
-        }
-    }
-    // In the file viewer, vertical scrolls the text one line at a time instead
-    // of moving focus (the viewer's group holds only the Back button). Direction
-    // comes from the glitch-suppressed `diff`; magnitude is fixed at one line.
+    // A reading view takes the vertical axis for scrolling; everywhere else it steps
+    // focus through the group.
     lv_obj_t *scroll_tgt = g_sd_view_ta ? g_sd_view_ta                    // file viewer,
                          : g_art_scroll ? g_art_scroll                    // news article,
                          : g_rd_scroll;                                   // or a book page
-    if (scroll_tgt && diff != 0) {
+
+    // Leftover edges below one step are carried, not dropped, so a slow roll still
+    // gets there — but only for a moment: a stray edge must not sit in the accumulator
+    // and combine with the next deliberate nudge minutes later.
+    static int16_t   acc_v = 0, acc_h = 0;
+    static uint32_t  acc_ms = 0;
+    static lv_obj_t *acc_tgt = NULL;
+    if ((uint32_t)(now - acc_ms) > 250 || acc_tgt != scroll_tgt) { acc_v = acc_h = 0; }
+    if (vy || vx) acc_ms = now;
+    acc_tgt = scroll_tgt;
+
+    data->enc_diff = 0;
+
+    if (scroll_tgt) {
+        // Scroll by pixels, not by whole lines: a line-at-a-time jump is what the eye
+        // reads as the page snapping rather than moving.
+        int32_t px = -(int32_t)vy * TB_SCROLL_PX(g_tb_accel);   // clamp before it is an
+        if (px >  TB_SCROLL_MAX_PX) px =  TB_SCROLL_MAX_PX;     // lv_coord_t: a hard flick
+        if (px < -TB_SCROLL_MAX_PX) px = -TB_SCROLL_MAX_PX;     // overflows 16 bits
+        lv_coord_t dy = (lv_coord_t)px;
+
         // Clamp to the remaining content. lv_obj_scroll_by() does NOT bound a
         // programmatic scroll (only touch drags are bounded), so without this the
         // view keeps scrolling into blank space past the start/end of the text.
-        lv_coord_t lh   = lv_font_get_line_height(&font_kr16);
-        lv_coord_t dy   = (diff > 0) ? -lh : lh;                  // <0 = toward the end
         lv_coord_t room = (dy < 0) ? lv_obj_get_scroll_bottom(scroll_tgt)
                                    : lv_obj_get_scroll_top(scroll_tgt);
         if (room < 0) room = 0;
         if ((dy < 0 ? -dy : dy) > room) dy = (dy < 0) ? -room : room;
-        // Rolling on at the end of a book page turns it. Only once the page is whole:
-        // advancing off a half-received page would skip text that is still on its way.
-        if (!dy && scroll_tgt == g_rd_scroll && g_rd_n && g_rd_have >= g_rd_n) {
-            if (diff > 0)                  g_rd_next_req = true;
-            else if (g_rd_page > 0)        g_rd_prev_req = true;
-        }
         if (dy) lv_obj_scroll_by(scroll_tgt, 0, dy, LV_ANIM_OFF);
-        data->enc_diff = 0;
-    } else {
-        data->enc_diff = g_edit_slider ? 0 : diff;
+
+        // Keep rolling once the page has nowhere left to go and it turns. The dwell is
+        // what makes that safe: one flick reaches the bottom and would otherwise turn
+        // the page in the same motion, throwing away the lines it just brought into
+        // view. Only on a whole page — advancing off a half-received one would skip
+        // text that is still on its way.
+        // Only a read that actually saw motion may touch this state. A still ball gives
+        // vy == 0, which makes `room` the room in the OTHER direction — testing it then
+        // would clear the dwell on every quiet read, and a slow roller pressing at the
+        // bottom would never reach 350 ms of them.
+        static int8_t   edge_dir = 0;
+        static uint32_t edge_ms = 0, edge_last = 0;
+        if (vy && scroll_tgt == g_rd_scroll && g_rd_n && g_rd_have >= g_rd_n) {
+            int8_t d = (vy > 0) ? +1 : -1;
+            if (room > 0) {
+                edge_dir = 0;                                     // still text left to read
+            } else {
+                // A gap longer than this is a new push, not the same one continuing.
+                if (edge_dir != d || (uint32_t)(now - edge_last) > 400) { edge_dir = d; edge_ms = now; }
+                edge_last = now;
+                if ((uint32_t)(now - edge_ms) > TB_PAGE_DWELL_MS) {
+                    edge_ms = now;                                // one turn per dwell
+                    if (d > 0)                 g_rd_next_req = true;
+                    else if (g_rd_page > 0)    g_rd_prev_req = true;
+                }
+            }
+        }
+    } else if (!g_edit_slider) {
+        acc_v += vy;                                   // focus navigation
+        int div  = TB_FOCUS_DIV(g_tb_accel);
+        int step = acc_v / div;
+        if (step) { acc_v -= (int16_t)(step * div); data->enc_diff = step; }
     }
 
-    // ---- horizontal -> adjust the engaged slider only ----
-    int8_t hdir = 0;
-    bool right = digitalRead(BOARD_TBOX_G02);
-    if (right != last_right) { last_right = right; hdir = +1; }
-    bool left = digitalRead(BOARD_TBOX_G04);
-    if (left != last_left)   { last_left = left;   hdir = (hdir != 0) ? 0 : -1; }
-
-    if (hdir != 0 && (g_edit_slider || scroll_tgt)) {
-        uint32_t now = millis();
-        if (!(hdir == -last_hdir && (now - last_hms) < TB_REVERSE_MS)) {
-            if (g_edit_slider) {
-                int32_t mn = lv_slider_get_min_value(g_edit_slider);
-                int32_t mx = lv_slider_get_max_value(g_edit_slider);
-                int32_t range = mx - mn;
-                int32_t hstep = (range > 25) ? range / 25 : 1;
-                lv_slider_set_value(g_edit_slider, lv_slider_get_value(g_edit_slider) + hdir * hstep, LV_ANIM_OFF);
-                lv_event_send(g_edit_slider, LV_EVENT_VALUE_CHANGED, NULL);
-            } else {
-                // Reading view: vertical is taken by scrolling, so horizontal moves
-                // focus across the buttons (Back / List / Re-req); press activates.
-                data->enc_diff = hdir;
-            }
-            last_hdir = hdir;
-            last_hms  = now;
+    // ---- horizontal: the engaged slider, or focus in a reading view ----
+    if (vx && g_edit_slider) {
+        acc_h += vx;
+        int div  = TB_FOCUS_DIV(g_tb_accel);
+        int step = acc_h / div;
+        if (step) {
+            acc_h -= (int16_t)(step * div);
+            int32_t range = lv_slider_get_max_value(g_edit_slider) - lv_slider_get_min_value(g_edit_slider);
+            int32_t hstep = (range > 25) ? range / 25 : 1;
+            lv_slider_set_value(g_edit_slider, lv_slider_get_value(g_edit_slider) + step * hstep, LV_ANIM_OFF);
+            lv_event_send(g_edit_slider, LV_EVENT_VALUE_CHANGED, NULL);
         }
+    } else if (vx && scroll_tgt && !data->enc_diff) {
+        // Reading view: vertical is taken by scrolling, so horizontal moves focus
+        // across whatever buttons the view has (List / Re-req / Read); press activates.
+        // A straight vertical roll brushes these lines too, so the divisor here is
+        // deliberately coarse — focus must not wander while the page is being read.
+        acc_h += vx;
+        int div  = 2 * TB_FOCUS_DIV(g_tb_accel);
+        int step = acc_h / div;
+        if (step) { acc_h -= (int16_t)(step * div); data->enc_diff = step; }
     }
 }
 
@@ -646,7 +719,13 @@ static void setupLvgl()
     disp_drv.ver_res     = TFT_WIDTH;    // 240 tall
     disp_drv.flush_cb    = disp_flush;
     disp_drv.draw_buf    = &draw_buf;
-    disp_drv.full_refresh = 1;
+    // Draw and push only what changed. full_refresh = 1 (inherited from the LilyGO
+    // example this started from) re-rendered all 320x240 and pushed 153,600 bytes down
+    // a 40 MHz bus for every repaint, ~31 ms of SPI alone — so the clock ticking in the
+    // status bar cost a whole screen, and LVGL could not read the trackball while it
+    // happened. The buffer stays full-screen; it is now a ceiling, not a quota.
+    disp_drv.full_refresh = 0;
+    disp_drv.monitor_cb   = disp_monitor;
     lv_disp_drv_register(&disp_drv);
 
     // Global font: Korean + Latin + LVGL icons in one font, so Hangul renders
@@ -2003,41 +2082,91 @@ static void book_tick()
     book_send_bn();
 }
 
-// Render whatever of the page we hold. Gaps show as "..." so reading can start before
-// the last chunk lands, which is the point of a small transfer unit.
+// Turn the wire's [NL] markers into the breaks this screen wants.
+//
+// Each break is decided from the line it ends and nothing else. A rule that reads the
+// whole page instead — "does this page contain a blank line?" — changes its mind when a
+// later chunk lands, and re-wrapping text somebody is part way through reading is
+// exactly the jump this whole pass is about. A local rule can only ever append.
+//
+//   empty line            -> paragraph
+//   short line            -> the source ended it early on purpose (paragraph, heading)
+//   full-looking line     -> the source hard-wrapped for a wider page than this one;
+//                            join with a space and let the label wrap for itself
+//   very long line        -> the source puts one whole paragraph on a line
+#define RF_WRAP_MIN 26      // columns below which a line ended on purpose
+#define RF_WRAP_MAX 140     // columns above which a line IS a paragraph
+static String book_reflow(const String &src)
+{
+    String out;
+    out.reserve(src.length());
+    int pos = 0;
+    bool first = true;
+    while (true) {
+        int nl = src.indexOf("[NL]", pos);
+        if (nl < 0) { out += src.substring(pos); break; }
+        out += src.substring(pos, nl);
+        int cols = 0;                                     // display columns, not bytes:
+        for (int i = pos; i < nl; i++)                    // Hangul is three bytes a glyph
+            if (((uint8_t)src[i] & 0xC0) != 0x80) cols++;
+        // A page starts mid-line, so its first break ends a line that began on the page
+        // before and only looks short. Treat it as the wrap it almost always is.
+        if (cols && (first || (cols >= RF_WRAP_MIN && cols <= RF_WRAP_MAX))) out += " ";
+        else                                                                out += "\n";
+        first = false;
+        pos   = nl + 4;
+    }
+    return out;
+}
+
+// Draw the page. While it is still arriving only the CONTIGUOUS prefix is drawn —
+// chunk 0 up to the first gap. Drawing a gap as "..." and swapping in its real text
+// later moves every line below it, which under a reader's eyes is the page lurching;
+// text that only ever appends at the end never disturbs what has been read.
 static void book_render_page()
 {
     if (!g_rd_body) return;
-    // How far to draw. !BR gives the real count, but it can be the frame that gets lost,
-    // and chunks that have arrived must not sit invisible behind a missing header — so
-    // without it, draw up to the highest chunk seen.
+    // How far the page goes. !BR gives the real count, but it can be the frame that gets
+    // lost, and chunks that have arrived must not sit invisible behind a missing header —
+    // so without it, go to the highest chunk seen.
     int n = g_rd_n;
     if (!n) for (int i = BOOK_PAGE_MAX - 1; i >= 0; i--) if (g_rd_seen[i]) { n = i + 1; break; }
-    if (!n) lv_label_set_text(g_rd_body, "쪽 요청 중...");
+    int upto = 0;
+    while (upto < n && g_rd_seen[upto]) upto++;
+
+    String out;
+    if (!upto) out = "쪽 요청 중...";
     else {
         String t;
-        for (int i = 0; i < n; i++) t += g_rd_seen[i] ? g_rd_chunk[i] : String("...");
-        // Reflow. The router keeps the source's line structure, so a blank line arrives
-        // as two [NL] in a row and a hard-wrapped line as one. The original's wrapping was
-        // for a wider page than this: the label wraps for itself, so single breaks become
-        // spaces and blank lines become paragraphs. A page with no blank line at all is
-        // one whose single breaks ARE its paragraphs, and those are left alone.
-        if (t.indexOf("[NL][NL]") >= 0) {
-            t.replace("[NL][NL]", "\x01");
-            t.replace("[NL]", " ");
-            t.replace("\x01", "\n\n");
-        } else {
-            t.replace("[NL]", "\n");
-        }
-        lv_label_set_text(g_rd_body, t.c_str());
+        for (int i = 0; i < upto; i++) t += g_rd_chunk[i];
+        out = book_reflow(t);
     }
-    if (g_rd_land_bottom && g_rd_n && g_rd_have >= g_rd_n && g_rd_scroll) {
+    // Setting the same text again costs a full re-wrap and a repaint of the whole label.
+    // Repair traffic for a page already on screen would do that for nothing.
+    const char *cur = lv_label_get_text(g_rd_body);
+    if (!cur || out != cur) lv_label_set_text(g_rd_body, out.c_str());
+
+    // Turning back a page resumes at its end. Stay pinned there for every chunk, not
+    // just the last one: letting the prefix fill from the top and then snapping to the
+    // bottom on completion is a jump, and following the tail lands in the same place
+    // without one. lv_obj_update_layout first — the label has only just been given new
+    // text, and its height is not recomputed until the next layout pass, so measuring
+    // now without it scrolls by the OLD content height.
+    if (g_rd_land_bottom && g_rd_scroll) {
+        lv_obj_update_layout(g_rd_scroll);
         lv_obj_scroll_by(g_rd_scroll, 0, -lv_obj_get_scroll_bottom(g_rd_scroll), LV_ANIM_OFF);
-        g_rd_land_bottom = false;
+        if (g_rd_n && g_rd_have >= g_rd_n) g_rd_land_bottom = false;
     }
     if (g_rd_foot) {
         int idx = book_find(String(g_rd_id));
-        lv_label_set_text_fmt(g_rd_foot, "%d/%d쪽", g_rd_page + 1, idx >= 0 ? g_books[idx].pages : 0);
+        int tot = idx >= 0 ? g_books[idx].pages : 0;
+        // The body says nothing about what is missing now, so the footer does: which
+        // chunks are still out is the reason the page stops where it stops.
+        if (g_rd_n && g_rd_have < g_rd_n)
+            lv_label_set_text_fmt(g_rd_foot, "%d/%d쪽   %d/%d 수신", g_rd_page + 1, tot,
+                                  g_rd_have, g_rd_n);
+        else
+            lv_label_set_text_fmt(g_rd_foot, "%d/%d쪽", g_rd_page + 1, tot);
     }
 }
 
@@ -3896,6 +4025,13 @@ void setup()
     pinMode(BOARD_TBOX_G02, INPUT_PULLUP);
     pinMode(BOARD_TBOX_G03, INPUT_PULLUP);
     pinMode(BOARD_TBOX_G04, INPUT_PULLUP);
+    // Count every edge in an ISR. Polling these four lines from the LVGL read callback
+    // lost most of them: a read happens once a frame at best, and the ball turns far
+    // faster than the screen paints. See tb_take().
+    attachInterrupt(BOARD_TBOX_G01, tb_isr_up,    CHANGE);
+    attachInterrupt(BOARD_TBOX_G03, tb_isr_down,  CHANGE);
+    attachInterrupt(BOARD_TBOX_G02, tb_isr_right, CHANGE);
+    attachInterrupt(BOARD_TBOX_G04, tb_isr_left,  CHANGE);
 
     tft.begin();
     tft.setRotation(1);
@@ -4172,6 +4308,8 @@ static void power_save_run()
 
     while (digitalRead(BOARD_BOOT_PIN) == LOW) delay(10);   // swallow the wake press so it
     delay(50);                                              // does not also click a button
+    tb_flush();   // and every edge the ball collected in the dark, which would otherwise
+                  // all arrive at once as one violent scroll on the first read
 
     // Act on WHY we woke. Waking silently and leaving the user to hunt for what caused
     // it is the same as not waking: a chime with nothing on screen tells them nothing.
@@ -4245,5 +4383,22 @@ void loop()
     gps_feed();        // keep the NMEA parser fed regardless of which app is open
     lora_service();    // always-on LoRa RX so messages arrive even with the app closed
     news_tick();       // deferred announce (chime + speech + hijack), repair, expiry
-    delay(5);
+
+    // How the last second of drawing went. Only while the screen is genuinely busy —
+    // the clock in the status bar paints one small frame a second forever, and a console
+    // line for that would bury everything else worth reading.
+    static uint32_t perf_ms = 0;
+    uint32_t now = millis();
+    if ((uint32_t)(now - perf_ms) > 1000) {
+        if (g_perf_frames >= 5)
+            Serial.printf("[perf] %lu fps  %lu ms/frame  %lu px/frame  ball %lu edges/s\n",
+                          (unsigned long)g_perf_frames,
+                          (unsigned long)(g_perf_ms / g_perf_frames),
+                          (unsigned long)(g_perf_px / g_perf_frames),
+                          (unsigned long)g_perf_tb);
+        g_perf_frames = g_perf_ms = g_perf_px = 0;
+        g_perf_tb = 0;
+        perf_ms = now;
+    }
+    delay(1);          // yield to the idle task; 5 ms here was a tenth of a frame
 }
