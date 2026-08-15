@@ -176,8 +176,11 @@ static lv_obj_t     *g_art_body = NULL;         // article body label (non-NULL 
 static lv_obj_t     *g_art_scroll = NULL;       // article scroll container — trackball scrolls this by line
 static lv_obj_t     *g_rd_scroll  = NULL;       // book page scroll container — likewise
 static volatile bool g_rd_next_req = false;    // rolled past the end: fetch the next page
+static volatile bool g_rd_prev_req = false;    // rolled above the top: fetch the previous one
+static bool          g_rd_land_bottom = false; // ...and open it at its end, where reading left off
 static int           g_rd_n        = 0;        // chunks in the open page (0 = !BR not seen yet)
 static int           g_rd_have     = 0;        // how many of them have arrived
+static int           g_rd_page     = 0;        // page open in the reader
 static String        g_art_crc;                 // v1.8: crc32 of the whole body, from !GR
 static uint32_t      g_art_last_ms = 0;         // last !GR/!GD seen — idle detection for !GN
 static uint32_t      g_art_gn_ms   = 0;         // rate-limit our !GN repair requests
@@ -430,8 +433,10 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
         if ((dy < 0 ? -dy : dy) > room) dy = (dy < 0) ? -room : room;
         // Rolling on at the end of a book page turns it. Only once the page is whole:
         // advancing off a half-received page would skip text that is still on its way.
-        if (!dy && diff > 0 && scroll_tgt == g_rd_scroll && g_rd_n && g_rd_have >= g_rd_n)
-            g_rd_next_req = true;
+        if (!dy && scroll_tgt == g_rd_scroll && g_rd_n && g_rd_have >= g_rd_n) {
+            if (diff > 0)                  g_rd_next_req = true;
+            else if (g_rd_page > 0)        g_rd_prev_req = true;
+        }
         if (dy) lv_obj_scroll_by(scroll_tgt, 0, dy, LV_ANIM_OFF);
         data->enc_diff = 0;
     } else {
@@ -1725,7 +1730,6 @@ static BookPend      g_bt_pend[8];
 static int           g_bt_pend_n = 0;
 
 static char          g_rd_id[6]   = "";   // book open in the reader ("" = shelf)
-static int           g_rd_page    = 0;
 static char          g_rd_crc[10] = "";
 static String        g_rd_chunk[BOOK_PAGE_MAX];
 static bool          g_rd_seen[BOOK_PAGE_MAX];
@@ -1940,7 +1944,9 @@ static void book_send_bq(const char *id, int page)
     g_rd_page = page;
     book_page_reset();
     g_rd_next_req = false;
-    if (g_rd_scroll) lv_obj_scroll_to_y(g_rd_scroll, 0, LV_ANIM_OFF);   // read from the top
+    // Forward opens at the top. Backward opens at the bottom, once the text is there to
+    // scroll through — see book_render_page().
+    if (g_rd_scroll && !g_rd_land_bottom) lv_obj_scroll_to_y(g_rd_scroll, 0, LV_ANIM_OFF);
     lora_tx_line("!BQ\t" + String(id) + "\t" + b36((uint32_t)page) + "\n");
     lora_radio.startReceive();
     book_render_page();
@@ -1966,6 +1972,11 @@ static void book_tick()
     if (g_rd_next_req) {            // asked for by the scroll, sent from here: !BQ blocks
         g_rd_next_req = false;
         book_turn(1);
+    }
+    if (g_rd_prev_req) {
+        g_rd_prev_req = false;
+        g_rd_land_bottom = true;    // going back means resuming at the end of that page
+        book_turn(-1);
     }
     if (!g_rd_id[0] || !g_rd_n || g_rd_have >= g_rd_n) return;
     uint32_t now = millis();
@@ -2009,14 +2020,13 @@ static void book_render_page()
         t.replace("[NL]", "\n");
         lv_label_set_text(g_rd_body, t.c_str());
     }
+    if (g_rd_land_bottom && g_rd_n && g_rd_have >= g_rd_n && g_rd_scroll) {
+        lv_obj_scroll_by(g_rd_scroll, 0, -lv_obj_get_scroll_bottom(g_rd_scroll), LV_ANIM_OFF);
+        g_rd_land_bottom = false;
+    }
     if (g_rd_foot) {
         int idx = book_find(String(g_rd_id));
-        int tot = idx >= 0 ? g_books[idx].pages : 0;
-        if (g_rd_n && g_rd_have < g_rd_n)
-            lv_label_set_text_fmt(g_rd_foot, "%d/%d쪽   조각 %d/%d", g_rd_page + 1, tot,
-                                  g_rd_have, g_rd_n);
-        else
-            lv_label_set_text_fmt(g_rd_foot, "%d/%d쪽", g_rd_page + 1, tot);
+        lv_label_set_text_fmt(g_rd_foot, "%d/%d쪽", g_rd_page + 1, idx >= 0 ? g_books[idx].pages : 0);
     }
 }
 
@@ -2061,32 +2071,8 @@ static void book_show_reader()
     lv_obj_set_style_text_font(g_rd_foot, &font_kr16, 0);
     lv_obj_set_style_text_color(g_rd_foot, lv_color_hex(0x9CA3AF), 0);
 
-    lv_obj_t *row = lv_obj_create(g_book_root);
-    lv_obj_remove_style_all(row);
-    lv_obj_set_width(row, lv_pct(100));
-    lv_obj_set_height(row, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    lv_obj_t *pv = lv_btn_create(row);
-    lv_label_set_text(lv_label_create(pv), LV_SYMBOL_LEFT);
-    lv_obj_add_event_cb(pv, [](lv_event_t *) { book_turn(-1); }, LV_EVENT_CLICKED, NULL);
-    lv_group_add_obj(g, pv);
-
-    lv_obj_t *sh = lv_btn_create(row);
-    lv_label_set_text(lv_label_create(sh), LV_SYMBOL_LIST);
-    lv_obj_add_event_cb(sh, [](lv_event_t *) { g_rd_id[0] = 0; book_show_shelf(); },
-                        LV_EVENT_CLICKED, NULL);
-    lv_group_add_obj(g, sh);
-
-    lv_obj_t *nx = lv_btn_create(row);
-    lv_label_set_text(lv_label_create(nx), LV_SYMBOL_RIGHT);
-    lv_obj_add_event_cb(nx, [](lv_event_t *) { book_turn(1); }, LV_EVENT_CLICKED, NULL);
-    lv_group_add_obj(g, nx);
-    lv_group_focus_obj(nx);
-
     book_render_page();
-    lv_label_set_text(g_toast, LV_SYMBOL_LEFT LV_SYMBOL_RIGHT " 쪽 넘김   위아래로 스크롤");
+    lv_label_set_text(g_toast, "굴려서 읽기   끝까지 굴리면 다음 쪽");
 }
 
 static void book_open_cb(lv_event_t *e)
