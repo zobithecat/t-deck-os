@@ -537,15 +537,23 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
         // is still on its way. Backward does not, and must not: abandoning a page we have
         // not finished receiving costs nothing, while being held on a page that is not
         // coming, with no way back, is the worse place to be stranded.
-        static uint32_t turn_ms = 0;
-        if (vy && scroll_tgt == g_rd_scroll && room <= 0 &&
-            (uint32_t)(now - turn_ms) > TB_PAGE_REARM_MS) {
+        // ONE turn per gesture, and the gesture ends when the ball stops. A page that is
+        // still only a request has no room in either direction, so every read that saw
+        // motion qualified and the trigger fired again every re-arm — a roll upward while
+        // waiting walked backwards through the book, one page every 700 ms, asking for
+        // each. A timer alone cannot tell a long roll from a new one; coming to rest can.
+        static uint32_t turn_ms = 0, vmove_ms = 0;
+        static bool     turn_latch = false;
+        if (vy) vmove_ms = now;
+        if (turn_latch && (uint32_t)(now - vmove_ms) > 300 &&
+            (uint32_t)(now - turn_ms) > TB_PAGE_REARM_MS) turn_latch = false;
+
+        if (vy && !turn_latch && scroll_tgt == g_rd_scroll && room <= 0) {
             int8_t d = (vy > 0) ? +1 : -1;
             bool whole = g_rd_n && g_rd_have >= g_rd_n;
             if (d > 0 ? whole : (g_rd_page > 0)) {
-                turn_ms = now;          // a page that arrives already short must not let
-                Serial.printf("[book] rolled %s past the end -> turn\n",  // one long roll
-                              d > 0 ? "down" : "up");                     // walk the book
+                turn_ms = now; turn_latch = true;
+                Serial.printf("[book] rolled %s past the end -> turn\n", d > 0 ? "down" : "up");
                 if (d > 0) g_rd_next_req = true;
                 else       g_rd_prev_req = true;
             }
@@ -2116,6 +2124,16 @@ static void book_send_bl()
 static void book_send_bq(const char *id, int page)
 {
     if (!g_lora_ok || !id[0]) return;
+    // Never the same page twice inside three seconds. A real turn always changes the
+    // page number, so this costs nothing and bounds the damage from any future caller
+    // that fires more often than it means to — which has now happened twice.
+    static char     last_id[6] = "";
+    static int      last_page  = -1;
+    static uint32_t last_ms    = 0;
+    if (last_ms && page == last_page && !strcmp(last_id, id) &&
+        (uint32_t)(millis() - last_ms) < 3000) return;
+    strncpy(last_id, id, sizeof(last_id) - 1); last_id[sizeof(last_id) - 1] = 0;
+    last_page = page; last_ms = millis();
     strncpy(g_rd_id, id, sizeof(g_rd_id) - 1);
     g_rd_page = page;
     book_page_reset();
