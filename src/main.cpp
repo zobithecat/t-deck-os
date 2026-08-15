@@ -187,6 +187,7 @@ static lv_obj_t     *g_rd_scroll  = NULL;       // book page scroll container �
 static volatile bool g_rd_next_req = false;    // rolled past the end: fetch the next page
 static volatile bool g_rd_prev_req = false;    // rolled above the top: fetch the previous one
 static bool          g_rd_land_bottom = false; // ...and open it at its end, where reading left off
+static bool          g_rd_land_top    = false; // forward: pinned to the top until text arrives
 static int           g_rd_n        = 0;        // chunks in the open page (0 = !BR not seen yet)
 static int           g_rd_have     = 0;        // how many of them have arrived
 static int           g_rd_page     = 0;        // page open in the reader
@@ -506,14 +507,22 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
         //
         // Only a read that saw motion may test this: a still ball gives vy == 0, which
         // makes `room` the room in the OTHER direction.
+        // Forward needs a whole page — advancing off a half-received one skips text that
+        // is still on its way. Backward does not, and must not: abandoning a page we have
+        // not finished receiving costs nothing, while being held on a page that is not
+        // coming, with no way back, is the worse place to be stranded.
         static uint32_t turn_ms = 0;
-        if (vy && scroll_tgt == g_rd_scroll && g_rd_n && g_rd_have >= g_rd_n &&
-            room <= 0 && (uint32_t)(now - turn_ms) > TB_PAGE_REARM_MS) {
-            turn_ms = now;              // a page that arrives already short must not let
-            int8_t d = (vy > 0) ? +1 : -1;   // one long roll walk through the whole book
-            Serial.printf("[book] rolled %s past the end -> turn\n", d > 0 ? "down" : "up");
-            if (d > 0)                 g_rd_next_req = true;
-            else if (g_rd_page > 0)    g_rd_prev_req = true;
+        if (vy && scroll_tgt == g_rd_scroll && room <= 0 &&
+            (uint32_t)(now - turn_ms) > TB_PAGE_REARM_MS) {
+            int8_t d = (vy > 0) ? +1 : -1;
+            bool whole = g_rd_n && g_rd_have >= g_rd_n;
+            if (d > 0 ? whole : (g_rd_page > 0)) {
+                turn_ms = now;          // a page that arrives already short must not let
+                Serial.printf("[book] rolled %s past the end -> turn\n",  // one long roll
+                              d > 0 ? "down" : "up");                     // walk the book
+                if (d > 0) g_rd_next_req = true;
+                else       g_rd_prev_req = true;
+            }
         }
     } else if (!g_edit_slider) {
         acc_v += vy;                                   // focus navigation
@@ -2076,8 +2085,12 @@ static void book_send_bq(const char *id, int page)
     book_page_reset();
     g_rd_next_req = false;
     // Forward opens at the top. Backward opens at the bottom, once the text is there to
-    // scroll through — see book_render_page().
-    if (g_rd_scroll && !g_rd_land_bottom) lv_obj_scroll_to_y(g_rd_scroll, 0, LV_ANIM_OFF);
+    // scroll through — see book_render_page(). One scroll_to_y here is not enough for
+    // the forward case: it lands before the body is replaced by "쪽 요청 중...", and a
+    // container that then loses almost all its content keeps the offset it had and shows
+    // blank. The flag holds it at the top until there is something to read.
+    g_rd_land_top = !g_rd_land_bottom;
+    if (g_rd_land_top && g_rd_scroll) lv_obj_scroll_to_y(g_rd_scroll, 0, LV_ANIM_OFF);
     lora_tx_line("!BQ\t" + String(id) + "\t" + b36((uint32_t)page) + "\n");
     lora_radio.startReceive();
     Serial.printf("[book] BQ %s p%d\n", id, page);
@@ -2235,6 +2248,12 @@ static void book_render_page()
         lv_obj_update_layout(g_rd_scroll);
         lv_obj_scroll_by(g_rd_scroll, 0, -lv_obj_get_scroll_bottom(g_rd_scroll), LV_ANIM_OFF);
         if (g_rd_n && g_rd_have >= g_rd_n) g_rd_land_bottom = false;
+    } else if (g_rd_land_top && g_rd_scroll) {
+        // Held at the top for as long as the page is only a request. Released by the
+        // first chunk: from there the text only ever appends, so the reader owns the
+        // scroll and nothing below will move under them.
+        lv_obj_scroll_to_y(g_rd_scroll, 0, LV_ANIM_OFF);
+        if (g_rd_have) g_rd_land_top = false;
     }
     if (g_rd_foot) {
         int idx = book_find(String(g_rd_id));
@@ -2561,15 +2580,20 @@ static void lora_tx_line(const String &payload) { lora_tx_ttl(payload, RELAY_TTL
 //
 // Never while a stream is landing. This is a second of transmitting and settling, and
 // the frames it would step on are the ones the rest of this pass exists to stop losing.
+// Awake only. Power save is a screen-off idle loop that never calls this, which is the
+// behaviour we want: a beacon is the single most expensive thing a sleeping endpoint
+// could do with its radio, and a device with its screen off is not one anybody needs to
+// route through. Waking re-announces (g_hb_last, cleared in power_save_run) so the mesh
+// learns it is back without waiting out the rest of a minute.
+static uint32_t g_hb_last = 0;
 static void lora_hb_tick()
 {
     if (!g_lora_ok || g_range_active) return;
-    static uint32_t last = 0;
     uint32_t now = millis();
     if (now < 15000) return;                                  // let the radio settle first
-    if (last && (uint32_t)(now - last) < 60000) return;
+    if (g_hb_last && (uint32_t)(now - g_hb_last) < 60000) return;
     if (g_stream_ms && (uint32_t)(now - g_stream_ms) < 5000) return;   // wait it out
-    last = now;
+    g_hb_last = now;
     String hb = String("HB\t") + NODE_ID;
     if (g_rx_rssi_last) hb += "\trssi=" + String(g_rx_rssi_last);
     lora_tx_ttl(hb + "\n", RELAY_TTL_LOCAL);
@@ -4448,6 +4472,7 @@ static void power_save_run()
     delay(50);                                              // does not also click a button
     tb_flush();   // and every edge the ball collected in the dark, which would otherwise
                   // all arrive at once as one violent scroll on the first read
+    g_hb_last = 0;   // beacon again now that we are back on the mesh
 
     // Act on WHY we woke. Waking silently and leaving the user to hunt for what caused
     // it is the same as not waking: a chime with nothing on screen tells them nothing.
