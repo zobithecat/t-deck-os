@@ -2238,12 +2238,23 @@ static void book_render_page()
     int upto = 0;
     while (upto < n && g_rd_seen[upto]) upto++;
 
+    // If the FIRST chunk is the one that is late, start from whatever we do hold instead
+    // of showing nothing. Contiguous-prefix drawing is there so a gap filling in cannot
+    // move text somebody is part way through reading — but with the leading chunk
+    // missing there is no text to move, and holding a whole page back over its first 44
+    // bytes left the reader on "쪽 요청 중..." for the entire transfer with the rest of
+    // the page already in hand. One line reflowing at the top is the smaller loss.
+    int from = 0;
+    if (!upto) { while (from < n && !g_rd_seen[from]) from++;
+                 if (from < n) { upto = from; while (upto < n && g_rd_seen[upto]) upto++; } }
+
     String out;
-    if (!upto) out = g_rd_bq_try ? "응답 없음 - 다시 요청 중..." : "쪽 요청 중...";
+    if (upto <= from) out = g_rd_bq_try ? "응답 없음 - 다시 요청 중..." : "쪽 요청 중...";
     else {
         String t;
-        for (int i = 0; i < upto; i++) t += g_rd_chunk[i];
+        for (int i = from; i < upto; i++) t += g_rd_chunk[i];
         out = book_reflow(t);
+        if (from) out = "... " + out;      // the start is still on its way
     }
     // Setting the same text again costs a full re-wrap and a repaint of the whole label.
     // Repair traffic for a page already on screen would do that for nothing.
