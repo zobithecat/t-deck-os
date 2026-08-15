@@ -1985,6 +1985,17 @@ static void book_handle_bd(const String &line)
     if (!g_rd_seen[i]) { g_rd_seen[i] = true; g_rd_have++; g_rd_chunk[i] = line.substring(t[3] + 1); }
     g_rd_last_ms = millis();
     g_rd_bn_due  = 0;                       // traffic is flowing; the quiet gap restarts
+    // ...unless that was the last chunk of the page. The router sends a page in order,
+    // once, so anything still missing when chunk n-1 lands is definitively lost — there
+    // is nothing left to wait for. Waiting anyway was most of why a page felt so much
+    // slower than an article: a single lost chunk cost the whole quiet-gap timer and a
+    // slot on top of it, twenty seconds of nothing, for a repair we could already prove
+    // was needed. Only the ttl-3 relay copies of this same frame are worth ducking.
+    if (g_rd_n && i == g_rd_n - 1 && g_rd_have < g_rd_n) {
+        uint32_t toa = (uint32_t)(lora_radio.getTimeOnAir(79) / 1000);
+        if (toa < 200) toa = 200;
+        g_rd_bn_due = millis() + toa / 2 + (esp_random() % (toa + 1));
+    }
     book_render_page();
 
     if (!g_rd_n || g_rd_have < g_rd_n) return;
@@ -2076,19 +2087,25 @@ static void book_tick()
     }
     if (g_rd_have >= g_rd_n) return;
 
+    // Fallback for the one gap the arrival of chunk n-1 cannot prove: the tail itself
+    // going missing. Nothing tells us the stream ended then except silence.
+    //
+    // The wait used to be 8 s of quiet plus a slot up to sixteen frames wide — better
+    // than twenty seconds before the first !BN. That schedule belongs to the news plane,
+    // where one broadcast is heard by everybody and a hundred readers must not all
+    // repair at once. A page is pulled: it is wanted by the one reader who asked for it,
+    // so there is nobody to take turns with, and the spread bought nothing but delay.
     if (!g_rd_bn_due) {
-        uint32_t quiet = 3 * toa;
-        if (quiet < 8000) quiet = 8000;               // never chase a stream still running
+        uint32_t quiet = 4 * toa;
+        if (quiet < 3000) quiet = 3000;               // never chase a stream still running
         if ((uint32_t)(now - g_rd_last_ms) < quiet) return;
         if (g_rd_bn_try >= 2) {                       // two repairs did not close it
             Serial.println("[book] repair twice, asking for the page again");
             book_send_bq(g_rd_id, g_rd_page);
             return;
         }
-        uint32_t h = 2166136261u;
-        for (const char *c = NODE_ID; *c; c++) { h ^= (uint8_t)*c; h *= 16777619u; }
-        g_rd_bn_due = now + 4 * toa + (h % 16) * toa + (esp_random() % (toa / 2 + 1));
-        return;
+        g_rd_bn_due = now + toa + (esp_random() % (toa + 1));   // just enough to not
+        return;                                                 // collide with a twin
     }
     if ((int32_t)(now - g_rd_bn_due) < 0) return;
     g_rd_bn_due = 0;
