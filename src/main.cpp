@@ -174,6 +174,7 @@ static bool          g_art_seen[ART_MAX_CHUNKS];
 static String        g_art_chunk[ART_MAX_CHUNKS];
 static lv_obj_t     *g_art_body = NULL;         // article body label (non-NULL only in article view)
 static lv_obj_t     *g_art_scroll = NULL;       // article scroll container — trackball scrolls this by line
+static lv_obj_t     *g_rd_scroll  = NULL;       // book page scroll container — likewise
 static String        g_art_crc;                 // v1.8: crc32 of the whole body, from !GR
 static uint32_t      g_art_last_ms = 0;         // last !GR/!GD seen — idle detection for !GN
 static uint32_t      g_art_gn_ms   = 0;         // rate-limit our !GN repair requests
@@ -411,7 +412,9 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     // In the file viewer, vertical scrolls the text one line at a time instead
     // of moving focus (the viewer's group holds only the Back button). Direction
     // comes from the glitch-suppressed `diff`; magnitude is fixed at one line.
-    lv_obj_t *scroll_tgt = g_sd_view_ta ? g_sd_view_ta : g_art_scroll;   // file viewer OR news article
+    lv_obj_t *scroll_tgt = g_sd_view_ta ? g_sd_view_ta                    // file viewer,
+                         : g_art_scroll ? g_art_scroll                    // news article,
+                         : g_rd_scroll;                                   // or a book page
     if (scroll_tgt && diff != 0) {
         // Clamp to the remaining content. lv_obj_scroll_by() does NOT bound a
         // programmatic scroll (only touch drags are bounded), so without this the
@@ -1726,7 +1729,6 @@ static uint8_t       g_rd_bn_try  = 0;
 static uint32_t      g_rd_bn_due  = 0;    // scheduled !BN (slot rule, PROTOCOL.md §8)
 static lv_obj_t     *g_book_list  = NULL; // shelf list   (non-NULL only on the shelf)
 static lv_obj_t     *g_rd_body    = NULL; // page text    (non-NULL only in the reader)
-static lv_obj_t     *g_rd_scroll  = NULL;
 static lv_obj_t     *g_rd_foot    = NULL;
 static lv_obj_t     *g_book_root  = NULL;
 
@@ -1984,10 +1986,15 @@ static void book_tick()
 static void book_render_page()
 {
     if (!g_rd_body) return;
-    if (!g_rd_n) { lv_label_set_text(g_rd_body, "쪽 요청 중..."); }
+    // How far to draw. !BR gives the real count, but it can be the frame that gets lost,
+    // and chunks that have arrived must not sit invisible behind a missing header — so
+    // without it, draw up to the highest chunk seen.
+    int n = g_rd_n;
+    if (!n) for (int i = BOOK_PAGE_MAX - 1; i >= 0; i--) if (g_rd_seen[i]) { n = i + 1; break; }
+    if (!n) lv_label_set_text(g_rd_body, "쪽 요청 중...");
     else {
         String t;
-        for (int i = 0; i < g_rd_n; i++) t += g_rd_seen[i] ? g_rd_chunk[i] : String("...");
+        for (int i = 0; i < n; i++) t += g_rd_seen[i] ? g_rd_chunk[i] : String("...");
         t.replace("[NL]", "\n");
         lv_label_set_text(g_rd_body, t.c_str());
     }
