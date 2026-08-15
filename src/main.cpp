@@ -699,6 +699,7 @@ static void build_launcher_ui()
         { LV_SYMBOL_LIST,     "Discovery",         0xA3E635 },
         { LV_SYMBOL_BELL,     "News",              0xFCD34D },
         { LV_SYMBOL_WARNING,  "Alert",             0xF87171 },
+        { LV_SYMBOL_FILE,     "Books",             0xA5B4FC },
         { LV_SYMBOL_GPS,      "GPS",               0xF87171 },
         { LV_SYMBOL_KEYBOARD, "KbTest",            0x60A5FA },
         { LV_SYMBOL_BELL,     "Messages",          0xFBBF24 },
@@ -1691,6 +1692,429 @@ static void news_show_article(const char *art_id, const char *title)
     news_send_gq();
 }
 
+// --- book service (!B* — BOOKS.md v1.10) -------------------------------------
+// The transfer unit is a PAGE, not a document. A novel is ~9,000 chunks; streaming
+// one the way !GQ streams an article would hold the channel for hours and leave no
+// clear air for an alert. So nothing is ever pushed and nothing is fetched ahead:
+// a page goes out only when the reader turns onto it.
+#define BOOK_N        12          // catalogue capacity
+#define BOOK_PAGE_MAX 24          // chunk ceiling per page. The router's default is 10,
+                                  // but !BR carries the real n and the last page is short
+struct BookItem { char id[6], cid[6], title[56]; uint16_t pages; };
+static BookItem      g_books[BOOK_N];
+static int           g_books_n = 0;
+static char          g_book_rev[10] = "";
+static uint32_t      g_book_seq = 0;
+static int           g_book_count = -1;
+static uint32_t      g_book_bl_ms = 0;
+
+// !BT for a revision we have not been announced yet: held until its !BC arrives, so a
+// late frame from an older catalogue cannot redefine the shelf on its own.
+struct BookPend { char rev[10], id[6], cid[6], title[56]; uint16_t pages; };
+static BookPend      g_bt_pend[8];
+static int           g_bt_pend_n = 0;
+
+static char          g_rd_id[6]   = "";   // book open in the reader ("" = shelf)
+static int           g_rd_page    = 0;
+static int           g_rd_n       = 0;    // chunks in this page (0 = !BR not seen yet)
+static char          g_rd_crc[10] = "";
+static String        g_rd_chunk[BOOK_PAGE_MAX];
+static bool          g_rd_seen[BOOK_PAGE_MAX];
+static int           g_rd_have    = 0;
+static uint32_t      g_rd_last_ms = 0;    // last !BD, for the quiet-gap test
+static uint8_t       g_rd_bn_try  = 0;
+static uint32_t      g_rd_bn_due  = 0;    // scheduled !BN (slot rule, PROTOCOL.md §8)
+static lv_obj_t     *g_book_list  = NULL; // shelf list   (non-NULL only on the shelf)
+static lv_obj_t     *g_rd_body    = NULL; // page text    (non-NULL only in the reader)
+static lv_obj_t     *g_rd_scroll  = NULL;
+static lv_obj_t     *g_rd_foot    = NULL;
+static lv_obj_t     *g_book_root  = NULL;
+
+static void book_show_shelf();
+static void book_show_reader();
+static void book_send_bq(const char *id, int page);
+static void book_render_page();
+static void book_turn(int delta);
+
+static String b36(uint32_t n)
+{
+    static const char *D = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    String o; do { o = String(D[n % 36]) + o; n /= 36; } while (n);
+    return o;
+}
+static uint32_t unb36(const String &s) { return (uint32_t)strtoul(s.c_str(), NULL, 36); }
+
+// Bitwise CRC-32, matching zlib's — the router computes the page crc with
+// zlib.crc32 over the chunks AS SENT, so this runs before [NL] is decoded.
+static uint32_t crc32_of(const String &s)
+{
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < s.length(); i++) {
+        c ^= (uint8_t)s[i];
+        for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(c & 1)));
+    }
+    return c ^ 0xFFFFFFFFu;
+}
+
+static int book_find(const String &id)
+{
+    for (int i = 0; i < g_books_n; i++) if (id.equals(g_books[i].id)) return i;
+    return -1;
+}
+
+// Reading position is local and stays local: putting it on the air would spend the
+// scarce direction on something only this device cares about (DOCTRINE D3).
+static int  book_pos_get(const char *id)        { Preferences p;
+                                                  if (!p.begin("tdeckbk", true)) return 0;
+                                                  int v = p.getInt(id, 0); p.end(); return v; }
+static void book_pos_set(const char *id, int pg) { Preferences p; p.begin("tdeckbk", false);
+                                                  p.putInt(id, pg); p.end(); }
+
+static void book_save()
+{
+    Preferences p; p.begin("tdeckbk", false);
+    p.putString("rev", g_book_rev);
+    p.putUInt("seq", g_book_seq);
+    p.putInt("cnt", g_book_count);
+    p.putInt("n", g_books_n);
+    p.putBytes("cat", g_books, sizeof(BookItem) * g_books_n);
+    p.end();
+}
+
+static void book_load()
+{
+    Preferences p;
+    if (!p.begin("tdeckbk", true)) return;    // nothing saved yet
+
+    String rev = p.getString("rev", "");
+    strncpy(g_book_rev, rev.c_str(), sizeof(g_book_rev) - 1);
+    g_book_seq   = p.getUInt("seq", 0);
+    g_book_count = p.getInt("cnt", -1);
+    int n = p.getInt("n", 0);
+    if (n > BOOK_N) n = BOOK_N;
+    if (n > 0) p.getBytes("cat", g_books, sizeof(BookItem) * n);
+    g_books_n = n;
+    p.end();
+}
+
+static void book_page_reset()
+{
+    for (int i = 0; i < BOOK_PAGE_MAX; i++) { g_rd_seen[i] = false; g_rd_chunk[i] = ""; }
+    g_rd_n = 0; g_rd_have = 0; g_rd_crc[0] = 0;
+    g_rd_bn_try = 0; g_rd_bn_due = 0; g_rd_last_ms = millis();
+}
+
+static void book_store(const String &rev, const String &id, uint16_t pages,
+                       const String &cid, const String &title)
+{
+    int i = book_find(id);
+    if (i < 0) { if (g_books_n >= BOOK_N) return; i = g_books_n++; memset(&g_books[i], 0, sizeof(BookItem)); }
+    // A changed cid means the body was edited upstream: the cached page is stale, but the
+    // id is derived from the selector rather than the text, so the reader keeps its place.
+    if (g_books[i].cid[0] && !cid.equals(g_books[i].cid) && !strcmp(g_books[i].id, g_rd_id))
+        book_page_reset();
+    strncpy(g_books[i].id,    id.c_str(),    sizeof(g_books[i].id) - 1);
+    strncpy(g_books[i].cid,   cid.c_str(),   sizeof(g_books[i].cid) - 1);
+    strncpy(g_books[i].title, title.c_str(), sizeof(g_books[i].title) - 1);
+    g_books[i].pages = pages;
+}
+
+// !BC — catalogue announce. Same monotonic rule as !GA: only a GREATER seq replaces
+// what we hold, so a re-ordered older announce cannot wipe the shelf.
+static void book_handle_bc(const String &line)
+{
+    int t[4], p = 0, at = line.indexOf('\t');
+    while (p < 4 && at >= 0) { t[p++] = at; at = line.indexOf('\t', at + 1); }
+    if (p < 4) return;
+    String rev = line.substring(t[0] + 1, t[1]);
+    uint32_t seq = unb36(line.substring(t[3] + 1));
+    if (g_book_rev[0] && seq <= g_book_seq) return;          // stale or repeat
+    bool newrev = !rev.equals(g_book_rev);
+    strncpy(g_book_rev, rev.c_str(), sizeof(g_book_rev) - 1);
+    g_book_seq   = seq;
+    g_book_count = (int)unb36(line.substring(t[1] + 1, t[2]));
+    if (newrev) g_books_n = 0;
+    for (int i = 0; i < g_bt_pend_n; i++)                    // adopt what was waiting
+        if (rev.equals(g_bt_pend[i].rev))
+            book_store(rev, g_bt_pend[i].id, g_bt_pend[i].pages, g_bt_pend[i].cid, g_bt_pend[i].title);
+    g_bt_pend_n = 0;
+    book_save();
+    if (g_book_list) book_show_shelf();
+}
+
+// !BT — one book. Five fields then the title, which is last and may contain tabs.
+static void book_handle_bt(const String &line)
+{
+    int t[5], p = 0, at = line.indexOf('\t');
+    while (p < 5 && at >= 0) { t[p++] = at; at = line.indexOf('\t', at + 1); }
+    if (p < 5) return;
+    String rev   = line.substring(t[0] + 1, t[1]);
+    String id    = line.substring(t[1] + 1, t[2]);
+    uint16_t pgs = (uint16_t)unb36(line.substring(t[2] + 1, t[3]));
+    String cid   = line.substring(t[3] + 1, t[4]);
+    String title = line.substring(t[4] + 1);
+    if (!rev.equals(g_book_rev)) {                            // hold it for its !BC
+        if (g_bt_pend_n >= (int)(sizeof(g_bt_pend) / sizeof(g_bt_pend[0]))) return;
+        BookPend &q = g_bt_pend[g_bt_pend_n++];
+        memset(&q, 0, sizeof(q));
+        strncpy(q.rev, rev.c_str(), sizeof(q.rev) - 1);
+        strncpy(q.id,  id.c_str(),  sizeof(q.id)  - 1);
+        strncpy(q.cid, cid.c_str(), sizeof(q.cid) - 1);
+        strncpy(q.title, title.c_str(), sizeof(q.title) - 1);
+        q.pages = pgs;
+        return;
+    }
+    book_store(rev, id, pgs, cid, title);
+    book_save();
+    if (g_book_list) book_show_shelf();
+}
+
+// !BR — page reply header, sent before the chunks. n is per-page: the last page of a
+// book is short, so nothing may assume the router's default of 10.
+static void book_handle_br(const String &line)
+{
+    int t[4], p = 0, at = line.indexOf('\t');
+    while (p < 4 && at >= 0) { t[p++] = at; at = line.indexOf('\t', at + 1); }
+    if (p < 4) return;
+    if (!line.substring(t[0] + 1, t[1]).equals(g_rd_id)) return;      // another book
+    if ((int)unb36(line.substring(t[1] + 1, t[2])) != g_rd_page) return;
+    int n = (int)unb36(line.substring(t[2] + 1, t[3]));
+    if (n < 1 || n > BOOK_PAGE_MAX) return;
+    if (g_rd_n != n) { book_page_reset(); g_rd_n = n; }
+    String crc = line.substring(t[3] + 1);
+    strncpy(g_rd_crc, crc.c_str(), sizeof(g_rd_crc) - 1);
+    g_rd_last_ms = millis();
+    book_render_page();
+}
+
+// !BD — one chunk. Four fields then the text, which is last and may contain tabs.
+// Chunks can arrive out of order, and a frame for a page we are not on is not ours.
+static void book_handle_bd(const String &line)
+{
+    int t[4], p = 0, at = line.indexOf('\t');
+    while (p < 4 && at >= 0) { t[p++] = at; at = line.indexOf('\t', at + 1); }
+    if (p < 4) return;
+    if (!line.substring(t[0] + 1, t[1]).equals(g_rd_id)) return;
+    if ((int)unb36(line.substring(t[1] + 1, t[2])) != g_rd_page) return;
+    int i = (int)unb36(line.substring(t[2] + 1, t[3]));
+    if (i < 0 || i >= BOOK_PAGE_MAX) return;
+    if (!g_rd_seen[i]) { g_rd_seen[i] = true; g_rd_have++; g_rd_chunk[i] = line.substring(t[3] + 1); }
+    g_rd_last_ms = millis();
+    g_rd_bn_due  = 0;                       // traffic is flowing; the quiet gap restarts
+    book_render_page();
+
+    if (!g_rd_n || g_rd_have < g_rd_n) return;
+    String body;                            // complete: check it end to end
+    for (int k = 0; k < g_rd_n; k++) body += g_rd_chunk[k];
+    if (g_rd_crc[0] && crc32_of(body) != unb36(String(g_rd_crc))) {
+        // Bytes are wrong, not missing. !BN asks for what never arrived and would return
+        // the same corrupt chunk, so the whole page is requested again.
+        Serial.println("[book] page crc mismatch, re-requesting");
+        book_send_bq(g_rd_id, g_rd_page);
+        return;
+    }
+    book_pos_set(g_rd_id, g_rd_page);       // a page that verified is a page we have read
+    book_render_page();
+}
+
+static void book_send_bl()
+{
+    if (!g_lora_ok) return;
+    if (g_book_bl_ms && (uint32_t)(millis() - g_book_bl_ms) < 8000) return;
+    g_book_bl_ms = millis();
+    lora_tx_line(String("!BL\t") + (g_book_rev[0] ? g_book_rev : "-") + "\n");
+    lora_radio.startReceive();
+}
+
+static void book_send_bq(const char *id, int page)
+{
+    if (!g_lora_ok || !id[0]) return;
+    strncpy(g_rd_id, id, sizeof(g_rd_id) - 1);
+    g_rd_page = page;
+    book_page_reset();
+    lora_tx_line("!BQ\t" + String(id) + "\t" + b36((uint32_t)page) + "\n");
+    lora_radio.startReceive();
+    book_render_page();
+}
+
+// The bitmap is what we HAVE (LSB = chunk 0 of this page); the router resends the
+// clear bits. Sending "what is missing" instead would ask for the whole page back.
+static void book_send_bn()
+{
+    if (!g_lora_ok || !g_rd_id[0] || !g_rd_n) return;
+    uint32_t have = 0;
+    for (int i = 0; i < g_rd_n && i < 32; i++) if (g_rd_seen[i]) have |= (1u << i);
+    lora_tx_line("!BN\t" + String(g_rd_id) + "\t" + b36((uint32_t)g_rd_page) + "\t" + b36(have) + "\n");
+    lora_radio.startReceive();
+    Serial.printf("[book] BN %s p%d have=%s (%d/%d)\n", g_rd_id, g_rd_page,
+                  b36(have).c_str(), g_rd_have, g_rd_n);
+}
+
+// Repair, on the schedule §8 lays down: wait for the stream to go quiet, then answer in
+// a slot derived from this node's id so several readers do not all speak at once.
+static void book_tick()
+{
+    if (!g_rd_id[0] || !g_rd_n || g_rd_have >= g_rd_n) return;
+    uint32_t now = millis();
+    uint32_t toa = (uint32_t)(lora_radio.getTimeOnAir(79) / 1000);
+    if (toa < 200) toa = 200;
+
+    if (!g_rd_bn_due) {
+        uint32_t quiet = 3 * toa;
+        if (quiet < 8000) quiet = 8000;               // never chase a stream still running
+        if ((uint32_t)(now - g_rd_last_ms) < quiet) return;
+        if (g_rd_bn_try >= 2) {                       // two repairs did not close it
+            Serial.println("[book] repair twice, asking for the page again");
+            book_send_bq(g_rd_id, g_rd_page);
+            return;
+        }
+        uint32_t h = 2166136261u;
+        for (const char *c = NODE_ID; *c; c++) { h ^= (uint8_t)*c; h *= 16777619u; }
+        g_rd_bn_due = now + 4 * toa + (h % 16) * toa + (esp_random() % (toa / 2 + 1));
+        return;
+    }
+    if ((int32_t)(now - g_rd_bn_due) < 0) return;
+    g_rd_bn_due = 0;
+    g_rd_bn_try++;
+    book_send_bn();
+}
+
+// Render whatever of the page we hold. Gaps show as "..." so reading can start before
+// the last chunk lands, which is the point of a small transfer unit.
+static void book_render_page()
+{
+    if (!g_rd_body) return;
+    if (!g_rd_n) { lv_label_set_text(g_rd_body, "쪽 요청 중..."); }
+    else {
+        String t;
+        for (int i = 0; i < g_rd_n; i++) t += g_rd_seen[i] ? g_rd_chunk[i] : String("...");
+        t.replace("[NL]", "\n");
+        lv_label_set_text(g_rd_body, t.c_str());
+    }
+    if (g_rd_foot) {
+        int idx = book_find(String(g_rd_id));
+        int tot = idx >= 0 ? g_books[idx].pages : 0;
+        if (g_rd_n && g_rd_have < g_rd_n)
+            lv_label_set_text_fmt(g_rd_foot, "%d/%d쪽   조각 %d/%d", g_rd_page + 1, tot,
+                                  g_rd_have, g_rd_n);
+        else
+            lv_label_set_text_fmt(g_rd_foot, "%d/%d쪽", g_rd_page + 1, tot);
+    }
+}
+
+static void book_turn(int delta)
+{
+    int idx = book_find(String(g_rd_id));
+    if (idx < 0) return;
+    int np = g_rd_page + delta;
+    if (np < 0 || np >= (int)g_books[idx].pages) return;   // last page: forward does nothing
+    book_send_bq(g_rd_id, np);
+}
+
+static void book_show_reader()
+{
+    if (!g_book_root) return;
+    g_book_list = NULL;
+    lv_obj_clean(g_book_root);
+    lv_group_t *g = lv_group_get_default();
+    int idx = book_find(String(g_rd_id));
+
+    lv_obj_t *ttl = lv_label_create(g_book_root);
+    lv_obj_set_width(ttl, lv_pct(100));
+    lv_label_set_long_mode(ttl, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(ttl, &font_kr16, 0);
+    lv_obj_set_style_text_color(ttl, lv_color_hex(0xA5B4FC), 0);
+    lv_label_set_text(ttl, idx >= 0 ? g_books[idx].title : g_rd_id);
+
+    g_rd_scroll = lv_obj_create(g_book_root);
+    lv_obj_set_width(g_rd_scroll, lv_pct(100));
+    lv_obj_set_flex_grow(g_rd_scroll, 1);
+    lv_obj_set_style_bg_opa(g_rd_scroll, LV_OPA_0, 0);
+    lv_obj_set_style_border_width(g_rd_scroll, 0, 0);
+    lv_obj_set_style_pad_all(g_rd_scroll, 2, 0);
+    lv_obj_set_scroll_dir(g_rd_scroll, LV_DIR_VER);
+
+    g_rd_body = lv_label_create(g_rd_scroll);
+    lv_obj_set_width(g_rd_body, lv_pct(100));
+    lv_label_set_long_mode(g_rd_body, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(g_rd_body, &font_kr16, 0);
+
+    g_rd_foot = lv_label_create(g_book_root);
+    lv_obj_set_style_text_font(g_rd_foot, &font_kr16, 0);
+    lv_obj_set_style_text_color(g_rd_foot, lv_color_hex(0x9CA3AF), 0);
+
+    lv_obj_t *row = lv_obj_create(g_book_root);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_width(row, lv_pct(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *pv = lv_btn_create(row);
+    lv_label_set_text(lv_label_create(pv), LV_SYMBOL_LEFT);
+    lv_obj_add_event_cb(pv, [](lv_event_t *) { book_turn(-1); }, LV_EVENT_CLICKED, NULL);
+    lv_group_add_obj(g, pv);
+
+    lv_obj_t *sh = lv_btn_create(row);
+    lv_label_set_text(lv_label_create(sh), LV_SYMBOL_LIST);
+    lv_obj_add_event_cb(sh, [](lv_event_t *) { g_rd_id[0] = 0; book_show_shelf(); },
+                        LV_EVENT_CLICKED, NULL);
+    lv_group_add_obj(g, sh);
+
+    lv_obj_t *nx = lv_btn_create(row);
+    lv_label_set_text(lv_label_create(nx), LV_SYMBOL_RIGHT);
+    lv_obj_add_event_cb(nx, [](lv_event_t *) { book_turn(1); }, LV_EVENT_CLICKED, NULL);
+    lv_group_add_obj(g, nx);
+    lv_group_focus_obj(nx);
+
+    book_render_page();
+    lv_label_set_text(g_toast, LV_SYMBOL_LEFT LV_SYMBOL_RIGHT " 쪽 넘김   위아래로 스크롤");
+}
+
+static void book_open_cb(lv_event_t *e)
+{
+    int i = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+    if (i < 0 || i >= g_books_n) return;
+    book_show_reader();                       // build the view first, then ask for the page
+    book_send_bq(g_books[i].id, book_pos_get(g_books[i].id));
+}
+
+static void book_show_shelf()
+{
+    if (!g_book_root) return;
+    g_rd_body = g_rd_scroll = g_rd_foot = NULL;
+    lv_obj_clean(g_book_root);
+    lv_group_t *g = lv_group_get_default();
+
+    lv_obj_t *hdr = lv_label_create(g_book_root);
+    lv_obj_set_style_text_font(hdr, &font_kr16, 0);
+    lv_obj_set_style_text_color(hdr, lv_color_hex(0xA5B4FC), 0);
+    if (g_books_n)
+        lv_label_set_text_fmt(hdr, LV_SYMBOL_FILE "  서가  %d/%s권", g_books_n,
+                              g_book_count >= 0 ? String(g_book_count).c_str() : "?");
+    else
+        lv_label_set_text(hdr, LV_SYMBOL_FILE "  서가  (목록 요청 중...)");
+
+    g_book_list = lv_list_create(g_book_root);
+    lv_obj_set_width(g_book_list, lv_pct(100));
+    lv_obj_set_flex_grow(g_book_list, 1);
+    lv_obj_set_style_text_font(g_book_list, &font_kr16, 0);
+    for (int i = 0; i < g_books_n; i++) {
+        String row = String(g_books[i].title) + "\n읽음 " +
+                     String(book_pos_get(g_books[i].id) + 1) + "/" + String(g_books[i].pages) + "쪽";
+        lv_obj_t *b = lv_list_add_btn(g_book_list, LV_SYMBOL_FILE, row.c_str());
+        lv_obj_set_style_text_font(b, &font_kr16, 0);
+        lv_obj_set_user_data(b, (void *)(intptr_t)i);
+        lv_obj_add_event_cb(b, book_open_cb, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, b);
+    }
+
+    lv_obj_t *rf = lv_btn_create(g_book_root);
+    lv_label_set_text(lv_label_create(rf), LV_SYMBOL_REFRESH " Refresh");
+    lv_obj_add_event_cb(rf, [](lv_event_t *) { book_send_bl(); }, LV_EVENT_CLICKED, NULL);
+    lv_group_add_obj(g, rf);
+}
+
 static void lora_l1_dispatch(const String &line)
 {
     int t1 = line.indexOf('\t');
@@ -1700,6 +2124,10 @@ static void lora_l1_dispatch(const String &line)
     if (type == "GR") { news_head_handle(line);   return; }   // v1.8 article reply header
     if (type == "GD") { news_data_handle(line);   return; }   // v1.5 article body chunk
     if (type == "AL") { alert_handle(line);       return; }   // v1.8 disaster alert
+    if (type == "BC") { book_handle_bc(line);     return; }   // v1.10 book catalogue
+    if (type == "BT") { book_handle_bt(line);     return; }
+    if (type == "BR") { book_handle_br(line);     return; }   // page header
+    if (type == "BD") { book_handle_bd(line);     return; }   // page chunk
     Serial.printf("[L1 %s] %s\n", type.c_str(), line.c_str()); // !CS/!SYS/!AL/… → drop
 }
 
@@ -2880,6 +3308,19 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         if (!g_disc_timer) g_disc_timer = lv_timer_create(discovery_poll_cb, 1000, NULL);
         discovery_poll_cb(NULL);              // paint immediately from the warm table
         lv_label_set_text(g_toast, LV_SYMBOL_LIST " who's alive on the mesh");
+    } else if (strcmp(name, "Books") == 0) {
+        lora_init();
+        g_book_root = lv_obj_create(parent);
+        lv_obj_remove_style_all(g_book_root);
+        lv_obj_set_width(g_book_root, lv_pct(100));
+        lv_obj_set_flex_grow(g_book_root, 1);
+        lv_obj_set_flex_flow(g_book_root, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(g_book_root, 6, 0);
+        lv_obj_clear_flag(g_book_root, LV_OBJ_FLAG_SCROLLABLE);
+        book_show_shelf();
+        // Ask once, and only when there is nothing to show. Never on a timer: a catalogue
+        // costs (count+1) relayed frames and the mesh carries alerts on the same channel.
+        if (!g_books_n) book_send_bl();
     } else if (strcmp(name, "Alert") == 0) {
         lora_init();
         lv_obj_t *hdr = lv_label_create(parent);
@@ -2990,6 +3431,8 @@ static void go_home()
     if (g_disc_timer)      { lv_timer_del(g_disc_timer);      g_disc_timer = NULL; }
     g_disc_lbl = NULL;
     g_alert_list = NULL;
+    g_book_root = NULL; g_book_list = NULL;
+    g_rd_body = NULL; g_rd_scroll = NULL; g_rd_foot = NULL;
     g_news_root = NULL; g_news_list = NULL; g_art_body = NULL; g_art_scroll = NULL; g_art_id[0] = 0;  // News views torn down (inbox data persists)
     if (g_notes_ta) {                                  // auto-save notes on leave
         Preferences p;
@@ -3215,10 +3658,12 @@ static void alert_list_render()
     }
 }
 
+
 static void news_tick()
 {
     uint32_t now = millis();
     tts_pump();                     // keep the speech queue moving, one line at a time
+    book_tick();                    // page repair, on the quiet-gap + slot schedule
 
     if (g_alert_announce_req) {
         g_alert_announce_req = false;
@@ -3374,6 +3819,7 @@ static void boot_restore()
     g_beep_vol  = p.getUChar("beepvol", 7);
     g_gps_enabled = p.getBool("gpsen", true);
     g_tts_enabled = p.getBool("tts", true);
+    book_load();
     g_audio_vol   = p.getUChar("ttsvol", 2);   // fresh NVS must come up QUIET, not full scale
     if (g_audio_vol > 10) g_audio_vol = 10;
     // remember which alert we already announced, so a reboot inside a live alert is silent
@@ -3444,6 +3890,15 @@ void setup()
     delay(20);
     Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
 
+    // A GT911 put to sleep stays asleep across an ESP32 reset, and with no RST wired
+    // (setPins passes -1) begin() cannot bring it back — so a reset taken while power
+    // save had the touch chip down left the panel without touch entirely. Toggle INT
+    // the way the driver's wakeup() does before probing.
+    pinMode(BOARD_TOUCH_INT, OUTPUT);
+    digitalWrite(BOARD_TOUCH_INT, HIGH);
+    delay(10);
+    pinMode(BOARD_TOUCH_INT, INPUT);
+    delay(60);
     touch.setPins(-1, BOARD_TOUCH_INT);
     if (!touch.begin(Wire, GT911_SLAVE_ADDRESS_L)) {
         Serial.println("GT911 not found - check wiring (display still works)");
