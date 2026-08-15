@@ -175,6 +175,9 @@ static String        g_art_chunk[ART_MAX_CHUNKS];
 static lv_obj_t     *g_art_body = NULL;         // article body label (non-NULL only in article view)
 static lv_obj_t     *g_art_scroll = NULL;       // article scroll container — trackball scrolls this by line
 static lv_obj_t     *g_rd_scroll  = NULL;       // book page scroll container — likewise
+static volatile bool g_rd_next_req = false;    // rolled past the end: fetch the next page
+static int           g_rd_n        = 0;        // chunks in the open page (0 = !BR not seen yet)
+static int           g_rd_have     = 0;        // how many of them have arrived
 static String        g_art_crc;                 // v1.8: crc32 of the whole body, from !GR
 static uint32_t      g_art_last_ms = 0;         // last !GR/!GD seen — idle detection for !GN
 static uint32_t      g_art_gn_ms   = 0;         // rate-limit our !GN repair requests
@@ -425,6 +428,10 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
                                    : lv_obj_get_scroll_top(scroll_tgt);
         if (room < 0) room = 0;
         if ((dy < 0 ? -dy : dy) > room) dy = (dy < 0) ? -room : room;
+        // Rolling on at the end of a book page turns it. Only once the page is whole:
+        // advancing off a half-received page would skip text that is still on its way.
+        if (!dy && diff > 0 && scroll_tgt == g_rd_scroll && g_rd_n && g_rd_have >= g_rd_n)
+            g_rd_next_req = true;
         if (dy) lv_obj_scroll_by(scroll_tgt, 0, dy, LV_ANIM_OFF);
         data->enc_diff = 0;
     } else {
@@ -1719,11 +1726,9 @@ static int           g_bt_pend_n = 0;
 
 static char          g_rd_id[6]   = "";   // book open in the reader ("" = shelf)
 static int           g_rd_page    = 0;
-static int           g_rd_n       = 0;    // chunks in this page (0 = !BR not seen yet)
 static char          g_rd_crc[10] = "";
 static String        g_rd_chunk[BOOK_PAGE_MAX];
 static bool          g_rd_seen[BOOK_PAGE_MAX];
-static int           g_rd_have    = 0;
 static uint32_t      g_rd_last_ms = 0;    // last !BD, for the quiet-gap test
 static uint8_t       g_rd_bn_try  = 0;
 static uint32_t      g_rd_bn_due  = 0;    // scheduled !BN (slot rule, PROTOCOL.md §8)
@@ -1934,6 +1939,8 @@ static void book_send_bq(const char *id, int page)
     strncpy(g_rd_id, id, sizeof(g_rd_id) - 1);
     g_rd_page = page;
     book_page_reset();
+    g_rd_next_req = false;
+    if (g_rd_scroll) lv_obj_scroll_to_y(g_rd_scroll, 0, LV_ANIM_OFF);   // read from the top
     lora_tx_line("!BQ\t" + String(id) + "\t" + b36((uint32_t)page) + "\n");
     lora_radio.startReceive();
     book_render_page();
@@ -1956,6 +1963,10 @@ static void book_send_bn()
 // a slot derived from this node's id so several readers do not all speak at once.
 static void book_tick()
 {
+    if (g_rd_next_req) {            // asked for by the scroll, sent from here: !BQ blocks
+        g_rd_next_req = false;
+        book_turn(1);
+    }
     if (!g_rd_id[0] || !g_rd_n || g_rd_have >= g_rd_n) return;
     uint32_t now = millis();
     uint32_t toa = (uint32_t)(lora_radio.getTimeOnAir(79) / 1000);
