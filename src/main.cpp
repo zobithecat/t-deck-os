@@ -192,6 +192,8 @@ static int           g_rd_n        = 0;        // chunks in the open page (0 = !
 static int           g_rd_have     = 0;        // how many of them have arrived
 static int           g_rd_page     = 0;        // page open in the reader
 static String        g_art_crc;                 // v1.8: crc32 of the whole body, from !GR
+static volatile bool g_art_crc_req = false;     // checked bad; re-fetch from news_tick
+static uint8_t       g_art_crc_try = 0;         // ...at most twice, then stop and say so
 static uint32_t      g_art_last_ms = 0;         // last !GR/!GD seen — idle detection for !GN
 static uint32_t      g_art_gn_ms   = 0;         // rate-limit our !GN repair requests
 static String        g_lora_compose;    // committed Korean text (preview appended on display)
@@ -1494,12 +1496,12 @@ static void news_data_handle(const String &line)
     if (g_art_have < g_art_total || !g_art_crc.length()) return;
     String body;
     for (int k = 0; k < g_art_total; k++) body += g_art_chunk[k];   // as sent, before [NL]
-    if (crc32_of(body) == unb36(g_art_crc)) return;
-    Serial.println("[news] article crc mismatch, re-requesting");
-    for (int k = 0; k < ART_MAX_CHUNKS; k++) { g_art_seen[k] = false; g_art_chunk[k] = ""; }
-    g_art_total = 0; g_art_have = 0; g_art_gn_ms = 0;   // clear, or the resent chunks
-    g_news_gq_ms = 0;                                   // land as "already seen"
-    news_send_gq();
+    if (crc32_of(body) == unb36(g_art_crc)) { g_art_crc_try = 0; return; }
+    // Asked for from news_tick, not sent from here: a !GQ blocks the radio for about a
+    // second, and this runs inside the RX drain loop -- transmitting from in there means
+    // going deaf in the middle of reading the air.
+    Serial.printf("[news] article crc mismatch (try %u)\n", (unsigned)g_art_crc_try + 1);
+    g_art_crc_req = true;
 }
 
 // v1.8 !GR\t<art_id>\t<n>\t<crc> — reply header: chunk count + crc32 of the whole body.
@@ -1775,6 +1777,11 @@ static void news_show_article(const char *art_id, const char *title)
     g_news_list = NULL;
     strncpy(g_art_id, art_id, sizeof(g_art_id) - 1); g_art_id[sizeof(g_art_id) - 1] = 0;
     g_art_total = 0; g_art_have = 0;
+    // The crc belongs to the article that carried it. Leaving the last one here meant a
+    // new article whose !GR went missing -- and about one frame in twelve is arriving
+    // damaged -- got checked against the PREVIOUS article's crc, failed for ever, and
+    // re-requested itself every twenty seconds with no way out. That is the freeze.
+    g_art_crc = ""; g_art_crc_req = false; g_art_crc_try = 0;
     for (int k = 0; k < ART_MAX_CHUNKS; k++) { g_art_seen[k] = false; g_art_chunk[k] = ""; }
 
     lv_obj_clean(g_news_root);
@@ -2568,7 +2575,9 @@ static void lora_tx_ttl(const String &payload, uint8_t ttl)
     // frames it was spent on are !GN and !BN, sent precisely when a stream we are
     // trying not to miss any more of is still in the air.
     lora_radio.startReceive();
-    delay(lora_radio.getTimeOnAir(w.length()) / 500 + 50);
+    // Nothing relays a ttl-1 frame, so there is no half-duplex hop to make room for and
+    // the settle is pure cost — a second of frozen UI every time the beacon fires.
+    if (ttl > RELAY_TTL_LOCAL) delay(lora_radio.getTimeOnAir(w.length()) / 500 + 50);
 }
 
 static void lora_tx_line(const String &payload) { lora_tx_ttl(payload, RELAY_TTL_MESH); }
@@ -3970,6 +3979,23 @@ static void news_tick()
     uint32_t now = millis();
     tts_pump();                     // keep the speech queue moving, one line at a time
     book_tick();                    // page repair, on the quiet-gap + slot schedule
+
+    // The article arrived whole and wrong. Bytes are damaged, not missing, so !GN is the
+    // wrong instrument -- it asks for what never came and the bad chunk is not among
+    // them. Drop it all and pull the article again. TWICE, and then stop: a check that
+    // re-fetches for ever on a mismatch it cannot fix is worse than the corruption, and
+    // costs twenty seconds of everyone's air per round.
+    if (g_art_crc_req) {
+        g_art_crc_req = false;
+        if (++g_art_crc_try > 2) {
+            if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_WARNING " 본문 손상 - Re-req로 다시");
+        } else {
+            for (int k = 0; k < ART_MAX_CHUNKS; k++) { g_art_seen[k] = false; g_art_chunk[k] = ""; }
+            g_art_total = 0; g_art_have = 0;      // clear, or the resent chunks land as
+            g_art_gn_ms = 0; g_news_gq_ms = 0;    // "already seen" on top of the bad one
+            news_send_gq();
+        }
+    }
 
     if (g_alert_announce_req) {
         g_alert_announce_req = false;
