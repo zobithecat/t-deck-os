@@ -90,6 +90,7 @@ static volatile bool g_lora_rx_flag = false;
 static uint32_t g_rx_ok = 0, g_rx_bad = 0, g_rx_corrupt = 0;
 static int      g_rx_rssi_last = 0;
 static float    g_rx_snr_last  = 0;
+static uint32_t g_stream_ms    = 0;   // last !GD/!BD in: nothing of ours may transmit near it
 static bool          g_lora_ok = false;
 static lv_obj_t     *g_lora_log;
 static lv_obj_t     *g_lora_input;
@@ -1410,7 +1411,9 @@ static void lora_emit_msg(String msg)
 // News UI is a small state machine inside g_news_root: LIST ⇄ ARTICLE. Views rebuild
 // that container (never g_app_view — the framework Back button lives there).
 static void lora_tx_line(const String &payload);   // defined below; used by news_send_gq()
-static String b36(uint32_t n);                     // the one base36 encoder (books section)
+static String   b36(uint32_t n);                   // the one base36 encoder (books section)
+static uint32_t unb36(const String &s);
+static uint32_t crc32_of(const String &s);         // zlib-compatible, over chunks AS SENT
 static void news_show_list();
 static void news_show_article(const char *art_id, const char *title);
 static void news_send_gq();
@@ -1468,8 +1471,26 @@ static void news_data_handle(const String &line)
     if (!g_art_seen[i]) { g_art_seen[i] = true; g_art_have++; g_art_chunk[i] = line.substring(t3 + 1); }
     Serial.printf("[rx] GD %d/%d  %d dBm  %.1f dB  +%lums\n", i, n, g_rx_rssi_last,
                   g_rx_snr_last, (unsigned long)(millis() - g_art_last_ms));
-    g_art_last_ms = millis();
+    g_art_last_ms = g_stream_ms = millis();
     news_art_render();
+
+    // Check the article end to end, the way a page is checked. !GR has carried this crc
+    // since v1.8 and nothing was doing anything with it: an article could arrive with a
+    // chunk quietly mangled in the air -- PHY CRC is off (D2), so nothing else would
+    // catch it -- and be displayed as if it were the text.
+    //
+    // A mismatch means bytes are WRONG, not missing, so !GN is the wrong instrument: it
+    // asks for what never arrived and the corrupt chunk would not be among them. The
+    // buffer is dropped and the whole article re-requested.
+    if (g_art_have < g_art_total || !g_art_crc.length()) return;
+    String body;
+    for (int k = 0; k < g_art_total; k++) body += g_art_chunk[k];   // as sent, before [NL]
+    if (crc32_of(body) == unb36(g_art_crc)) return;
+    Serial.println("[news] article crc mismatch, re-requesting");
+    for (int k = 0; k < ART_MAX_CHUNKS; k++) { g_art_seen[k] = false; g_art_chunk[k] = ""; }
+    g_art_total = 0; g_art_have = 0; g_art_gn_ms = 0;   // clear, or the resent chunks
+    g_news_gq_ms = 0;                                   // land as "already seen"
+    news_send_gq();
 }
 
 // v1.8 !GR\t<art_id>\t<n>\t<crc> — reply header: chunk count + crc32 of the whole body.
@@ -1679,16 +1700,26 @@ static void news_send_gq()
 {
     if (!g_art_id[0] || !g_lora_ok) return;
     // One stream is ~50 s of everyone's airtime, so it gets the same guard !GL has —
-    // tapping list↔article or mashing Re-req must not stack streams on the router.
+    // tapping list<->article or mashing Re-req must not stack streams on the router.
+    //
+    // Per ARTICLE, though. The guard used to be a single timestamp with no id against
+    // it, so it did not fire on the thing it was written for and did fire on the thing
+    // it was not: after reading one article, opening a DIFFERENT one inside 45 s was
+    // refused, and all the reader got was a toast. That is the whole of "the first
+    // article comes and from the second on there is no body" -- the request was never
+    // sent. Asking for another article is a new intent; asking for the same one twice
+    // is the mash this exists to absorb.
+    static char gq_id[8] = "";
     uint32_t now = millis();
-    if (g_news_gq_ms && (uint32_t)(now - g_news_gq_ms) < 45000) {
+    if (g_news_gq_ms && !strcmp(gq_id, g_art_id) && (uint32_t)(now - g_news_gq_ms) < 45000) {
         if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_REFRESH " already requested - waiting");
         return;
     }
+    strncpy(gq_id, g_art_id, sizeof(gq_id) - 1); gq_id[sizeof(gq_id) - 1] = 0;
     g_news_gq_ms = now;
     g_art_gn_ms = 0;
     lora_tx_line("!GQ\t" + String(g_art_id) + "\n");      // ttl=3, reaches the multi-hop edge router
-    lora_radio.startReceive();                            // listen for the !GR/!GD stream
+    Serial.printf("[news] GQ %s\n", g_art_id);
 }
 
 // LIST view: header + a tappable button per headline.
@@ -1999,7 +2030,7 @@ static void book_handle_bd(const String &line)
     if (!g_rd_seen[i]) { g_rd_seen[i] = true; g_rd_have++; g_rd_chunk[i] = line.substring(t[3] + 1); }
     Serial.printf("[rx] BD %d/%d  %d dBm  %.1f dB  +%lums\n", i, g_rd_n, g_rx_rssi_last,
                   g_rx_snr_last, (unsigned long)(millis() - g_rd_last_ms));
-    g_rd_last_ms = millis();
+    g_rd_last_ms = g_stream_ms = millis();
     g_rd_bn_due  = 0;                       // traffic is flowing; the quiet gap restarts
     // ...unless that was the last chunk of the page. The router sends a page in order,
     // once, so anything still missing when chunk n-1 lands is definitively lost — there
@@ -2508,9 +2539,9 @@ static void lora_service()            // always-on background RX (called from lo
     }
 }
 
-static void lora_tx_line(const String &payload)
+static void lora_tx_ttl(const String &payload, uint8_t ttl)
 {
-    String w = relay_wrap(payload, RELAY_TTL_MESH);
+    String w = relay_wrap(payload, ttl);
     lora_radio.transmit(w.c_str());
     // ~2x ToA gap so the half-duplex relay can RX+forward this packet before the next.
     // Listen through it. transmit() leaves the radio in standby, so this wait used to
@@ -2519,6 +2550,29 @@ static void lora_tx_line(const String &payload)
     // trying not to miss any more of is still in the air.
     lora_radio.startReceive();
     delay(lora_radio.getTimeOnAir(w.length()) / 500 + 50);
+}
+
+static void lora_tx_line(const String &payload) { lora_tx_ttl(payload, RELAY_TTL_MESH); }
+
+// PROTOCOL.md §5: every node beacons once a minute at ttl 1, so the rest of the mesh can
+// hold a neighbour table instead of only seeing this device when it asks for something.
+// ttl 1 = RELAY_TTL_LOCAL: a beacon that was relayed would say a node is next door when
+// it is two hops away, and §6 keeps endpoints out of the forwarding path regardless.
+//
+// Never while a stream is landing. This is a second of transmitting and settling, and
+// the frames it would step on are the ones the rest of this pass exists to stop losing.
+static void lora_hb_tick()
+{
+    if (!g_lora_ok || g_range_active) return;
+    static uint32_t last = 0;
+    uint32_t now = millis();
+    if (now < 15000) return;                                  // let the radio settle first
+    if (last && (uint32_t)(now - last) < 60000) return;
+    if (g_stream_ms && (uint32_t)(now - g_stream_ms) < 5000) return;   // wait it out
+    last = now;
+    String hb = String("HB\t") + NODE_ID;
+    if (g_rx_rssi_last) hb += "\trssi=" + String(g_rx_rssi_last);
+    lora_tx_ttl(hb + "\n", RELAY_TTL_LOCAL);
 }
 
 static void lora_send(const char *text)
@@ -4466,6 +4520,7 @@ void loop()
     lv_timer_handler();
     gps_feed();        // keep the NMEA parser fed regardless of which app is open
     lora_service();    // always-on LoRa RX so messages arrive even with the app closed
+    lora_hb_tick();    // 60 s beacon, ttl 1, never on top of an arriving stream
     news_tick();       // deferred announce (chime + speech + hijack), repair, expiry
 
     // How the last second of drawing went. Only while the screen is genuinely busy —
