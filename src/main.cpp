@@ -2017,7 +2017,18 @@ static void book_render_page()
     else {
         String t;
         for (int i = 0; i < n; i++) t += g_rd_seen[i] ? g_rd_chunk[i] : String("...");
-        t.replace("[NL]", "\n");
+        // Reflow. The router keeps the source's line structure, so a blank line arrives
+        // as two [NL] in a row and a hard-wrapped line as one. The original's wrapping was
+        // for a wider page than this: the label wraps for itself, so single breaks become
+        // spaces and blank lines become paragraphs. A page with no blank line at all is
+        // one whose single breaks ARE its paragraphs, and those are left alone.
+        if (t.indexOf("[NL][NL]") >= 0) {
+            t.replace("[NL][NL]", "\x01");
+            t.replace("[NL]", " ");
+            t.replace("\x01", "\n\n");
+        } else {
+            t.replace("[NL]", "\n");
+        }
         lv_label_set_text(g_rd_body, t.c_str());
     }
     if (g_rd_land_bottom && g_rd_n && g_rd_have >= g_rd_n && g_rd_scroll) {
