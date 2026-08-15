@@ -2108,6 +2108,7 @@ static void book_tick()
     g_rd_bn_due = 0;
     g_rd_bn_try++;
     book_send_bn();
+    book_render_page();   // the hint line carries the repair count
 }
 
 // Turn the wire's [NL] markers into the breaks this screen wants.
@@ -2187,14 +2188,28 @@ static void book_render_page()
     }
     if (g_rd_foot) {
         int idx = book_find(String(g_rd_id));
-        int tot = idx >= 0 ? g_books[idx].pages : 0;
-        // The body says nothing about what is missing now, so the footer does: which
-        // chunks are still out is the reason the page stops where it stops.
-        if (g_rd_n && g_rd_have < g_rd_n)
-            lv_label_set_text_fmt(g_rd_foot, "%d/%d쪽   %d/%d 수신", g_rd_page + 1, tot,
-                                  g_rd_have, g_rd_n);
+        lv_label_set_text_fmt(g_rd_foot, "%d/%d쪽", g_rd_page + 1,
+                              idx >= 0 ? g_books[idx].pages : 0);
+    }
+    // The transfer goes on the hint line at the bottom. The page stopping short is
+    // otherwise indistinguishable from the page having ended, and there is no button
+    // left on this screen to ask what happened — so the line that would just be
+    // repeating the controls says what the radio is doing instead.
+    if (g_toast) {
+        String s;
+        if (!g_rd_n && !upto)
+            s = g_rd_bq_try ? "응답 없음 - 다시 요청 " + String((int)g_rd_bq_try) + "회"
+                            : LV_SYMBOL_DOWNLOAD " 쪽 요청 중...";
+        else if (!g_rd_n)
+            s = LV_SYMBOL_DOWNLOAD " 청크 " + String(g_rd_have) + "개 (쪽 크기 미상)";
+        else if (g_rd_have < g_rd_n)
+            s = LV_SYMBOL_DOWNLOAD " 청크 " + String(g_rd_have) + "/" + String(g_rd_n) +
+                (g_rd_bn_try   ? "   빠진 조각 재요청 " + String((int)g_rd_bn_try) + "회"
+                 : upto < g_rd_have ? "   빠진 조각 대기" : "");
         else
-            lv_label_set_text_fmt(g_rd_foot, "%d/%d쪽", g_rd_page + 1, tot);
+            s = "굴려서 읽기   끝까지 굴리면 다음 쪽";
+        const char *t = lv_label_get_text(g_toast);
+        if (!t || s != t) lv_label_set_text(g_toast, s.c_str());
     }
 }
 
@@ -2243,8 +2258,7 @@ static void book_show_reader()
     lv_obj_set_style_text_font(g_rd_foot, &font_kr16, 0);
     lv_obj_set_style_text_color(g_rd_foot, lv_color_hex(0x9CA3AF), 0);
 
-    book_render_page();
-    lv_label_set_text(g_toast, "굴려서 읽기   끝까지 굴리면 다음 쪽");
+    book_render_page();   // ...which sets the hint line: it knows the transfer state
 }
 
 static void book_open_cb(lv_event_t *e)
