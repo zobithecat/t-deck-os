@@ -82,6 +82,14 @@ static lv_timer_t   *g_browser_timer;
 static bool          g_audio_inited;
 static SX1262        lora_radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
 static volatile bool g_lora_rx_flag = false;
+// PHY CRC is off by doctrine (D2 — the DX-LR02 pager runs without it), so a packet
+// mangled in the air is handed to us looking like any other and dies silently when the
+// R| header fails to parse. From the far end that is indistinguishable from never
+// having heard it, which is why a downlink can appear to lose 40% with a clean link
+// and a clean uplink. These counters are the only way to tell the two apart from here.
+static uint32_t g_rx_ok = 0, g_rx_bad = 0, g_rx_corrupt = 0;
+static int      g_rx_rssi_last = 0;
+static float    g_rx_snr_last  = 0;
 static bool          g_lora_ok = false;
 static lv_obj_t     *g_lora_log;
 static lv_obj_t     *g_lora_input;
@@ -1402,6 +1410,7 @@ static void lora_emit_msg(String msg)
 // News UI is a small state machine inside g_news_root: LIST ⇄ ARTICLE. Views rebuild
 // that container (never g_app_view — the framework Back button lives there).
 static void lora_tx_line(const String &payload);   // defined below; used by news_send_gq()
+static String b36(uint32_t n);                     // the one base36 encoder (books section)
 static void news_show_list();
 static void news_show_article(const char *art_id, const char *title);
 static void news_send_gq();
@@ -1457,6 +1466,8 @@ static void news_data_handle(const String &line)
         g_art_total = n; g_art_have = 0;
     }
     if (!g_art_seen[i]) { g_art_seen[i] = true; g_art_have++; g_art_chunk[i] = line.substring(t3 + 1); }
+    Serial.printf("[rx] GD %d/%d  %d dBm  %.1f dB  +%lums\n", i, n, g_rx_rssi_last,
+                  g_rx_snr_last, (unsigned long)(millis() - g_art_last_ms));
     g_art_last_ms = millis();
     news_art_render();
 }
@@ -1490,12 +1501,15 @@ static void news_send_gn()
     g_art_gn_ms = now;
     uint32_t bits = 0;                                    // ART_MAX_CHUNKS <= 48; 32 fit a word
     for (int i = 0; i < g_art_total && i < 32; i++) if (g_art_seen[i]) bits |= (1u << i);
-    char b36[8]; int p = 0;                               // base36, LSB = chunk 0
-    if (!bits) b36[p++] = '0';
-    while (bits && p < 7) { int d = bits % 36; b36[p++] = d < 10 ? ('0' + d) : ('A' + d - 10); bits /= 36; }
-    b36[p] = 0;
-    lora_tx_line("!GN\t" + String(g_art_id) + "\t" + String(b36) + "\n");
-    lora_radio.startReceive();
+    // b36(), not a hand-rolled loop. The loop that used to be here emitted the digits
+    // least-significant FIRST -- a reversed number. The router decodes the field with
+    // int(s, 36), so it read a completely different set of have-bits and resent chunks
+    // we already had while the ones we were missing never came again. An article that
+    // lost even one chunk could not finish, which is exactly what it looked like from
+    // the outside: the first article fine, and from then on no body at all.
+    lora_tx_line("!GN\t" + String(g_art_id) + "\t" + b36(bits) + "\n");
+    Serial.printf("[news] GN %s have=%s (%d/%d)\n", g_art_id, b36(bits).c_str(),
+                  g_art_have, g_art_total);
 }
 
 // v1.8 !AL — disaster alert. Chime, speak, and pull the user to the News app from
@@ -1983,6 +1997,8 @@ static void book_handle_bd(const String &line)
     int i = (int)unb36(line.substring(t[2] + 1, t[3]));
     if (i < 0 || i >= BOOK_PAGE_MAX) return;
     if (!g_rd_seen[i]) { g_rd_seen[i] = true; g_rd_have++; g_rd_chunk[i] = line.substring(t[3] + 1); }
+    Serial.printf("[rx] BD %d/%d  %d dBm  %.1f dB  +%lums\n", i, g_rd_n, g_rx_rssi_last,
+                  g_rx_snr_last, (unsigned long)(millis() - g_rd_last_ms));
     g_rd_last_ms = millis();
     g_rd_bn_due  = 0;                       // traffic is flowing; the quiet gap restarts
     // ...unless that was the last chunk of the page. The router sends a page in order,
@@ -2437,10 +2453,15 @@ static void lora_rx_dispatch(const String &line)
             nm = (p2 < 0) ? orig.substring(p1 + 1) : orig.substring(p1 + 1, p2);
         }
         neigh_update(src, nm, g_lora_rx_rssi, hops);
+        g_rx_ok++;
         lora_process_line(orig);
+        return;
     }
     // else: not a valid R| line = RF corruption (CRC is off; all real traffic is
     // wrapped now) → DROP, so a mangled relayed copy can't pollute/break the frame.
+    g_rx_corrupt++;
+    Serial.printf("[rx] corrupt %d dBm %.1f dB: %.32s\n", g_rx_rssi_last, g_rx_snr_last,
+                  line.c_str());
 }
 
 static int lora_init()
@@ -2464,17 +2485,26 @@ static void lora_service()            // always-on background RX (called from lo
     while (g_lora_rx_flag && guard++ < 6) {     // drain bursts so fast SF9 packets don't pile up/corrupt
         g_lora_rx_flag = false;
         String pkt;
-        if (lora_radio.readData(pkt) == RADIOLIB_ERR_NONE && pkt.length()) {
-            g_lora_rx_rssi = (int)lora_radio.getRSSI();  // for the discovery table
-            int start = 0, len = pkt.length();           // split payload into newline-delimited lines
-            for (int i = 0; i <= len; i++) {
-                if (i == len || pkt[i] == '\n' || pkt[i] == '\r') {
-                    if (i > start) lora_rx_dispatch(pkt.substring(start, i));
-                    start = i + 1;
-                }
+        int  st  = lora_radio.readData(pkt);
+        int  rs  = (int)lora_radio.getRSSI();
+        float sn = lora_radio.getSNR();
+        // Back to listening BEFORE the line is parsed, stored and drawn. RadioLib's
+        // readData() drops the radio into standby, so everything that happened between
+        // there and the old startReceive() at the bottom of this loop happened deaf —
+        // the whole dispatch, including a full re-wrap of the article label. The next
+        // chunk of a stream is ~0.5 s behind this one; none of that work belongs
+        // inside the window.
+        lora_radio.startReceive();
+        if (st != RADIOLIB_ERR_NONE || !pkt.length()) { g_rx_bad++; continue; }
+        g_lora_rx_rssi = rs;                         // for the discovery table
+        g_rx_rssi_last = rs; g_rx_snr_last = sn;
+        int start = 0, len = pkt.length();           // split payload into newline-delimited lines
+        for (int i = 0; i <= len; i++) {
+            if (i == len || pkt[i] == '\n' || pkt[i] == '\r') {
+                if (i > start) lora_rx_dispatch(pkt.substring(start, i));
+                start = i + 1;
             }
         }
-        lora_radio.startReceive();
     }
 }
 
@@ -2482,7 +2512,12 @@ static void lora_tx_line(const String &payload)
 {
     String w = relay_wrap(payload, RELAY_TTL_MESH);
     lora_radio.transmit(w.c_str());
-    // ~2x ToA gap so the half-duplex relay can RX+forward this packet before the next
+    // ~2x ToA gap so the half-duplex relay can RX+forward this packet before the next.
+    // Listen through it. transmit() leaves the radio in standby, so this wait used to
+    // be a second of deliberate deafness on top of the transmission itself — and the
+    // frames it was spent on are !GN and !BN, sent precisely when a stream we are
+    // trying not to miss any more of is still in the air.
+    lora_radio.startReceive();
     delay(lora_radio.getTimeOnAir(w.length()) / 500 + 50);
 }
 
@@ -4448,6 +4483,23 @@ void loop()
         g_perf_frames = g_perf_ms = g_perf_px = 0;
         g_perf_tb = 0;
         perf_ms = now;
+    }
+    // Reception, since boot, whenever it has moved. `corrupt` is the number that
+    // settles the argument the router cannot settle from its end: those are packets we
+    // DID hear and could not use. Loss with corrupt at zero is a deaf receiver; loss
+    // with corrupt climbing is the air, and with PHY CRC off nothing else can tell.
+    static uint32_t rx_seen = 0, rx_ms = 0;
+    if ((uint32_t)(now - rx_ms) > 5000) {
+        uint32_t tot = g_rx_ok + g_rx_corrupt + g_rx_bad;
+        if (tot != rx_seen) {
+            Serial.printf("[rx] ok %lu  corrupt %lu  readfail %lu  (%lu%% unusable)  last %d dBm %.1f dB\n",
+                          (unsigned long)g_rx_ok, (unsigned long)g_rx_corrupt,
+                          (unsigned long)g_rx_bad,
+                          (unsigned long)(100 * (g_rx_corrupt + g_rx_bad) / (tot ? tot : 1)),
+                          g_rx_rssi_last, g_rx_snr_last);
+            rx_seen = tot;
+        }
+        rx_ms = now;
     }
     delay(1);          // yield to the idle task; 5 ms here was a tenth of a frame
 }
