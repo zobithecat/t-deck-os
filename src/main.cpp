@@ -379,8 +379,7 @@ static void tb_flush()   // drop motion made while nothing was watching (wake, v
 #define TB_SCROLL_PX(a)  (3 + 2 * (a))
 #define TB_FOCUS_DIV(a)  (5 - (a) > 1 ? 5 - (a) : 1)
 #define TB_SCROLL_MAX_PX 72     // ceiling per read: a flick may not throw the page away
-#define TB_PAGE_OVER_PX  120    // roll this far past the end of a page and it turns
-#define TB_PAGE_IDLE_MS  1200   // ...counted across flicks, until the ball rests this long
+#define TB_PAGE_REARM_MS 700    // one roll may turn one page, not walk through the book
 static lv_obj_t *g_edit_slider = NULL;   // slider engaged for left/right adjust
 static lv_obj_t *g_sd_view_ta  = NULL;   // file-viewer textarea: trackball scrolls it by line
 
@@ -488,37 +487,24 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
         if ((dy < 0 ? -dy : dy) > room) dy = (dy < 0) ? -room : room;
         if (dy) lv_obj_scroll_by(scroll_tgt, 0, dy, LV_ANIM_OFF);
 
-        // Keep rolling once the page has nowhere left to go and it turns. What counts is
-        // the travel THROWN AWAY at the end, not time spent there. A flick that only just
-        // reaches the bottom must not also turn the page and take the lines it has this
-        // moment brought into view — but nor may the reader be made to hold one unbroken
-        // roll: real flicks are short and come in twos and threes, and measuring time
-        // started the wait over on every one of them, so the page never turned at all.
-        // Over-travel adds up across flicks; a pause of TB_PAGE_IDLE_MS ends the gesture.
+        // Roll past the end of the page and it turns, on the first read that finds
+        // nowhere left to go. `room` is measured BEFORE this read's scroll, so the read
+        // that lands on the last line still had room and does not fire — the ball has to
+        // still be moving that way afterwards. That is the whole guard, and it is enough:
+        // asking for more once there is demonstrably nothing left is not a mistake anyone
+        // makes by accident. Two earlier attempts to be cleverer about it (hold 350 ms,
+        // then spend 120 px of over-travel) both read as the reader simply stopping dead.
         //
-        // Only a read that saw motion may touch this. A still ball gives vy == 0, which
-        // makes `room` the room in the OTHER direction, so testing it on a quiet read
-        // would throw the count away in the gap between two flicks.
-        static int8_t   over_dir = 0;
-        static int16_t  over     = 0;   // scroll pixels asked for past the end of the page
-        static uint32_t over_ms  = 0;
-        if (vy && scroll_tgt == g_rd_scroll && g_rd_n && g_rd_have >= g_rd_n) {
-            int8_t d = (vy > 0) ? +1 : -1;
-            if (room > 0) {
-                over = 0; over_dir = 0;                 // still text to read: nothing wasted
-            } else {
-                if (over_dir != d || (uint32_t)(now - over_ms) > TB_PAGE_IDLE_MS) {
-                    over_dir = d; over = 0;
-                }
-                over_ms = now;
-                over   += (int16_t)(px < 0 ? -px : px);
-                if (over >= TB_PAGE_OVER_PX) {
-                    over = 0;
-                    Serial.printf("[book] rolled %s past the end -> turn\n", d > 0 ? "down" : "up");
-                    if (d > 0)                 g_rd_next_req = true;
-                    else if (g_rd_page > 0)    g_rd_prev_req = true;
-                }
-            }
+        // Only a read that saw motion may test this: a still ball gives vy == 0, which
+        // makes `room` the room in the OTHER direction.
+        static uint32_t turn_ms = 0;
+        if (vy && scroll_tgt == g_rd_scroll && g_rd_n && g_rd_have >= g_rd_n &&
+            room <= 0 && (uint32_t)(now - turn_ms) > TB_PAGE_REARM_MS) {
+            turn_ms = now;              // a page that arrives already short must not let
+            int8_t d = (vy > 0) ? +1 : -1;   // one long roll walk through the whole book
+            Serial.printf("[book] rolled %s past the end -> turn\n", d > 0 ? "down" : "up");
+            if (d > 0)                 g_rd_next_req = true;
+            else if (g_rd_page > 0)    g_rd_prev_req = true;
         }
     } else if (!g_edit_slider) {
         acc_v += vy;                                   // focus navigation
