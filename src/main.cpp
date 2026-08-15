@@ -1496,11 +1496,16 @@ static void news_data_handle(const String &line)
     if (g_art_have < g_art_total || !g_art_crc.length()) return;
     String body;
     for (int k = 0; k < g_art_total; k++) body += g_art_chunk[k];   // as sent, before [NL]
-    if (crc32_of(body) == unb36(g_art_crc)) { g_art_crc_try = 0; return; }
-    // Asked for from news_tick, not sent from here: a !GQ blocks the radio for about a
-    // second, and this runs inside the RX drain loop -- transmitting from in there means
-    // going deaf in the middle of reading the air.
-    Serial.printf("[news] article crc mismatch (try %u)\n", (unsigned)g_art_crc_try + 1);
+    uint32_t ours = crc32_of(body);
+    if (ours == unb36(g_art_crc)) { g_art_crc_try = 0; return; }
+    // ADVISORY ONLY, for now. Twice this check has cost the reader an article it would
+    // otherwise have had: it is a guard against damage that has to be rarer than the
+    // damage, and dropping a whole article on a mismatch is a bigger loss than one
+    // mangled chunk in it. So say so and leave the text up. Both values go to the log so
+    // a mismatch can be told from a disagreement about what is being summed at all --
+    // the second would fire on every article and is the thing to rule out first.
+    Serial.printf("[news] crc ours=%s theirs=%s over %d chunks / %u bytes\n",
+                  b36(ours).c_str(), g_art_crc.c_str(), g_art_total, (unsigned)body.length());
     g_art_crc_req = true;
 }
 
@@ -3980,21 +3985,15 @@ static void news_tick()
     tts_pump();                     // keep the speech queue moving, one line at a time
     book_tick();                    // page repair, on the quiet-gap + slot schedule
 
-    // The article arrived whole and wrong. Bytes are damaged, not missing, so !GN is the
-    // wrong instrument -- it asks for what never came and the bad chunk is not among
-    // them. Drop it all and pull the article again. TWICE, and then stop: a check that
-    // re-fetches for ever on a mismatch it cannot fix is worse than the corruption, and
-    // costs twenty seconds of everyone's air per round.
+    // The article arrived whole and its crc disagrees. It stays on screen: re-fetching
+    // on this has now twice taken an article the reader would otherwise have been
+    // reading, and one damaged chunk in a body is a smaller loss than the whole body.
+    // The hint line says the text is suspect and Re-req is one button away, which is the
+    // reader's call to make and not this function's.
     if (g_art_crc_req) {
         g_art_crc_req = false;
-        if (++g_art_crc_try > 2) {
-            if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_WARNING " 본문 손상 - Re-req로 다시");
-        } else {
-            for (int k = 0; k < ART_MAX_CHUNKS; k++) { g_art_seen[k] = false; g_art_chunk[k] = ""; }
-            g_art_total = 0; g_art_have = 0;      // clear, or the resent chunks land as
-            g_art_gn_ms = 0; g_news_gq_ms = 0;    // "already seen" on top of the bad one
-            news_send_gq();
-        }
+        g_art_crc_try++;
+        if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_WARNING " 본문 일부 손상 - Re-req");
     }
 
     if (g_alert_announce_req) {
