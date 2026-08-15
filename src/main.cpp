@@ -184,6 +184,8 @@ static String        g_art_chunk[ART_MAX_CHUNKS];
 static lv_obj_t     *g_art_body = NULL;         // article body label (non-NULL only in article view)
 static lv_obj_t     *g_art_scroll = NULL;       // article scroll container — trackball scrolls this by line
 static lv_obj_t     *g_rd_scroll  = NULL;       // book page scroll container — likewise
+static lv_obj_t     *g_book_root;              // Books content root (non-NULL only in the app)
+static volatile bool g_book_back_req = false;  // ball held ~1 s: reader -> shelf -> home
 static volatile bool g_rd_next_req = false;    // rolled past the end: fetch the next page
 static volatile bool g_rd_prev_req = false;    // rolled above the top: fetch the previous one
 static bool          g_rd_land_bottom = false; // ...and open it at its end, where reading left off
@@ -433,7 +435,17 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     // sleeping inside an input callback would stop LVGL mid-read.
     static uint32_t hold_ms = 0;
     if (press_edge)      hold_ms = millis();
-    else if (!pressed)   hold_ms = 0;
+    // Books has no Back button, so a one-second hold is the way out: reader -> shelf ->
+    // home. It fires on RELEASE, not at one second, which is what keeps it out of the
+    // way of the three-second hold for power save — hold on past three and you sleep,
+    // and going back is not also waiting for you when you wake.
+    else if (!pressed) {
+        if (hold_ms && g_book_root) {
+            uint32_t held = (uint32_t)(millis() - hold_ms);
+            if (held > 1000 && held <= 3000) g_book_back_req = true;
+        }
+        hold_ms = 0;
+    }
     if (hold_ms && (uint32_t)(millis() - hold_ms) > 3000) {
         hold_ms = 0;
         g_sleep_req = true;
@@ -1878,7 +1890,7 @@ static uint32_t      g_rd_bn_due  = 0;    // scheduled !BN (slot rule, PROTOCOL.
 static lv_obj_t     *g_book_list  = NULL; // shelf list   (non-NULL only on the shelf)
 static lv_obj_t     *g_rd_body    = NULL; // page text    (non-NULL only in the reader)
 static lv_obj_t     *g_rd_foot    = NULL;
-static lv_obj_t     *g_book_root  = NULL;
+// g_book_root is declared up with the reader state — trackball_read needs it
 
 static void book_show_shelf();
 static void book_show_reader();
@@ -2126,6 +2138,16 @@ static void book_send_bn()
 // a slot derived from this node's id so several readers do not all speak at once.
 static void book_tick()
 {
+    // One level per hold: a book goes back to the shelf, the shelf goes home. Acted on
+    // here rather than in the input callback — both paths rebuild the screen the callback
+    // is reading from.
+    if (g_book_back_req) {
+        g_book_back_req = false;
+        lv_indev_reset(NULL, NULL);          // the hold is ours; do not let it also click
+        if (g_rd_body) { g_rd_id[0] = 0; book_page_reset(); book_show_shelf(); }
+        else           { go_home(); }
+        return;
+    }
     if (g_rd_next_req) {            // asked for by the scroll, sent from here: !BQ blocks
         g_rd_next_req = false;
         book_turn(1);
@@ -2326,13 +2348,8 @@ static void book_show_reader()
     lv_group_t *g = lv_group_get_default();
     int idx = book_find(String(g_rd_id));
 
-    lv_obj_t *ttl = lv_label_create(g_book_root);
-    lv_obj_set_width(ttl, lv_pct(100));
-    lv_label_set_long_mode(ttl, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_font(ttl, &font_kr16, 0);
-    lv_obj_set_style_text_color(ttl, lv_color_hex(0xA5B4FC), 0);
-    lv_label_set_text(ttl, idx >= 0 ? g_books[idx].title : g_rd_id);
-
+    // No title row in the reader. You know which book you opened, and on a 320x240 panel
+    // that line is a twelfth of the text you came for. The footer already names the page.
     g_rd_scroll = lv_obj_create(g_book_root);
     lv_obj_set_width(g_rd_scroll, lv_pct(100));
     lv_obj_set_flex_grow(g_rd_scroll, 1);
@@ -4095,16 +4112,29 @@ static void open_app(const char *name)
     lv_group_t *g = lv_group_get_default();
     lv_group_remove_all_objs(g);
 
-    lv_obj_t *back = lv_btn_create(g_app_view);
-    lv_obj_t *bl   = lv_label_create(back);
-    lv_label_set_text(bl, LV_SYMBOL_LEFT " Back");
-    lv_obj_add_event_cb(back, back_event_cb, LV_EVENT_CLICKED, NULL);
-    lv_group_add_obj(g, back);
+    // Books has no Back button: a page of text wants the screen more than a button that
+    // is pressed once a session, and a one-second hold on the ball does the same job
+    // (see trackball_read). The padding goes with it, for the same reason.
+    bool reader = !strcmp(name, "Books");
+    if (reader) {
+        lv_obj_set_style_pad_all(g_app_view, 2, 0);
+        lv_obj_set_style_pad_row(g_app_view, 2, 0);
+    }
+    lv_obj_t *back = NULL;
+    if (!reader) {
+        back = lv_btn_create(g_app_view);
+        lv_obj_t *bl = lv_label_create(back);
+        lv_label_set_text(bl, LV_SYMBOL_LEFT " Back");
+        lv_obj_add_event_cb(back, back_event_cb, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, back);
+    }
 
     build_app_content(g_app_view, name, g);
 
-    lv_group_focus_obj(back);
-    lv_label_set_text(g_toast, LV_SYMBOL_LEFT " Back to go home");
+    if (back) {
+        lv_group_focus_obj(back);
+        lv_label_set_text(g_toast, LV_SYMBOL_LEFT " Back to go home");
+    }
 }
 
 // ---------------------------------------------------------------------------
