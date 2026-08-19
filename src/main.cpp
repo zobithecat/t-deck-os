@@ -91,6 +91,13 @@ static uint32_t g_rx_ok = 0, g_rx_bad = 0, g_rx_corrupt = 0;
 static int      g_rx_rssi_last = 0;
 static float    g_rx_snr_last  = 0;
 static uint32_t g_stream_ms    = 0;   // last !GD/!BD in: nothing of ours may transmit near it
+// Envelope of the line being dispatched RIGHT NOW. v1.11 scopes (rev, seq) per router
+// and derives the router id from the envelope src, so the L1 handlers need to see it;
+// threading two parameters through every handler signature buys nothing over this.
+static char     g_rx_src3[8]   = "";  // envelope src of the L1 line in flight
+static uint8_t  g_rx_env_ttl   = 0;   // its envelope ttl (1 = provably direct)
+static bool     g_gq_answered  = true;   // the open !GQ got its first !GR/!GD back
+static uint32_t g_gq_sent_ms   = 0;      // ...else 15 s of silence = one failed pull
 static bool          g_lora_ok = false;
 static lv_obj_t     *g_lora_log;
 static lv_obj_t     *g_lora_input;
@@ -1462,6 +1469,155 @@ static void news_show_article(const char *art_id, const char *title);
 static void news_send_gq();
 static void news_send_gl();
 static void news_mark_new(const String &speak);   // arm the deferred announce (alert_handle uses it)
+static void news_send_gl();
+static void book_send_bl();
+static bool book_rev_differs(const char *rev);    // g_book_rev lives in the books section
+
+// --- router plane (!RB + addressed pulls — PROTOCOL.md §5 v1.11) --------------------
+// Two routers on one floor, both serving. Selection lives entirely in this device:
+// track a per-router RSSI EWMA from beacons, pick a home, address every pull to it.
+// The routers keep no per-device state — handover is a client-side readdress.
+#define RTR_N 4
+struct RouterInfo {
+    char     id[8];                    // envelope src of its beacons ("P10")
+    char     ns[4], caps[6];           // alert namespace, services (subset of "NBA")
+    char     news_rev[10], book_rev[10];
+    char     floor[8], room[24];       // indoor-position seed, for the diagnostics UI
+    float    ewma;                     // beacon RSSI, alpha = 0.3 (normative)
+    uint32_t last_ms;                  // last beacon heard
+    uint8_t  streak;                   // consecutive beacons above home + 6 dB
+    long     ga_seq;                   // last !GA seq accepted FROM THIS SRC (-1 = none)
+    uint32_t bc_seq;                   // last !BC seq from this src
+};
+static RouterInfo g_routers[RTR_N];
+static int        g_routers_n  = 0;
+static int        g_home       = -1;  // index into g_routers, -1 = no home yet
+static uint8_t    g_home_fail  = 0;   // consecutive unanswered pulls (2 = home lost)
+
+static RouterInfo *router_get(const char *src, bool create)
+{
+    if (!src[0]) return NULL;
+    for (int i = 0; i < g_routers_n; i++)
+        if (!strcmp(g_routers[i].id, src)) return &g_routers[i];
+    if (!create) return NULL;
+    int i = g_routers_n < RTR_N ? g_routers_n++
+          : 0;                                       // full: evict the stalest
+    if (g_routers_n == RTR_N)
+        for (int k = 1; k < RTR_N; k++)
+            if (g_routers[k].last_ms < g_routers[i].last_ms && k != g_home) i = k;
+    memset(&g_routers[i], 0, sizeof(RouterInfo));
+    strncpy(g_routers[i].id, src, sizeof(g_routers[i].id) - 1);
+    g_routers[i].ga_seq = -1;
+    return &g_routers[i];
+}
+
+static bool router_src_is_home(const char *src)
+{
+    // No home yet = follow anyone: a device that has never heard a beacon must keep
+    // working against a v1.10 single-router mesh exactly as before.
+    if (g_home < 0) return true;
+    return !strcmp(g_routers[g_home].id, src);
+}
+
+// The optional trailing <router> field on every pull. Absent = '*' = any router
+// answers (v1.10 behavior), which is exactly right while no home is known.
+static String router_pull_suffix()
+{
+    if (g_home < 0) return String();
+    return String("\t") + g_routers[g_home].id;
+}
+
+// Adopt a (new) home's advertised shelf state: if its revisions differ from what we
+// hold, one pull each closes the gap. Both senders are rate-limited internally, so a
+// beacon-storm of handovers cannot burn the channel.
+static void router_adopt_home()
+{
+    if (g_home < 0) return;
+    RouterInfo &r = g_routers[g_home];
+    g_home_fail = 0;
+    Serial.printf("[rtr] home = %s  ns=%s  ewma=%.0f dBm\n", r.id, r.ns, r.ewma);
+    if (r.news_rev[0] && strcmp(r.news_rev, "-") && !String(r.news_rev).equals(g_news_rev))
+        news_send_gl();
+    if (r.book_rev[0] && strcmp(r.book_rev, "-") && book_rev_differs(r.book_rev))
+        book_send_bl();
+}
+
+// !RB\t<caps>\t<ns>\t<news_rev>\t<book_rev>\t<lat>\t<lon>\t<floor>\t<room>
+// Router id is the ENVELOPE src — beacons are always ttl 1, so the RSSI is the
+// router's own signal and "hearable beacon" means "directly usable router".
+static void router_handle_rb(const String &line)
+{
+    if (g_rx_env_ttl != 1) return;              // a relayed beacon would poison selection
+    int t[8], p = 0, at = line.indexOf('\t');
+    while (p < 8 && at >= 0) { t[p++] = at; at = line.indexOf('\t', at + 1); }
+    if (p < 8) return;                          // 9 fields: type + 8 (room may hold tabs)
+    RouterInfo *r = router_get(g_rx_src3, true);
+    if (!r) return;
+    String f[8];
+    for (int i = 0; i < 7; i++) f[i] = line.substring(t[i] + 1, t[i + 1]);
+    f[7] = line.substring(t[7] + 1);
+    strncpy(r->caps,     f[0].c_str(), sizeof(r->caps) - 1);
+    strncpy(r->ns,       f[1].c_str(), sizeof(r->ns) - 1);
+    strncpy(r->news_rev, f[2].c_str(), sizeof(r->news_rev) - 1);
+    strncpy(r->book_rev, f[3].c_str(), sizeof(r->book_rev) - 1);
+    strncpy(r->floor,    f[6].c_str(), sizeof(r->floor) - 1);
+    strncpy(r->room,     f[7].c_str(), sizeof(r->room) - 1);
+    r->ewma    = r->last_ms ? 0.3f * g_rx_rssi_last + 0.7f * r->ewma : (float)g_rx_rssi_last;
+    r->last_ms = millis();
+
+    int idx = (int)(r - g_routers);
+    if (g_home < 0) {                            // first beacon ever: that's home
+        g_home = idx;
+        router_adopt_home();
+    } else if (idx == g_home) {
+        // Home beacon doubles as a change hint: revs moved -> pull now, not next push.
+        if (r->news_rev[0] && strcmp(r->news_rev, "-") && !String(r->news_rev).equals(g_news_rev))
+            news_send_gl();
+        if (r->book_rev[0] && strcmp(r->book_rev, "-") && book_rev_differs(r->book_rev))
+            book_send_bl();
+    } else {
+        // Switch only on 6 dB over the home for 3 CONSECUTIVE candidate beacons —
+        // hysteresis against ping-pong on the floor boundary (normative numbers).
+        if (r->ewma > g_routers[g_home].ewma + 6.0f) {
+            if (++r->streak >= 3) {
+                Serial.printf("[rtr] handover %s -> %s (+%.0f dB x3)\n",
+                              g_routers[g_home].id, r->id, r->ewma - g_routers[g_home].ewma);
+                g_home = idx;
+                for (int i = 0; i < g_routers_n; i++) g_routers[i].streak = 0;
+                router_adopt_home();
+            }
+        } else r->streak = 0;
+    }
+    Serial.printf("[rtr] RB %s %s ns=%s %.0fdBm nr=%s br=%s %s/%s%s\n", r->id, r->caps,
+                  r->ns, r->ewma, r->news_rev, r->book_rev, r->floor, r->room,
+                  idx == g_home ? "  *home*" : "");
+}
+
+// Home-loss watchdog: 3 beacon intervals silent, or 2 consecutive unanswered pulls,
+// -> reselect immediately among routers heard within the last 3 intervals.
+static void router_tick()
+{
+    if (g_home < 0) return;
+    uint32_t now = millis();
+    bool silent = (uint32_t)(now - g_routers[g_home].last_ms) > 200000;   // 3 x 60s + slack
+    if (!silent && g_home_fail < 2) return;
+    Serial.printf("[rtr] home %s lost (%s)\n", g_routers[g_home].id,
+                  silent ? "no beacons" : "2 pulls unanswered");
+    int best = -1;
+    for (int i = 0; i < g_routers_n; i++) {
+        if (i == g_home) continue;
+        if ((uint32_t)(now - g_routers[i].last_ms) > 180000) continue;
+        if (best < 0 || g_routers[i].ewma > g_routers[best].ewma) best = i;
+    }
+    g_home = best;                       // may be -1: back to '*' pulls until a beacon
+    g_home_fail = 0;
+    if (g_home >= 0) router_adopt_home();
+    else Serial.println("[rtr] no router in range - pulls revert to '*'");
+}
+
+// A pull went unanswered (the existing no-reply timers fire this). Two in a row is
+// the §5 home-lost trigger — checked in router_tick.
+static void router_pull_failed() { if (g_home >= 0 && g_home_fail < 255) g_home_fail++; }
 
 // Upsert one headline by art_id. Returns true iff a NEW art_id was added (drives the
 // background chime + list refresh); an existing art_id is an idempotent title overwrite.
@@ -1576,7 +1732,7 @@ static void news_send_gn()
     // we already had while the ones we were missing never came again. An article that
     // lost even one chunk could not finish, which is exactly what it looked like from
     // the outside: the first article fine, and from then on no body at all.
-    lora_tx_line("!GN\t" + String(g_art_id) + "\t" + b36(bits) + "\n");
+    lora_tx_line("!GN\t" + String(g_art_id) + "\t" + b36(bits) + router_pull_suffix() + "\n");
     Serial.printf("[news] GN %s have=%s (%d/%d)\n", g_art_id, b36(bits).c_str(),
                   g_art_have, g_art_total);
 }
@@ -1687,14 +1843,23 @@ static void news_handle(bool is_ga, const String &line)
     if (is_ga) {
         int t3 = (t2 < 0) ? -1 : line.indexOf('\t', t2 + 1);          // digest | seq
         long seq = (t3 < 0) ? -1 : strtol(line.substring(t3 + 1).c_str(), NULL, 36);
+        // v1.11: (rev, seq) is scoped per envelope src. Two routers persist two
+        // independent counters, and comparing them against one global was the
+        // split-brain §5 exists to fix: whichever router rebooted more recently would
+        // have its every announce look "stale". Monotonicity is judged per router;
+        // WHICH router may move our shelf revision is a separate question — the home's
+        // announces only.
+        RouterInfo *rt = router_get(g_rx_src3, true);
+        if (seq >= 0 && rt && rt->ga_seq >= 0 && seq <= rt->ga_seq) return;  // this src repeating itself
+        if (seq >= 0 && rt) rt->ga_seq = seq;
         if (!rev.equals(g_news_rev)) {
-            // v1.8: order by seq. A v1.7 sender omits it (seq < 0) — fall back to the
-            // old "different rev wins" so the mesh keeps working during the rollout.
-            if (seq >= 0 && g_news_seq >= 0 && seq <= g_news_seq) return;   // stale/duplicate
+            if (!router_src_is_home(g_rx_src3)) return;   // a non-home shelf is not ours
             strncpy(g_news_rev, rev.c_str(), sizeof(g_news_rev) - 1);
             g_news_rev[sizeof(g_news_rev) - 1] = 0;
             g_news_n = 0; g_news_count = -1; structural = true;
             if (news_flush_hold()) news_mark_new(g_news_n ? g_news[0].title : "");
+        } else if (!router_src_is_home(g_rx_src3)) {
+            return;   // same rev from elsewhere: counted its seq, but the home speaks for us
         }
         if (seq >= 0) g_news_seq = seq;
         String cnt = (t2 < 0) ? line.substring(t1 + 1) : line.substring(t1 + 1, t2);
@@ -1738,7 +1903,7 @@ static void news_send_gl()
     if (g_news_gl_ms && (uint32_t)(now - g_news_gl_ms) < 30000) return;   // too soon
     g_news_gl_ms = now;
     bool complete = g_news_rev[0] && g_news_count >= 0 && g_news_n >= g_news_count;
-    lora_tx_line(String("!GL\t") + (complete ? g_news_rev : "-") + "\n");
+    lora_tx_line(String("!GL\t") + (complete ? g_news_rev : "-") + router_pull_suffix() + "\n");
     lora_radio.startReceive();
     if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_REFRESH " requesting headlines...");
 }
@@ -1766,8 +1931,9 @@ static void news_send_gq()
     strncpy(gq_id, g_art_id, sizeof(gq_id) - 1); gq_id[sizeof(gq_id) - 1] = 0;
     g_news_gq_ms = now;
     g_art_gn_ms = 0;
-    lora_tx_line("!GQ\t" + String(g_art_id) + "\n");      // ttl=3, reaches the multi-hop edge router
-    Serial.printf("[news] GQ %s\n", g_art_id);
+    g_gq_answered = false; g_gq_sent_ms = now;
+    lora_tx_line("!GQ\t" + String(g_art_id) + router_pull_suffix() + "\n");   // ttl=3
+    Serial.printf("[news] GQ %s%s\n", g_art_id, router_pull_suffix().c_str());
 }
 
 // LIST view: header + a tappable button per headline.
@@ -1889,6 +2055,7 @@ struct BookItem { char id[6], cid[6], title[56]; uint16_t pages; };
 static BookItem      g_books[BOOK_N];
 static int           g_books_n = 0;
 static char          g_book_rev[10] = "";
+static bool book_rev_differs(const char *rev) { return !String(rev).equals(g_book_rev); }
 static uint32_t      g_book_seq = 0;
 static int           g_book_count = -1;
 static uint32_t      g_book_bl_ms = 0;
@@ -2010,7 +2177,13 @@ static void book_handle_bc(const String &line)
     if (p < 4) return;
     String rev = line.substring(t[0] + 1, t[1]);
     uint32_t seq = unb36(line.substring(t[3] + 1));
-    if (g_book_rev[0] && seq <= g_book_seq) return;          // stale or repeat
+    // v1.11: seq is per envelope src (two routers, two persisted counters), and only
+    // the home router may replace the shelf. Same reasoning as !GA above.
+    RouterInfo *rt = router_get(g_rx_src3, true);
+    if (rt && rt->bc_seq && seq <= rt->bc_seq) return;       // this src repeating itself
+    if (rt) rt->bc_seq = seq;
+    if (!router_src_is_home(g_rx_src3)) return;              // not our shelf-keeper
+    if (g_book_rev[0] && seq <= g_book_seq) return;          // stale vs adopted state
     bool newrev = !rev.equals(g_book_rev);
     strncpy(g_book_rev, rev.c_str(), sizeof(g_book_rev) - 1);
     g_book_seq   = seq;
@@ -2117,7 +2290,7 @@ static void book_send_bl()
     if (!g_lora_ok) return;
     if (g_book_bl_ms && (uint32_t)(millis() - g_book_bl_ms) < 8000) return;
     g_book_bl_ms = millis();
-    lora_tx_line(String("!BL\t") + (g_book_rev[0] ? g_book_rev : "-") + "\n");
+    lora_tx_line(String("!BL\t") + (g_book_rev[0] ? g_book_rev : "-") + router_pull_suffix() + "\n");
     lora_radio.startReceive();
 }
 
@@ -2145,7 +2318,7 @@ static void book_send_bq(const char *id, int page)
     // blank. The flag holds it at the top until there is something to read.
     g_rd_land_top = !g_rd_land_bottom;
     if (g_rd_land_top && g_rd_scroll) lv_obj_scroll_to_y(g_rd_scroll, 0, LV_ANIM_OFF);
-    lora_tx_line("!BQ\t" + String(id) + "\t" + b36((uint32_t)page) + "\n");
+    lora_tx_line("!BQ\t" + String(id) + "\t" + b36((uint32_t)page) + router_pull_suffix() + "\n");
     lora_radio.startReceive();
     Serial.printf("[book] BQ %s p%d\n", id, page);
     book_render_page();
@@ -2158,7 +2331,7 @@ static void book_send_bn()
     if (!g_lora_ok || !g_rd_id[0] || !g_rd_n) return;
     uint32_t have = 0;
     for (int i = 0; i < g_rd_n && i < 32; i++) if (g_rd_seen[i]) have |= (1u << i);
-    lora_tx_line("!BN\t" + String(g_rd_id) + "\t" + b36((uint32_t)g_rd_page) + "\t" + b36(have) + "\n");
+    lora_tx_line("!BN\t" + String(g_rd_id) + "\t" + b36((uint32_t)g_rd_page) + "\t" + b36(have) + router_pull_suffix() + "\n");
     lora_radio.startReceive();
     Serial.printf("[book] BN %s p%d have=%s (%d/%d)\n", g_rd_id, g_rd_page,
                   b36(have).c_str(), g_rd_have, g_rd_n);
@@ -2203,6 +2376,7 @@ static void book_tick()
             uint8_t t = g_rd_bq_try + 1;
             Serial.printf("[book] no reply for %s p%d, asking again (%u)\n",
                           g_rd_id, g_rd_page, (unsigned)t);
+            router_pull_failed();
             book_send_bq(g_rd_id, g_rd_page);
             g_rd_bq_try = t;                  // survives the reset book_send_bq does
             book_render_page();
@@ -2444,14 +2618,284 @@ static void book_show_shelf()
     lv_group_add_obj(g, rf);
 }
 
+// --- voice plane RX (VOICE.md v1.12 — 0xC2 chunk frames + !VA/!VN control) ----------
+// Receive side only in this stage: assemble notes chunk-by-chunk, repair per §4.4,
+// surface "sender out of voice range". Playback (codec2 decode) and the record/TX
+// side land next — the frame layer has to be provably right first, hence the boot
+// self-test below.
+#define VOICE_MAGIC      0xC2
+#define VOICE_MAX_CHUNKS 6          // §6: 8 s cap at C2-1200 = 6 chunks
+#define VOICE_CHUNK_MAX  200
+#define VOICE_HDR        13         // magic..len inclusive; payload starts here
+
+// CRC-16/CCITT (poly 0x1021, init 0xFFFF), computed with the ttl byte read as 0x00 —
+// relays decrement ttl in flight, and a CRC that covered it would fail at every hop.
+static uint16_t crc16_ccitt_ttl0(const uint8_t *b, int len)
+{
+    uint16_t c = 0xFFFF;
+    for (int i = 0; i < len; i++) {
+        uint8_t v = (i == 2) ? 0x00 : b[i];               // offset 2 = ttl, zeroed
+        c ^= (uint16_t)v << 8;
+        for (int k = 0; k < 8; k++) c = (c & 0x8000) ? (c << 1) ^ 0x1021 : (c << 1);
+    }
+    return c;
+}
+
+// Voice address (VOICE.md §3): role letter << 8 | hex suffix. "TFF" -> 0x54FF.
+// NOT the BMN rule — strtol alone maps P00 and F00 both to 0x0000.
+static uint16_t voice_addr(const char *id)
+{
+    if (!id[0]) return 0;
+    return ((uint16_t)(uint8_t)id[0] << 8) | (uint16_t)(strtol(id + 1, NULL, 16) & 0xFF);
+}
+static String voice_addr_str(uint16_t a)      // reversible by construction
+{
+    char s[6]; snprintf(s, sizeof(s), "%c%02X", (char)(a >> 8), (unsigned)(a & 0xFF));
+    return String(s);
+}
+
+struct VoiceNote {
+    bool     active, done, partial, ranged_out;
+    uint16_t src, dst, vid;
+    uint8_t  n, codec;                  // n=0 until first chunk or !VA
+    uint8_t  have, seen_mask;
+    uint8_t  clen[VOICE_MAX_CHUNKS];
+    uint8_t  data[VOICE_MAX_CHUNKS][VOICE_CHUNK_MAX];
+    bool     have_va;                   // !VA meta (advisory crc32 + duration)
+    uint32_t va_crc32, va_ms;
+    uint16_t dur_ds;
+    uint32_t last_ms, toa_ms;           // last chunk in + its measured ToA
+    uint8_t  vn_rounds;                 // §4.4: two repair rounds, then partial
+    uint32_t vn_due;
+};
+static VoiceNote g_vnote;
+
+static uint32_t crc32_bytes(const uint8_t *p, size_t n)
+{
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) { c ^= p[i];
+        for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(c & 1))); }
+    return c ^ 0xFFFFFFFFu;
+}
+
+static void voice_note_reset(uint16_t src, uint16_t vid)
+{
+    memset(&g_vnote, 0, sizeof(g_vnote));
+    g_vnote.active = true;
+    g_vnote.src = src; g_vnote.vid = vid;
+    g_vnote.last_ms = g_vnote.va_ms = millis();
+}
+
+static void voice_note_completed()
+{
+    g_vnote.done = true;
+    size_t total = 0;
+    for (int i = 0; i < g_vnote.n; i++) total += g_vnote.clen[i];
+    bool verified = true;
+    if (g_vnote.have_va) {
+        // Every chunk passed its CRC16, so a whole-note mismatch indicts the ANNOUNCE,
+        // not the audio (§4.2): keep the note, mark unverified, never discard.
+        uint8_t joined[VOICE_MAX_CHUNKS * VOICE_CHUNK_MAX]; size_t off = 0;
+        for (int i = 0; i < g_vnote.n; i++) { memcpy(joined + off, g_vnote.data[i], g_vnote.clen[i]); off += g_vnote.clen[i]; }
+        verified = (crc32_bytes(joined, off) == g_vnote.va_crc32);
+    }
+    float secs = g_vnote.codec == 1 ? total / 4 * 0.04f : total / 6 * 0.04f;
+    String who = voice_addr_str(g_vnote.src);
+    Serial.printf("[voice] note %s/%04X complete: %u B, %.1f s, codec %u%s\n",
+                  who.c_str(), g_vnote.vid, (unsigned)total, secs, g_vnote.codec,
+                  verified ? "" : " (announce crc mismatch - unverified)");
+    lora_log_print("< ", String("[음성] ") + who + " " + String(secs, 1) + "초 수신"
+                        + (verified ? "" : " (미검증)") + " - 재생은 다음 단계");
+    beep_notify();
+}
+
+// One 0xC2 frame off the air. Called from lora_service BEFORE any String conversion.
+static void voice_rx_frame(const uint8_t *b, int len)
+{
+    if (len < VOICE_HDR + 2) { g_rx_corrupt++; return; }
+    if ((b[1] & 0xF0) != 0x10) return;                    // future format version
+    uint8_t ttl = b[2];
+    if (ttl < 1 || ttl > 3) { g_rx_corrupt++; return; }   // syntactic clamp, binary edition
+    uint8_t plen = b[12];
+    if (plen > VOICE_CHUNK_MAX || VOICE_HDR + plen + 2 != len) { g_rx_corrupt++; return; }
+    uint16_t crc = (uint16_t)b[VOICE_HDR + plen] << 8 | b[VOICE_HDR + plen + 1];
+    if (crc16_ccitt_ttl0(b, VOICE_HDR + plen) != crc) {
+        g_rx_corrupt++;
+        Serial.printf("[voice] chunk crc16 fail (%d B)\n", len);
+        return;
+    }
+    uint16_t src = (uint16_t)b[3] | (uint16_t)b[4] << 8;   // LE
+    uint16_t dst = (uint16_t)b[5] | (uint16_t)b[6] << 8;
+    uint16_t vid = (uint16_t)b[7] | (uint16_t)b[8] << 8;
+    uint8_t  seq = b[9], n = b[10], codec = b[11];
+    if (src == voice_addr(NODE_ID)) return;                // self echo via a relay
+    if (dst != 0xFFFF && dst != voice_addr(NODE_ID)) return;
+    if (n < 1 || n > VOICE_MAX_CHUNKS || seq >= n || codec > 1) return;
+
+    if (!g_vnote.active || g_vnote.src != src || g_vnote.vid != vid) {
+        if (g_vnote.active && !g_vnote.done)
+            Serial.println("[voice] new note preempts an unfinished one");
+        voice_note_reset(src, vid);
+    }
+    if (g_vnote.done) return;                              // idempotent late copies
+    g_vnote.dst = dst; g_vnote.n = n; g_vnote.codec = codec;
+    if (!(g_vnote.seen_mask & (1 << seq))) {
+        g_vnote.seen_mask |= (1 << seq);
+        memcpy(g_vnote.data[seq], b + VOICE_HDR, plen);
+        g_vnote.clen[seq] = plen;
+        g_vnote.have++;
+    }
+    g_vnote.last_ms = millis();
+    g_vnote.toa_ms  = (uint32_t)(lora_radio.getTimeOnAir(len) / 1000);
+    g_vnote.vn_due  = 0;                                   // traffic flows; re-schedule
+    Serial.printf("[voice] chunk %u/%u from %s vid=%04X round=%u  %d dBm\n",
+                  seq, n, voice_addr_str(src).c_str(), vid, b[1] & 0x0F, g_rx_rssi_last);
+    if (g_vnote.have >= g_vnote.n) voice_note_completed();
+}
+
+// !VA\t<src>\t<vid>\t<n>\t<codec>\t<dur_ds>\t<crc32> — push announce (text plane, relayed)
+static void voice_handle_va(const String &line)
+{
+    int t[6], p = 0, at = line.indexOf('\t');
+    while (p < 6 && at >= 0) { t[p++] = at; at = line.indexOf('\t', at + 1); }
+    if (p < 6) return;
+    uint16_t src = (uint16_t)unb36(line.substring(t[0] + 1, t[1]));   // b36 of the u16
+    uint16_t vid = (uint16_t)unb36(line.substring(t[1] + 1, t[2]));
+    if (src == voice_addr(NODE_ID)) return;
+    if (!g_vnote.active || g_vnote.src != src || g_vnote.vid != vid)
+        voice_note_reset(src, vid);
+    g_vnote.have_va  = true;
+    g_vnote.n        = (uint8_t)unb36(line.substring(t[2] + 1, t[3]));
+    g_vnote.codec    = (uint8_t)unb36(line.substring(t[3] + 1, t[4]));
+    g_vnote.dur_ds   = (uint16_t)unb36(line.substring(t[4] + 1, t[5]));
+    g_vnote.va_crc32 = unb36(line.substring(t[5] + 1));
+    g_vnote.va_ms    = millis();
+    Serial.printf("[voice] VA %s vid=%04X n=%u codec=%u %u.%us\n",
+                  voice_addr_str(src).c_str(), vid, g_vnote.n, g_vnote.codec,
+                  g_vnote.dur_ds / 10, g_vnote.dur_ds % 10);
+}
+
+// !VN\t<src>\t<vid>\t<bitmap> — someone asks US to re-send. We do not transmit notes
+// yet, so log only; the sender side lands with the record pipeline.
+static void voice_handle_vn(const String &line)
+{
+    Serial.printf("[voice] VN heard (no TX side yet): %s\n", line.c_str());
+}
+
+static void voice_send_vn(const char *bitmap36)
+{
+    if (!g_lora_ok) return;
+    lora_tx_line("!VN\t" + b36(g_vnote.src) + "\t" + b36(g_vnote.vid) +
+                 "\t" + bitmap36 + "\n");
+    Serial.printf("[voice] VN -> %s vid=%04X have=%s (round %u)\n",
+                  voice_addr_str(g_vnote.src).c_str(), g_vnote.vid, bitmap36,
+                  (unsigned)g_vnote.vn_rounds + 1);
+}
+
+// §4.4 repair discipline. Never immediate: hold 4×ToA + jitter (unicast), or the §8
+// deferred slot (broadcast). Two rounds, then the note is marked partial and kept —
+// a playable prefix is still playable (40 ms alignment).
+static void voice_tick()
+{
+    if (!g_vnote.active || g_vnote.done) return;
+    uint32_t now = millis();
+    uint32_t toa = g_vnote.toa_ms ? g_vnote.toa_ms : 1300;
+
+    // Announce heard, zero chunks: out of voice range (personal notes are ttl 1 by
+    // design). Say so — silence reads as a bug. With fresh DIRECT evidence of the
+    // sender we may ask for the whole note once ('-' bitmap, §4.3); without it,
+    // requesting a stream from someone we cannot hear wastes everyone's air.
+    if (g_vnote.have_va && g_vnote.have == 0) {
+        if ((uint32_t)(now - g_vnote.va_ms) < 15000) return;
+        if (g_vnote.ranged_out) return;
+        String nid = voice_addr_str(g_vnote.src);
+        bool direct = false;
+        for (int i = 0; i < g_neigh_n; i++)
+            if (nid.equals(g_neigh[i].rid) && g_neigh[i].hops == 0 &&
+                (uint32_t)(now - g_neigh[i].last_ms) < 300000) direct = true;
+        if (direct && g_vnote.vn_rounds == 0) {
+            g_vnote.vn_rounds++;
+            voice_send_vn("-");
+            g_vnote.va_ms = now;                     // give the resend its window
+        } else {
+            g_vnote.ranged_out = true;
+            if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_VOLUME_MID " 음성 범위 밖 - 발신자가 가까이 와야 함");
+            lora_log_print("< ", String("[음성] ") + nid + " 쪽지 예고 수신 - 음성 범위 밖");
+        }
+        return;
+    }
+    if (!g_vnote.n || !g_vnote.have) return;
+
+    if (!g_vnote.vn_due) {
+        bool provable = (g_vnote.seen_mask & (1 << (g_vnote.n - 1))) && g_vnote.have < g_vnote.n;
+        bool idle     = g_vnote.have < g_vnote.n &&
+                        (uint32_t)(now - g_vnote.last_ms) > 3 * toa;
+        if (!provable && !idle) return;
+        if (g_vnote.vn_rounds >= 2) {                 // two rounds did not close it
+            g_vnote.done = true; g_vnote.partial = true;
+            Serial.printf("[voice] giving up at %u/%u - marked partial\n",
+                          g_vnote.have, g_vnote.n);
+            lora_log_print("< ", "[음성] 일부만 수신 (" + String(g_vnote.have) + "/" +
+                                 String(g_vnote.n) + ")");
+            return;
+        }
+        if (g_vnote.dst == 0xFFFF) {                  // §8 deferred slot, verbatim
+            uint32_t h = 2166136261u;
+            for (const char *c = NODE_ID; *c; c++) { h ^= (uint8_t)*c; h *= 16777619u; }
+            g_vnote.vn_due = now + 4 * toa + (h % 16) * toa + (esp_random() % (toa / 2 + 1));
+        } else {
+            g_vnote.vn_due = now + 4 * toa + (esp_random() % (toa / 2 + 1));
+        }
+        return;
+    }
+    if ((int32_t)(now - g_vnote.vn_due) < 0) return;
+    g_vnote.vn_due = 0;
+    g_vnote.vn_rounds++;
+    uint32_t have = 0;
+    for (int i = 0; i < g_vnote.n; i++) if (g_vnote.seen_mask & (1 << i)) have |= 1u << i;
+    voice_send_vn(b36(have).c_str());
+    g_vnote.last_ms = now;                            // restart the idle clock
+}
+
+// Boot self-test: the frame layer round-trips in RAM, a corrupt byte fails, and —
+// the property the whole relay design leans on — a DECREMENTED ttl still verifies.
+static void voice_selftest()
+{
+    uint8_t f[VOICE_HDR + 8 + 2];
+    const uint8_t pay[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    f[0] = VOICE_MAGIC; f[1] = 0x10; f[2] = 3;
+    uint16_t src = voice_addr("P10"), dst = 0xFFFF, vid = 0xBEEF;
+    f[3] = src & 0xFF; f[4] = src >> 8;
+    f[5] = dst & 0xFF; f[6] = dst >> 8;
+    f[7] = vid & 0xFF; f[8] = vid >> 8;
+    f[9] = 0; f[10] = 2; f[11] = 0; f[12] = 8;
+    memcpy(f + VOICE_HDR, pay, 8);
+    uint16_t c = crc16_ccitt_ttl0(f, VOICE_HDR + 8);
+    f[VOICE_HDR + 8] = c >> 8; f[VOICE_HDR + 8 + 1] = c & 0xFF;
+
+    bool ok = crc16_ccitt_ttl0(f, VOICE_HDR + 8) == c;
+    f[2] = 1;                                          // two relay hops later
+    ok &= crc16_ccitt_ttl0(f, VOICE_HDR + 8) == c;     // ...must still verify
+    f[15] ^= 0x40;                                     // one damaged payload byte
+    ok &= crc16_ccitt_ttl0(f, VOICE_HDR + 8) != c;     // ...must not
+    f[15] ^= 0x40;
+    ok &= voice_addr("TFF") == 0x54FF && voice_addr("P10") == 0x5010 &&
+          voice_addr("F00") == 0x4600;                 // the P00/F00 collision fix
+    Serial.printf("[voice] frame selftest %s (addr TFF=%04X)\n",
+                  ok ? "ok" : "FAILED", voice_addr("TFF"));
+}
+
 static void lora_l1_dispatch(const String &line)
 {
     int t1 = line.indexOf('\t');
     String type = (t1 < 0) ? line.substring(1) : line.substring(1, t1);
     if (type == "GA") { news_handle(true,  line); return; }   // v1.4 news announce (+v1.8 seq)
     if (type == "GH") { news_handle(false, line); return; }   // v1.4 news headline → inbox
-    if (type == "GR") { news_head_handle(line);   return; }   // v1.8 article reply header
-    if (type == "GD") { news_data_handle(line);   return; }   // v1.5 article body chunk
+    if (type == "GR") { g_gq_answered = true; news_head_handle(line); return; }   // v1.8 reply header
+    if (type == "GD") { g_gq_answered = true; news_data_handle(line); return; }   // v1.5 body chunk
+    if (type == "RB") { router_handle_rb(line);   return; }   // v1.11 router beacon
+    if (type == "VA") { voice_handle_va(line);    return; }   // v1.12 voice announce
+    if (type == "VN") { voice_handle_vn(line);    return; }   // v1.12 voice repair req
     if (type == "AL") { alert_handle(line);       return; }   // v1.8 disaster alert
     if (type == "BC") { book_handle_bc(line);     return; }   // v1.10 book catalogue
     if (type == "BT") { book_handle_bt(line);     return; }
@@ -2547,9 +2991,25 @@ static void discovery_poll_cb(lv_timer_t *)
         snprintf(tail, sizeof(tail), "  %ddBm %s  %lus\n", (int)n.rssi, hop, (unsigned long)age);
         body += tail;
     }
-    if (!g_neigh_n) { lv_label_set_text(g_disc_lbl, "listening...  (no nodes yet)"); return; }
+    // v1.11 diagnostics: which router this device pulls from, and how it sounds.
+    String rtr;
+    if (g_home >= 0) {
+        RouterInfo &r = g_routers[g_home];
+        char rl[96];
+        snprintf(rl, sizeof(rl), LV_SYMBOL_HOME " home %s  %.0fdBm  ns=%s  %s/%s\n",
+                 r.id, r.ewma, r.ns, r.floor[0] ? r.floor : "-", r.room[0] ? r.room : "-");
+        rtr = rl;
+    } else rtr = LV_SYMBOL_HOME " home: none (pulls go to *)\n";
+    for (int i = 0; i < g_routers_n; i++)
+        if (i != g_home) {
+            char rl[64];
+            snprintf(rl, sizeof(rl), "   rtr %s  %.0fdBm  %lus ago\n", g_routers[i].id,
+                     g_routers[i].ewma, (unsigned long)((now - g_routers[i].last_ms) / 1000));
+            rtr += rl;
+        }
+    if (!g_neigh_n && !g_routers_n) { lv_label_set_text(g_disc_lbl, "listening...  (no nodes yet)"); return; }
     char hdr[40]; snprintf(hdr, sizeof(hdr), "%d/%d alive\n", alive, g_neigh_n);
-    lv_label_set_text(g_disc_lbl, (String(hdr) + body).c_str());
+    lv_label_set_text(g_disc_lbl, (rtr + hdr + body).c_str());
 }
 
 // Relay layer in front of the message parser: strip the R| header, drop our own
@@ -2574,7 +3034,15 @@ static void lora_rx_dispatch(const String &line)
         }
         neigh_update(src, nm, g_lora_rx_rssi, hops);
         g_rx_ok++;
+        // Envelope context for the L1 handlers: v1.11 scopes (rev, seq) per src, and
+        // !RB derives the router id from here. Anything heard from the home router
+        // also clears the unanswered-pull counter — it is demonstrably alive.
+        strncpy(g_rx_src3, src.c_str(), sizeof(g_rx_src3) - 1);
+        g_rx_src3[sizeof(g_rx_src3) - 1] = 0;
+        g_rx_env_ttl = ttl;
+        if (g_home >= 0 && !strcmp(g_routers[g_home].id, g_rx_src3)) g_home_fail = 0;
         lora_process_line(orig);
+        g_rx_src3[0] = 0;
         return;
     }
     // else: not a valid R| line = RF corruption (CRC is off; all real traffic is
@@ -2604,10 +3072,23 @@ static void lora_service()            // always-on background RX (called from lo
     int guard = 0;
     while (g_lora_rx_flag && guard++ < 6) {     // drain bursts so fast SF9 packets don't pile up/corrupt
         g_lora_rx_flag = false;
-        String pkt;
-        int  st  = lora_radio.readData(pkt);
+        // Read into bytes, not a String: a 0xC2 voice frame is binary and a String
+        // truncates at its first NUL. The branch happens on the first byte, BEFORE any
+        // string conversion (VOICE.md §4.2 implementation note).
+        uint8_t raw[256];
+        size_t  rlen = lora_radio.getPacketLength();
+        if (rlen > sizeof(raw)) rlen = sizeof(raw);
+        int  st  = lora_radio.readData(raw, rlen);
         int  rs  = (int)lora_radio.getRSSI();
         float sn = lora_radio.getSNR();
+        if (st == RADIOLIB_ERR_NONE && rlen && raw[0] == VOICE_MAGIC) {
+            lora_radio.startReceive();
+            g_rx_rssi_last = rs; g_rx_snr_last = sn; g_lora_rx_rssi = rs;
+            voice_rx_frame(raw, (int)rlen);
+            continue;
+        }
+        String pkt;
+        if (st == RADIOLIB_ERR_NONE && rlen) pkt.concat((const char *)raw, rlen);
         // Back to listening BEFORE the line is parsed, stored and drawn. RadioLib's
         // readData() drops the radio into standby, so everything that happened between
         // there and the old startReceive() at the bottom of this loop happened deaf —
@@ -4042,6 +4523,15 @@ static void news_tick()
     uint32_t now = millis();
     tts_pump();                     // keep the speech queue moving, one line at a time
     book_tick();                    // page repair, on the quiet-gap + slot schedule
+    router_tick();                  // home-loss watchdog (§5: 3 silent beacons / 2 dead pulls)
+    voice_tick();                   // note repair + "out of voice range" surfacing
+    // An article pull that got NO reply at all in 15 s is one dead pull toward the
+    // home-lost trigger. Counted once per !GQ; any !GR/!GD clears the flag.
+    if (!g_gq_answered && g_gq_sent_ms && (uint32_t)(now - g_gq_sent_ms) > 15000) {
+        g_gq_answered = true;
+        router_pull_failed();
+        Serial.println("[rtr] GQ unanswered 15s");
+    }
 
     // The article arrived whole and its crc disagrees. It stays on screen: re-fetching
     // on this has now twice taken an article the reader would otherwise have been
@@ -4348,6 +4838,7 @@ void setup()
     setBrightness(g_screen_bright);   // restore saved brightness (boot_restore loaded it above)
 
     Serial.println("T-Deck OS ready.");
+    voice_selftest();               // the 0xC2 frame layer must round-trip before it airs
 #ifdef TTS_BENCH
     extern void tts_bench_run();   // measure the sanoTTS decoder on this silicon, once
     tts_bench_run();
