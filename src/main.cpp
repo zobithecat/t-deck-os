@@ -1461,6 +1461,7 @@ static void lora_emit_msg(String msg)
 // News UI is a small state machine inside g_news_root: LIST ⇄ ARTICLE. Views rebuild
 // that container (never g_app_view — the framework Back button lives there).
 static void lora_tx_line(const String &payload);   // defined below; used by news_send_gq()
+static void lora_tx_ttl(const String &payload, uint8_t ttl);   // voice !VA rides mesh ttl
 static String   b36(uint32_t n);                   // the one base36 encoder (books section)
 static uint32_t unb36(const String &s);
 static uint32_t crc32_of(const String &s);         // zlib-compatible, over chunks AS SENT
@@ -2775,11 +2776,50 @@ static void voice_handle_va(const String &line)
                   g_vnote.dur_ds / 10, g_vnote.dur_ds % 10);
 }
 
-// !VN\t<src>\t<vid>\t<bitmap> — someone asks US to re-send. We do not transmit notes
-// yet, so log only; the sender side lands with the record pipeline.
+// Sender-side note state — declared up here because the !VN handler below needs it;
+// the TX functions themselves live after the RX block.
+struct VoiceTx {
+    bool     active;                    // holding chunks for the repair window
+    uint16_t dst, vid;
+    uint8_t  n, codec, ttl, round;
+    const uint8_t *data; uint16_t len;
+    uint32_t sent_ms;
+    uint32_t resend_mask, resend_due;   // !VN asked; answered after the §8 hold
+};
+static VoiceTx       g_vtx;
+static volatile bool g_vtx_req     = false;  // Settings asked; the stream runs from loop()
+static uint32_t      g_vtx_last_ms = 0;      // §6: one note per src per 30 s
+
+// !VN\t<src>\t<vid>\t<bitmap> — someone asks the note's sender to re-send. Ours iff the
+// src field names OUR voice address. The answer is scheduled, never immediate (§8),
+// and fires from voice_tick with the round nibble bumped.
 static void voice_handle_vn(const String &line)
 {
-    Serial.printf("[voice] VN heard (no TX side yet): %s\n", line.c_str());
+    int t[3], p = 0, at = line.indexOf('\t');
+    while (p < 3 && at >= 0) { t[p++] = at; at = line.indexOf('\t', at + 1); }
+    if (p < 3) return;
+    uint16_t src = (uint16_t)unb36(line.substring(t[0] + 1, t[1]));
+    uint16_t vid = (uint16_t)unb36(line.substring(t[1] + 1, t[2]));
+    String   bm  = line.substring(t[2] + 1);
+    if (!g_vtx.active || src != voice_addr(NODE_ID) || vid != g_vtx.vid) return;
+    uint32_t all = ((uint32_t)1 << g_vtx.n) - 1, miss;
+    if (bm == "-") miss = all;                    // announce-only requester (§4.3)
+    else {
+        uint32_t have = unb36(bm);
+        // The v1.10 range rule, verbatim: a bit at or above n cannot describe this
+        // note — the digits may be in the wrong order (the reversed-bitmap incident),
+        // so a subset built from them would resend the wrong chunks. Send everything.
+        if (have & ~all) miss = all;
+        else             miss = ~have & all;
+    }
+    if (!miss) return;
+    g_vtx.resend_mask |= miss;
+    if (!g_vtx.resend_due) {
+        uint32_t toa = (uint32_t)(lora_radio.getTimeOnAir(VOICE_HDR + VOICE_CHUNK_MAX + 2) / 1000);
+        g_vtx.resend_due = millis() + 4 * toa + (esp_random() % (toa / 2 + 1));
+    }
+    Serial.printf("[voice] VN for our note: miss=%02lX, answering after hold\n",
+                  (unsigned long)miss);
 }
 
 static void voice_send_vn(const char *bitmap36)
@@ -2792,11 +2832,101 @@ static void voice_send_vn(const char *bitmap36)
                   (unsigned)g_vnote.vn_rounds + 1);
 }
 
+// --- voice plane TX (VOICE.md v1.12 sender side) -------------------------------------
+// A canned Piper-rendered clip stands in for the microphone until the record pipeline
+// lands: the P10 one-way test needs a sender before it needs an encoder. The path is
+// the real one — !VA announce, paced 0xC2 chunks, §8-held !VN answers with the round
+// nibble — so swapping the clip for live Codec2 later changes one pointer.
+#include "voice_test_clip.h"
+
+static bool alert_real_active()              // §4.5: voice yields to a live real alert
+{
+    for (int i = 0; i < g_alerts_n; i++)
+        if (g_alerts[i].state == 0 && !g_alerts[i].drill) return true;
+    return false;
+}
+
+static void voice_tx_frame(uint8_t seq)
+{
+    uint16_t off = (uint16_t)seq * VOICE_CHUNK_MAX;
+    if (off >= g_vtx.len) return;
+    uint16_t rem = g_vtx.len - off;
+    uint8_t  pl  = rem > VOICE_CHUNK_MAX ? VOICE_CHUNK_MAX : (uint8_t)rem;
+    uint8_t f[VOICE_HDR + VOICE_CHUNK_MAX + 2];
+    f[0] = VOICE_MAGIC;
+    f[1] = 0x10 | (g_vtx.round & 0x0F);          // high nibble v1, low = transmission round
+    f[2] = g_vtx.ttl;
+    uint16_t src = voice_addr(NODE_ID);
+    f[3] = src & 0xFF;        f[4] = src >> 8;   // LE
+    f[5] = g_vtx.dst & 0xFF;  f[6] = g_vtx.dst >> 8;
+    f[7] = g_vtx.vid & 0xFF;  f[8] = g_vtx.vid >> 8;
+    f[9] = seq; f[10] = g_vtx.n; f[11] = g_vtx.codec; f[12] = pl;
+    memcpy(f + VOICE_HDR, g_vtx.data + off, pl);
+    uint16_t c = crc16_ccitt_ttl0(f, VOICE_HDR + pl);
+    f[VOICE_HDR + pl] = c >> 8; f[VOICE_HDR + pl + 1] = c & 0xFF;
+    int tot = VOICE_HDR + pl + 2;
+    lora_radio.transmit(f, (size_t)tot);         // the (uint8_t*, len) API — NULs inside
+    lora_radio.startReceive();
+    uint32_t toa = (uint32_t)(lora_radio.getTimeOnAir(tot) / 1000);
+    Serial.printf("[voice] TX chunk %u/%u  %dB  round %u\n", seq, g_vtx.n, tot, g_vtx.round);
+    delay(toa * 13 / 10);                        // §7: inter-chunk gap = 1.3 x ToA, from TX end
+}
+
+static void voice_send_note(const uint8_t *data, uint16_t len, uint8_t codec,
+                            uint16_t dst, uint8_t ttl)
+{
+    if (!g_lora_ok || !len || !data) return;
+    if (alert_real_active()) {                   // an evacuation order outranks voice mail
+        if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_WARNING " 경보 활성 중 - 음성 송신 보류");
+        return;
+    }
+    uint32_t now = millis();
+    if (g_vtx_last_ms && (uint32_t)(now - g_vtx_last_ms) < 30000) {
+        if (g_toast) lv_label_set_text(g_toast, "음성쪽지는 30초에 1건");
+        return;
+    }
+    g_vtx_last_ms = now;
+    uint32_t crc = crc32_bytes(data, len);
+    g_vtx.active = true; g_vtx.data = data; g_vtx.len = len;
+    g_vtx.codec = codec; g_vtx.dst = dst; g_vtx.ttl = ttl; g_vtx.round = 0;
+    g_vtx.n = (uint8_t)((len + VOICE_CHUNK_MAX - 1) / VOICE_CHUNK_MAX);
+    g_vtx.vid = (uint16_t)(crc & 0xFFFF);        // §3: content-derived on purpose
+    g_vtx.resend_mask = 0; g_vtx.resend_due = 0;
+    uint16_t frames = (codec == 1) ? len / 4 : len / 6;
+    uint16_t dur_ds = frames * 4 / 10;           // 40 ms a frame, in deciseconds
+    lora_tx_ttl("!VA\t" + b36(voice_addr(NODE_ID)) + "\t" + b36(g_vtx.vid) + "\t" +
+                b36(g_vtx.n) + "\t" + b36(codec) + "\t" + b36(dur_ds) + "\t" + b36(crc) + "\n",
+                RELAY_TTL_MESH);                 // the announce floods even where chunks cannot
+    for (uint8_t s = 0; s < g_vtx.n; s++) voice_tx_frame(s);
+    g_vtx.sent_ms = millis();
+    Serial.printf("[voice] note sent: vid=%04X n=%u %u.%us -> %04X ttl%u\n",
+                  g_vtx.vid, g_vtx.n, dur_ds / 10, dur_ds % 10, dst, ttl);
+    if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_OK " 음성쪽지 송신됨 (수리 대기 2분)");
+}
+
 // §4.4 repair discipline. Never immediate: hold 4×ToA + jitter (unicast), or the §8
 // deferred slot (broadcast). Two rounds, then the note is marked partial and kept —
 // a playable prefix is still playable (40 ms alignment).
 static void voice_tick()
 {
+    // TX side: the Settings trigger runs here, not in the LVGL callback — the stream
+    // blocks for seconds, and !VN answers wait out their §8 hold here too.
+    if (g_vtx_req) {
+        g_vtx_req = false;
+        voice_send_note(VOICE_TEST_CLIP, VOICE_TEST_CLIP_LEN, 0, voice_addr("P10"), 1);
+    }
+    if (g_vtx.active) {
+        uint32_t tnow = millis();
+        if (g_vtx.resend_mask && g_vtx.resend_due && (int32_t)(tnow - g_vtx.resend_due) >= 0) {
+            if (g_vtx.round < 15) g_vtx.round++;   // relays dedup on (round, vid, seq)
+            uint32_t m = g_vtx.resend_mask;
+            g_vtx.resend_mask = 0; g_vtx.resend_due = 0;
+            for (uint8_t s = 0; s < g_vtx.n; s++) if (m & (1u << s)) voice_tx_frame(s);
+            g_vtx.sent_ms = millis();
+        }
+        if ((uint32_t)(tnow - g_vtx.sent_ms) > 120000) g_vtx.active = false;
+    }
+
     if (!g_vnote.active || g_vnote.done) return;
     uint32_t now = millis();
     uint32_t toa = g_vnote.toa_ms ? g_vnote.toa_ms : 1300;
@@ -3864,6 +3994,15 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
             Preferences p; p.begin("tdeckos", false); p.putUChar("tbaccel", (uint8_t)g_tb_accel); p.end();
         }, LV_EVENT_VALUE_CHANGED, NULL);
         lv_group_add_obj(g, tslider);
+
+        // Voice plane one-way test (VOICE.md v1.12): send the canned 2 s clip to P10
+        // as a real note — !VA announce + 2 paced 0xC2 chunks, then hold for repair.
+        lv_obj_t *vbtn = lv_btn_create(parent);
+        lv_obj_t *vbl  = lv_label_create(vbtn);
+        lv_obj_set_style_text_font(vbl, &font_kr16, 0);
+        lv_label_set_text(vbl, LV_SYMBOL_VOLUME_MID " 음성쪽지 테스트 -> P10");
+        lv_obj_add_event_cb(vbtn, [](lv_event_t *) { g_vtx_req = true; }, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, vbtn);
 
         lv_obj_t *blbl = lv_label_create(parent);
         lv_label_set_text(blbl, "Message beep volume  (0 = mute)");
