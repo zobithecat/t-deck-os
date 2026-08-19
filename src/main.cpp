@@ -98,6 +98,18 @@ static char     g_rx_src3[8]   = "";  // envelope src of the L1 line in flight
 static uint8_t  g_rx_env_ttl   = 0;   // its envelope ttl (1 = provably direct)
 static bool     g_gq_answered  = true;   // the open !GQ got its first !GR/!GD back
 static uint32_t g_gq_sent_ms   = 0;      // ...else 15 s of silence = one failed pull
+// A chunk render is a full label re-wrap plus a repaint of the whole reading region —
+// tens of ms on this panel. Fine alone; landing every 650 ms in the middle of a
+// trackball scroll it eats the frame budget and the scroll visibly hitches. While the
+// ball is moving, chunk renders are DEFERRED: handlers mark dirty, news_tick flushes
+// once the ball has been still for a beat. The progressive display stays progressive —
+// it just holds its breath while you steer.
+static volatile uint32_t g_ui_scroll_ms = 0;   // last trackball scroll (trackball_read)
+static bool g_art_dirty = false, g_rd_dirty = false;
+static inline bool render_defer()
+{
+    return g_ui_scroll_ms && (uint32_t)(millis() - g_ui_scroll_ms) < 250;
+}
 static bool          g_lora_ok = false;
 static lv_obj_t     *g_lora_log;
 static lv_obj_t     *g_lora_input;
@@ -528,7 +540,7 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
                                    : lv_obj_get_scroll_top(scroll_tgt);
         if (room < 0) room = 0;
         if ((dy < 0 ? -dy : dy) > room) dy = (dy < 0) ? -room : room;
-        if (dy) lv_obj_scroll_by(scroll_tgt, 0, dy, LV_ANIM_OFF);
+        if (dy) { lv_obj_scroll_by(scroll_tgt, 0, dy, LV_ANIM_OFF); g_ui_scroll_ms = now; }
 
         // Roll past the end of the page and it turns, on the first read that finds
         // nowhere left to go. `room` is measured BEFORE this read's scroll, so the read
@@ -1642,6 +1654,8 @@ static bool news_upsert(const String &art, const String &title)
 static void news_art_render()
 {
     if (!g_art_body) return;
+    if (render_defer()) { g_art_dirty = true; return; }
+    g_art_dirty = false;
     if (!g_art_total) { lv_label_set_text(g_art_body, "requesting article..."); return; }
     String body;
     for (int i = 0; i < g_art_total; i++) body += g_art_seen[i] ? g_art_chunk[i] : "...";
@@ -2457,6 +2471,8 @@ static String book_reflow(const String &src)
 static void book_render_page()
 {
     if (!g_rd_body) return;
+    if (render_defer()) { g_rd_dirty = true; return; }   // never re-wrap mid-scroll
+    g_rd_dirty = false;
     // How far the page goes. !BR gives the real count, but it can be the frame that gets
     // lost, and chunks that have arrived must not sit invisible behind a missing header —
     // so without it, go to the highest chunk seen.
@@ -4664,6 +4680,11 @@ static void news_tick()
     book_tick();                    // page repair, on the quiet-gap + slot schedule
     router_tick();                  // home-loss watchdog (§5: 3 silent beacons / 2 dead pulls)
     voice_tick();                   // note repair + "out of voice range" surfacing
+    // Flush the chunk renders that were deferred while the ball was moving.
+    if (!render_defer()) {
+        if (g_art_dirty) news_art_render();
+        if (g_rd_dirty)  book_render_page();
+    }
     // An article pull that got NO reply at all in 15 s is one dead pull toward the
     // home-lost trigger. Counted once per !GQ; any !GR/!GD clears the flag.
     if (!g_gq_answered && g_gq_sent_ms && (uint32_t)(now - g_gq_sent_ms) > 15000) {
