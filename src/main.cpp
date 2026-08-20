@@ -301,6 +301,7 @@ static int           g_sd_count;
 static void go_home();
 static void open_app(const char *name);
 static void news_tick();
+static void lora_service();   // playback's wait loop drains the radio through this
 static void       alert_list_render();
 static int        alert_find(const String &id);
 static AlertItem *alert_store(const String &id);
@@ -3073,13 +3074,51 @@ static void voice_play_note()
         Serial.println("[voice] play task alloc failed");
         return;
     }
-    while (g_vplay_running || eTaskGetState(h) != eSuspended) delay(5);
+    // Drain the radio while playback runs: the 3x repeats hold this loop for seconds,
+    // and !VT lines (sent AFTER the chunks per spec) plus anyone's repair requests land
+    // exactly in that window — one radio buffer deep, everything else lost. We ARE the
+    // loop task here, so calling its own service is safe; new-note traffic is gated off
+    // in the RX handlers while g_vplay_running (the decoder is reading g_vnote).
+    while (g_vplay_running || eTaskGetState(h) != eSuspended) { lora_service(); delay(5); }
     vTaskDeleteWithCaps(h);                    // stack is PSRAM; free it only off-CPU
 }
 
 // Incoming voice note = the drill-alert treatment: a full-screen takeover on the top
 // layer with the metadata as text, painted BEFORE playback blocks the loop (the 3x
 // repeats take seconds — lv_refr_now gets the panel on glass first). Ball click closes.
+static lv_obj_t *g_vdlg_body = NULL;
+static struct { uint16_t src, vid; char who[8]; float secs; bool verified; uint8_t have, n; } g_vdlg_meta;
+static String voice_text_for(uint16_t src, uint16_t vid);   // defined with the !VT store below
+
+// Body text, composed fresh each time: caption headline, then the !VT full text if any
+// is held for this (src, vid) — which may arrive AFTER the panel went up.
+static String voice_dialog_body()
+{
+    String b;
+    if (g_vnote.caption[0] && g_vnote.src == g_vdlg_meta.src && g_vnote.vid == g_vdlg_meta.vid) {
+        b += g_vnote.caption; b += "\n\n";
+    }
+    String full = voice_text_for(g_vdlg_meta.src, g_vdlg_meta.vid);
+    if (full.length()) { b += full; b += "\n\n"; }
+    char meta[96];
+    if (g_vdlg_meta.have >= g_vdlg_meta.n)
+        snprintf(meta, sizeof(meta), "%s 발신, %.1f초, %s",
+                 g_vdlg_meta.who, g_vdlg_meta.secs,
+                 g_vdlg_meta.verified ? "무결성 확인됨" : "미검증");
+    else
+        snprintf(meta, sizeof(meta), "%s 발신, %.1f초, 일부만 수신 (%u/%u)",
+                 g_vdlg_meta.who, g_vdlg_meta.secs, g_vdlg_meta.have, g_vdlg_meta.n);
+    b += meta;
+    return b;
+}
+
+static void voice_dialog_refresh()
+{
+    if (!g_vdlg || !g_vdlg_body) return;
+    lv_label_set_text(g_vdlg_body, voice_dialog_body().c_str());
+    lv_refr_now(NULL);                    // may run while playback holds the loop
+}
+
 static void voice_show_dialog(const char *who, float secs, bool verified, uint8_t have, uint8_t n)
 {
     if (g_vdlg) { lv_obj_del(g_vdlg); g_vdlg = NULL; }
@@ -3097,19 +3136,17 @@ static void voice_show_dialog(const char *who, float secs, bool verified, uint8_
     lv_obj_set_style_text_color(head, lv_color_white(), 0);
     lv_label_set_text_fmt(head, LV_SYMBOL_VOLUME_MAX " 음성쪽지        %s", who);
     lv_obj_t *body = lv_label_create(g_vdlg);
+    g_vdlg_body = body;
+    g_vdlg_meta.src = g_vnote.src; g_vdlg_meta.vid = g_vnote.vid;
+    strncpy(g_vdlg_meta.who, who, sizeof(g_vdlg_meta.who) - 1);
+    g_vdlg_meta.who[sizeof(g_vdlg_meta.who) - 1] = 0;
+    g_vdlg_meta.secs = secs; g_vdlg_meta.verified = verified;
+    g_vdlg_meta.have = have; g_vdlg_meta.n = n;
     lv_obj_set_width(body, 296);
     lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_font(body, &font_kr16, 0);
     lv_obj_set_style_text_color(body, lv_color_white(), 0);
-    const char *cap = g_vnote.caption[0] ? g_vnote.caption : NULL;   // v1.13 text half
-    if (have >= n)
-        lv_label_set_text_fmt(body, "%s%s%s 발신, %.1f초\n%s\n\n3회 반복 재생됩니다.",
-                              cap ? cap : "", cap ? "\n\n" : "",
-                              who, secs, verified ? "무결성 확인됨" : "미검증 (announce 불일치)");
-    else
-        lv_label_set_text_fmt(body, "%s%s%s 발신, %.1f초\n일부만 수신 (%u/%u) - 수리 실패분 포함 재생\n\n3회 반복 재생됩니다.",
-                              cap ? cap : "", cap ? "\n\n" : "",
-                              who, secs, have, n);
+    lv_label_set_text(body, voice_dialog_body().c_str());
     lv_obj_t *hint = lv_label_create(g_vdlg);
     lv_obj_set_style_text_font(hint, &font_kr16, 0);
     lv_obj_set_style_text_color(hint, lv_color_hex(0x93C5FD), 0);
@@ -3187,6 +3224,8 @@ static void voice_rx_frame(const uint8_t *b, int len)
     if (n < 1 || n > VOICE_MAX_CHUNKS || seq >= n || codec > 1) return;
 
     if (!g_vnote.active || g_vnote.src != src || g_vnote.vid != vid) {
+        if (g_vplay_running) return;             // decoder is READING g_vnote right now —
+                                                 // a reset under it is the crash saga again
         if (g_vnote.active && !g_vnote.done)
             Serial.println("[voice] new note preempts an unfinished one");
         voice_note_reset(src, vid);
@@ -3208,6 +3247,57 @@ static void voice_rx_frame(const uint8_t *b, int len)
     if (g_vnote.have >= g_vnote.n) voice_note_completed();
 }
 
+// !VT (v1.13): the note's FULL text, ≤4 lines keyed (src, vid). No repair by design —
+// the third copy of one message does not earn one; a missing line shows as a gap.
+// Order-independent: text may land before its note exists or after its dialog is up.
+struct VoiceText {
+    bool     active;
+    uint16_t src, vid;
+    uint8_t  n, have_mask;              // n ≤ 4 per spec
+    char     part[4][46];               // ≤44 B text per line, [NL]-decoded
+    uint32_t ms;                        // orphan bound: 2 min without a matching note
+};
+static VoiceText g_vtext;
+
+static String voice_text_for(uint16_t src, uint16_t vid)   // "" when none held
+{
+    if (!g_vtext.active || g_vtext.src != src || g_vtext.vid != vid) return "";
+    String out;
+    for (int i = 0; i < g_vtext.n; i++) {
+        if (g_vtext.have_mask & (1 << i)) out += g_vtext.part[i];
+        else out += " (…누락…) ";        // spec: show the gap, never suppress the text
+    }
+    return out;
+}
+
+static void voice_dialog_refresh();      // text arriving after the takeover updates it
+
+static void voice_handle_vt(const String &line)
+{
+    int t[5], p = 0, at = line.indexOf('\t');
+    while (p < 5 && at >= 0) { t[p++] = at; at = line.indexOf('\t', at + 1); }
+    if (p < 5) return;
+    uint16_t src = (uint16_t)unb36(line.substring(t[0] + 1, t[1]));
+    uint16_t vid = (uint16_t)unb36(line.substring(t[1] + 1, t[2]));
+    uint8_t  i   = (uint8_t)unb36(line.substring(t[2] + 1, t[3]));
+    uint8_t  n   = (uint8_t)unb36(line.substring(t[3] + 1, t[4]));
+    if (src == voice_addr(NODE_ID)) return;
+    if (!n || n > 4 || i >= n) return;   // n MUST NOT exceed 4 (v1.13)
+    if (!g_vtext.active || g_vtext.src != src || g_vtext.vid != vid) {
+        memset(&g_vtext, 0, sizeof(g_vtext));
+        g_vtext.active = true; g_vtext.src = src; g_vtext.vid = vid;
+    }
+    g_vtext.n = n;
+    String txt = line.substring(t[4] + 1);
+    txt.replace("[NL]", "\n");           // same escape as !GD
+    strncpy(g_vtext.part[i], txt.c_str(), sizeof(g_vtext.part[i]) - 1);
+    g_vtext.part[i][sizeof(g_vtext.part[i]) - 1] = 0;
+    g_vtext.have_mask |= (uint8_t)(1u << i);
+    g_vtext.ms = millis();
+    Serial.printf("[voice] VT %s/%04X %u/%u\n", voice_addr_str(src).c_str(), vid, i + 1, n);
+    voice_dialog_refresh();
+}
+
 // !VA\t<src>\t<vid>\t<n>\t<codec>\t<dur_ds>\t<crc32> — push announce (text plane, relayed)
 static void voice_handle_va(const String &line)
 {
@@ -3217,8 +3307,10 @@ static void voice_handle_va(const String &line)
     uint16_t src = (uint16_t)unb36(line.substring(t[0] + 1, t[1]));   // b36 of the u16
     uint16_t vid = (uint16_t)unb36(line.substring(t[1] + 1, t[2]));
     if (src == voice_addr(NODE_ID)) return;
-    if (!g_vnote.active || g_vnote.src != src || g_vnote.vid != vid)
+    if (!g_vnote.active || g_vnote.src != src || g_vnote.vid != vid) {
+        if (g_vplay_running) return;             // same guard as the chunk path
         voice_note_reset(src, vid);
+    }
     g_vnote.have_va  = true;
     g_vnote.n        = (uint8_t)unb36(line.substring(t[2] + 1, t[3]));
     g_vnote.codec    = (uint8_t)unb36(line.substring(t[3] + 1, t[4]));
@@ -3632,8 +3724,13 @@ static void voice_tick()
     }
     if (g_vdlg_dismiss) {
         g_vdlg_dismiss = false;
-        if (g_vdlg) { lv_obj_del(g_vdlg); g_vdlg = NULL; }
+        if (g_vdlg) { lv_obj_del(g_vdlg); g_vdlg = NULL; g_vdlg_body = NULL; }
     }
+    // v1.13 orphan bound (our review note on PR #13): !VT held for a note that never
+    // arrived cannot wait on §4.4 timers that never started. Two minutes, then gone.
+    if (g_vtext.active && (uint32_t)(millis() - g_vtext.ms) > 120000 &&
+        (!g_vnote.active || g_vnote.src != g_vtext.src || g_vnote.vid != g_vtext.vid))
+        memset(&g_vtext, 0, sizeof(g_vtext));
     if (g_ptt_txlen) {
         uint16_t plen2 = g_ptt_txlen; g_ptt_txlen = 0;
         voice_send_note(g_enc_buf, plen2, 1, 0xFFFF, 1, true);   // walkie: broadcast, no 30 s gate
@@ -3668,6 +3765,10 @@ static void voice_tick()
             // forget the previous note so every press plays.
             memset(&g_vnote, 0, sizeof(g_vnote));
             g_vrx_loopback = true;
+            // !VT BEFORE the announce on purpose — order independence is a spec MUST and
+            // the loopback should walk the ordering nobody designs for.
+            voice_handle_vt("!VT\t" + b36(src) + "\t" + b36(vid) + "\t0\t2\t지금 즉시 대피하십시오. ");
+            voice_handle_vt("!VT\t" + b36(src) + "\t" + b36(vid) + "\t1\t2\t가까운 대피소로 이동하십시오.");
             voice_handle_va("!VA\t" + b36(src) + "\t" + b36(vid) + "\t1\t1\t" +
                             b36((VOICE_TEST_CLIP_LEN / 4) * 4 / 10) + "\t" + b36(crc) +
                             "\t대피 안내 시험 방송");   // v1.13 caption, exercised end to end
@@ -3820,6 +3921,7 @@ static void lora_l1_dispatch(const String &line)
     if (type == "RB") { router_handle_rb(line);   return; }   // v1.11 router beacon
     if (type == "VA") { voice_handle_va(line);    return; }   // v1.12 voice announce
     if (type == "VN") { voice_handle_vn(line);    return; }   // v1.12 voice repair req
+    if (type == "VT") { voice_handle_vt(line);    return; }   // v1.13 voice full text
     if (type == "AL") { alert_handle(line);       return; }   // v1.8 disaster alert
     if (type == "BC") { book_handle_bc(line);     return; }   // v1.10 book catalogue
     if (type == "BT") { book_handle_bt(line);     return; }
