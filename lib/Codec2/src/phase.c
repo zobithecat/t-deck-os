@@ -25,18 +25,45 @@
   along with this program; if not,see <http://www.gnu.org/licenses/>.
 */
 
-#include "defines.h"
 #include "phase.h"
-#include "kiss_fft.h"
-#include "comp.h"
-#include "sine.h"
 
 #include <assert.h>
 #include <ctype.h>
 #include <math.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 
+#include "comp.h"
+#include "comp_prim.h"
+#include "defines.h"
+#include "kiss_fft.h"
+#include "sine.h"
+
+/*---------------------------------------------------------------------------*\
+
+  sample_phase()
+
+  Samples phase at centre of each harmonic from and array of FFT_ENC
+  DFT samples.
+
+\*---------------------------------------------------------------------------*/
+
+void sample_phase(MODEL *model, COMP H[],
+                  COMP A[] /* LPC analysis filter in freq domain */
+) {
+  int m, b;
+  float r;
+
+  r = TWO_PI / (FFT_ENC);
+
+  /* Sample phase at harmonics */
+
+  for (m = 1; m <= model->L; m++) {
+    b = (int)(m * model->Wo / r + 0.5);
+    H[m] =
+        cconj(A[b]); /* synth filter 1/A is opposite phase to analysis filter */
+  }
+}
 
 /*---------------------------------------------------------------------------*\
 
@@ -46,10 +73,11 @@
    parameters are required apart from the SNR (which can be reduced to a
    1 bit V/UV decision per frame).
 
-   The phase of each harmonic is modelled as the phase of a LPC
-   synthesis filter excited by an impulse.  Unlike the first order
-   model the position of the impulse is not transmitted, so we create
-   an excitation pulse train using a rule based approach.
+   The phase of each harmonic is modelled as the phase of a synthesis
+   filter excited by an impulse.  In many Codec 2 modes the synthesis
+   filter is a LPC filter. Unlike the first order model the position
+   of the impulse is not transmitted, so we create an excitation pulse
+   train using a rule based approach.
 
    Consider a pulse train with a pulse starting time n=0, with pulses
    repeated at a rate of Wo, the fundamental frequency.  A pulse train
@@ -72,16 +100,16 @@
 
    As we don't transmit the pulse position for this model, we need to
    synthesise it.  Now the excitation pulses occur at a rate of Wo.
-   This means the phase of the first harmonic advances by N samples
-   over a synthesis frame of N samples.  For example if Wo is pi/20
-   (200 Hz), then over a 10ms frame (N=80 samples), the phase of the
+   This means the phase of the first harmonic advances by N_SAMP samples
+   over a synthesis frame of N_SAMP samples.  For example if Wo is pi/20
+   (200 Hz), then over a 10ms frame (N_SAMP=80 samples), the phase of the
    first harmonic would advance (pi/20)*80 = 4*pi or two complete
    cycles.
 
    We generate the excitation phase of the fundamental (first
    harmonic):
 
-     arg[E[1]] = Wo*N;
+     arg[E[1]] = Wo*N_SAMP;
 
    We then relate the phase of the m-th excitation harmonic to the
    phase of the fundamental as:
@@ -99,7 +127,7 @@
    - If there are voicing errors, the speech can sound clicky or
      staticy.  If V speech is mistakenly declared UV, this model tends to
      synthesise impulses or clicks, as there is usually very little shift or
-     dispersion through the LPC filter.
+     dispersion through the LPC synthesis filter.
 
    - When combined with LPC amplitude modelling there is an additional
      drop in quality.  I am not sure why, theory is interformant energy
@@ -129,71 +157,119 @@
 \*---------------------------------------------------------------------------*/
 
 void phase_synth_zero_order(
-    kiss_fft_cfg fft_fwd_cfg,
-    MODEL *model,
-    float *ex_phase,            /* excitation phase of fundamental */
-    COMP   A[]
-)
-{
-    int   m, b;
-    float phi_, new_phi, r;
-    COMP  Ex[MAX_AMP+1];	  /* excitation samples */
-    COMP  A_[MAX_AMP+1];	  /* synthesised harmonic samples */
-    COMP  H[MAX_AMP+1];           /* LPC freq domain samples */
+    int n_samp, MODEL *model,
+    float *ex_phase, /* excitation phase of fundamental        */
+    COMP H[]         /* L synthesis filter freq domain samples */
 
-    r = TWO_PI/(FFT_ENC);
+) {
+  int m;
+  float new_phi;
+  COMP Ex[MAX_AMP + 1]; /* excitation samples */
+  COMP A_[MAX_AMP + 1]; /* synthesised harmonic samples */
 
-    /* Sample phase at harmonics */
+  /*
+     Update excitation fundamental phase track, this sets the position
+     of each pitch pulse during voiced speech.  After much experiment
+     I found that using just this frame's Wo improved quality for UV
+     sounds compared to interpolating two frames Wo like this:
 
-    for(m=1; m<=model->L; m++) {
-        b = (int)(m*model->Wo/r + 0.5);
-        phi_ = -atan2f(A[b].imag, A[b].real);
-        H[m].real = cosf(phi_);
-        H[m].imag = sinf(phi_);
+     ex_phase[0] += (*prev_Wo+model->Wo)*N_SAMP/2;
+  */
+
+  ex_phase[0] += (model->Wo) * n_samp;
+  ex_phase[0] -= TWO_PI * floorf(ex_phase[0] / TWO_PI + 0.5);
+
+  for (m = 1; m <= model->L; m++) {
+    /* generate excitation */
+
+    if (model->voiced) {
+      Ex[m].real = cosf(ex_phase[0] * m);
+      Ex[m].imag = sinf(ex_phase[0] * m);
+    } else {
+      /* When a few samples were tested I found that LPC filter
+         phase is not needed in the unvoiced case, but no harm in
+         keeping it.
+      */
+      float phi = TWO_PI * (float)codec2_rand() / CODEC2_RAND_MAX;
+      Ex[m].real = cosf(phi);
+      Ex[m].imag = sinf(phi);
     }
 
-    /*
-       Update excitation fundamental phase track, this sets the position
-       of each pitch pulse during voiced speech.  After much experiment
-       I found that using just this frame's Wo improved quality for UV
-       sounds compared to interpolating two frames Wo like this:
+    /* filter using LPC filter */
 
-       ex_phase[0] += (*prev_Wo+model->Wo)*N/2;
-    */
+    A_[m].real = H[m].real * Ex[m].real - H[m].imag * Ex[m].imag;
+    A_[m].imag = H[m].imag * Ex[m].real + H[m].real * Ex[m].imag;
 
-    ex_phase[0] += (model->Wo)*N;
-    ex_phase[0] -= TWO_PI*floorf(ex_phase[0]/TWO_PI + 0.5);
+    /* modify sinusoidal phase */
 
-    for(m=1; m<=model->L; m++) {
-
-        /* generate excitation */
-
-        if (model->voiced) {
-
-            Ex[m].real = cosf(ex_phase[0]*m);
-            Ex[m].imag = sinf(ex_phase[0]*m);
-        }
-        else {
-
-            /* When a few samples were tested I found that LPC filter
-               phase is not needed in the unvoiced case, but no harm in
-               keeping it.
-            */
-            float phi = TWO_PI*(float)codec2_rand()/CODEC2_RAND_MAX;
-            Ex[m].real = cosf(phi);
-            Ex[m].imag = sinf(phi);
-        }
-
-        /* filter using LPC filter */
-
-        A_[m].real = H[m].real*Ex[m].real - H[m].imag*Ex[m].imag;
-        A_[m].imag = H[m].imag*Ex[m].real + H[m].real*Ex[m].imag;
-
-        /* modify sinusoidal phase */
-
-        new_phi = atan2f(A_[m].imag, A_[m].real+1E-12);
-        model->phi[m] = new_phi;
-    }
-
+    new_phi = atan2f(A_[m].imag, A_[m].real + 1E-12);
+    model->phi[m] = new_phi;
+  }
 }
 
+/*---------------------------------------------------------------------------*\
+
+  FUNCTION....: mag_to_phase
+  AUTHOR......: David Rowe
+  DATE CREATED: Jan 2017
+
+  Algorithm for http://www.dsprelated.com/showcode/20.php ported to C.  See
+  also Octave function mag_to_phase.m
+
+  Given a magnitude spectrum in dB, returns a minimum-phase phase
+  spectra.
+
+\*---------------------------------------------------------------------------*/
+
+void mag_to_phase(
+    float phase[], /* Nfft/2+1 output phase samples in radians       */
+    float Gdbfk[], /* Nfft/2+1 positive freq amplitudes samples in dB */
+    int Nfft, codec2_fft_cfg fft_fwd_cfg, codec2_fft_cfg fft_inv_cfg) {
+  COMP Sdb[Nfft], c[Nfft], cf[Nfft], Cf[Nfft];
+  int Ns = Nfft / 2 + 1;
+  int i;
+
+  /* install negative frequency components, 1/Nfft takes into
+     account kiss fft lack of scaling on ifft */
+
+  Sdb[0].real = Gdbfk[0];
+  Sdb[0].imag = 0.0;
+  for (i = 1; i < Ns; i++) {
+    Sdb[i].real = Sdb[Nfft - i].real = Gdbfk[i];
+    Sdb[i].imag = Sdb[Nfft - i].imag = 0.0;
+  }
+
+  /* compute real cepstrum from log magnitude spectrum */
+
+  codec2_fft(fft_inv_cfg, Sdb, c);
+  for (i = 0; i < Nfft; i++) {
+    c[i].real /= (float)Nfft;
+    c[i].imag /= (float)Nfft;
+  }
+
+  /* Fold cepstrum to reflect non-min-phase zeros inside unit circle */
+
+  cf[0] = c[0];
+  for (i = 1; i < Ns - 1; i++) {
+    cf[i] = cadd(c[i], c[Nfft - i]);
+  }
+  cf[Ns - 1] = c[Ns - 1];
+  for (i = Ns; i < Nfft; i++) {
+    cf[i].real = 0.0;
+    cf[i].imag = 0.0;
+  }
+
+  /* Cf = dB_magnitude + j * minimum_phase */
+
+  codec2_fft(fft_fwd_cfg, cf, Cf);
+
+  /*  The maths says we are meant to be using log(x), not 20*log10(x),
+      so we need to scale the phase to account for this:
+      log(x) = 20*log10(x)/scale */
+
+  float scale = (20.0 / logf(10.0));
+
+  for (i = 0; i < Ns; i++) {
+    phase[i] = Cf[i].imag / scale;
+  }
+}

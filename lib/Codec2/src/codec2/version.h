@@ -1,15 +1,15 @@
 /*---------------------------------------------------------------------------*\
 
-  FILE........: phaseexp.h
-  AUTHOR......: David Rowe
-  DATE CREATED: June 2012
+  FILE........: version.h
+  AUTHOR......: Tomas Härdin
+  DATE CREATED: 03 November 2017
 
-  Experimental functions for quantising, modelling and synthesising phase.
+  Codec 2 VERSION #defines
 
 \*---------------------------------------------------------------------------*/
 
 /*
-  Copyright (C) 2012 David Rowe
+  Copyright (C) 2017 Tomas Härdin
 
   All rights reserved.
 
@@ -25,15 +25,13 @@
   along with this program; if not, see <http://www.gnu.org/licenses/>.
 */
 
-#ifndef __PHASEEXP__
-#define __PHASEEXP__
+//this functions both as an include guard and your typical HAVE macro
+#ifndef CODEC2_HAVE_VERSION
+#define CODEC2_HAVE_VERSION
 
-#include "kiss_fft.h"
+#define CODEC2_VERSION_MAJOR 1
+#define CODEC2_VERSION_MINOR 2
+/* #undef CODEC2_VERSION_PATCH */
+#define CODEC2_VERSION "1.2.0"
 
-struct PEXP;
-
-struct PEXP * phase_experiment_create();
-void phase_experiment_destroy(struct PEXP *pexp);
-void phase_experiment(struct PEXP *pexp, MODEL *model, char *arg);
-
-#endif
+#endif //CODEC2_HAVE_VERSION

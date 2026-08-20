@@ -1,14 +1,18 @@
 /* THIS IS A GENERATED FILE. Edit generate_codebook.c and its input */
 
 /*
- * This intermediary file and the files that used to create it are under
+ * This intermediary file and the files that used to create it are under 
  * The LGPL. See the file COPYING.
  */
 
 #include "defines.h"
 
-  /* codebook/dlsp1.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp1.txt */
+#ifdef __EMBEDDED__
 static const float codes0[] = {
+#else
+static const float codes0[] = {
+#endif
   25,
   50,
   75,
@@ -42,8 +46,12 @@ static const float codes0[] = {
   775,
   800
 };
-  /* codebook/dlsp2.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp2.txt */
+#ifdef __EMBEDDED__
 static const float codes1[] = {
+#else
+static const float codes1[] = {
+#endif
   25,
   50,
   75,
@@ -77,8 +85,12 @@ static const float codes1[] = {
   775,
   800
 };
-  /* codebook/dlsp3.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp3.txt */
+#ifdef __EMBEDDED__
 static const float codes2[] = {
+#else
+static const float codes2[] = {
+#endif
   25,
   50,
   75,
@@ -112,8 +124,12 @@ static const float codes2[] = {
   775,
   800
 };
-  /* codebook/dlsp4.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp4.txt */
+#ifdef __EMBEDDED__
 static const float codes3[] = {
+#else
+static const float codes3[] = {
+#endif
   25,
   50,
   75,
@@ -147,8 +163,12 @@ static const float codes3[] = {
   1350,
   1400
 };
-  /* codebook/dlsp5.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp5.txt */
+#ifdef __EMBEDDED__
 static const float codes4[] = {
+#else
+static const float codes4[] = {
+#endif
   25,
   50,
   75,
@@ -182,8 +202,12 @@ static const float codes4[] = {
   1350,
   1400
 };
-  /* codebook/dlsp6.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp6.txt */
+#ifdef __EMBEDDED__
 static const float codes5[] = {
+#else
+static const float codes5[] = {
+#endif
   25,
   50,
   75,
@@ -217,8 +241,12 @@ static const float codes5[] = {
   1350,
   1400
 };
-  /* codebook/dlsp7.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp7.txt */
+#ifdef __EMBEDDED__
 static const float codes6[] = {
+#else
+static const float codes6[] = {
+#endif
   25,
   50,
   75,
@@ -252,8 +280,12 @@ static const float codes6[] = {
   775,
   800
 };
-  /* codebook/dlsp8.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp8.txt */
+#ifdef __EMBEDDED__
 static const float codes7[] = {
+#else
+static const float codes7[] = {
+#endif
   25,
   50,
   75,
@@ -287,8 +319,12 @@ static const float codes7[] = {
   775,
   800
 };
-  /* codebook/dlsp9.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp9.txt */
+#ifdef __EMBEDDED__
 static const float codes8[] = {
+#else
+static const float codes8[] = {
+#endif
   25,
   50,
   75,
@@ -322,8 +358,12 @@ static const float codes8[] = {
   775,
   800
 };
-  /* codebook/dlsp10.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp10.txt */
+#ifdef __EMBEDDED__
 static const float codes9[] = {
+#else
+static const float codes9[] = {
+#endif
   25,
   50,
   75,
@@ -359,70 +399,70 @@ static const float codes9[] = {
 };
 
 const struct lsp_codebook lsp_cbd[] = {
-  /* codebook/dlsp1.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp1.txt */
   {
     1,
     5,
     32,
     codes0
   },
-  /* codebook/dlsp2.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp2.txt */
   {
     1,
     5,
     32,
     codes1
   },
-  /* codebook/dlsp3.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp3.txt */
   {
     1,
     5,
     32,
     codes2
   },
-  /* codebook/dlsp4.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp4.txt */
   {
     1,
     5,
     32,
     codes3
   },
-  /* codebook/dlsp5.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp5.txt */
   {
     1,
     5,
     32,
     codes4
   },
-  /* codebook/dlsp6.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp6.txt */
   {
     1,
     5,
     32,
     codes5
   },
-  /* codebook/dlsp7.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp7.txt */
   {
     1,
     5,
     32,
     codes6
   },
-  /* codebook/dlsp8.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp8.txt */
   {
     1,
     5,
     32,
     codes7
   },
-  /* codebook/dlsp9.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp9.txt */
   {
     1,
     5,
     32,
     codes8
   },
-  /* codebook/dlsp10.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/dlsp10.txt */
   {
     1,
     5,

@@ -96,7 +96,30 @@ static volatile bool g_lora_rx_flag = false;
 // R| header fails to parse. From the far end that is indistinguishable from never
 // having heard it, which is why a downlink can appear to lose 40% with a clean link
 // and a clean uplink. These counters are the only way to tell the two apart from here.
-static uint32_t g_rx_ok = 0, g_rx_bad = 0, g_rx_corrupt = 0;
+static uint32_t g_rx_ok = 0, g_rx_bad = 0, g_rx_corrupt = 0, g_rx_noise = 0;
+// False-lock filter (E00 measurement, 2026-08-20): with the PHY CRC off (D2), a false
+// preamble detection passes the explicit header's 4-bit CRC ~1/16 of the time and
+// delivers random bytes as a "reception". Energy is high but chirp correlation is
+// gone, so SNR separates what RSSI cannot (their sample: RSSI −32, SNR −0.25 against
+// a normal floor of 9.5). A failed reception more than 5 dB below the WORST recent
+// PARSED reception counts as rx_noise, not frame damage — and the baseline admits
+// parsed receptions only, otherwise false locks widen it until nothing is filtered.
+static float   g_snr_good[16];
+static uint8_t g_snr_good_n = 0, g_snr_good_i = 0;
+static int     g_rx_pkt_len = 0;   // radio-reported length of the packet being dispatched
+static void rx_snr_good(float snr)
+{
+    g_snr_good[g_snr_good_i] = snr;
+    g_snr_good_i = (g_snr_good_i + 1) & 15;
+    if (g_snr_good_n < 16) g_snr_good_n++;
+}
+static bool rx_is_noise(float snr)
+{
+    if (g_snr_good_n < 4) return false;          // no baseline yet: count it as damage
+    float mn = g_snr_good[0];
+    for (int i = 1; i < g_snr_good_n; i++) if (g_snr_good[i] < mn) mn = g_snr_good[i];
+    return snr < mn - 5.0f;
+}
 static int      g_rx_rssi_last = 0;
 static float    g_rx_snr_last  = 0;
 static uint32_t g_stream_ms    = 0;   // last !GD/!BD in: nothing of ours may transmit near it
@@ -2758,6 +2781,7 @@ struct VoiceNote {
     uint16_t src, dst, vid;
     uint8_t  n, codec;                  // n=0 until first chunk or !VA
     uint8_t  have, seen_mask;
+    uint8_t  unv_mask;                  // §5.2: crc16-failed bytes kept, awaiting repair
     uint8_t  clen[VOICE_MAX_CHUNKS];
     uint8_t  data[VOICE_MAX_CHUNKS][VOICE_CHUNK_MAX];
     bool     have_va;                   // !VA meta (advisory crc32 + duration)
@@ -2792,30 +2816,38 @@ static void voice_note_reset(uint16_t src, uint16_t vid)
 // duplicate channels on the way. Blocking for the clip length, like the chime.
 static void voice_play_note()
 {
-    if (!g_vnote.have) return;
-    if (g_vnote.codec != 0) {                 // vendored codec2 has no 700C decoder yet
-        Serial.println("[voice] codec 700C not decodable on-device yet");
-        return;
-    }
+    // §4.4 prefix rule, extended by §5.2: once repair has given up (partial), chunks
+    // whose crc16 failed but whose bytes were kept extend the playable prefix. Before
+    // give-up only verified chunks play — repair may still replace the kept ones.
+    uint8_t play_mask = g_vnote.seen_mask | (g_vnote.partial ? g_vnote.unv_mask : 0);
+    if (!play_mask) return;
+    if (g_vnote.codec > 1) { Serial.printf("[voice] unknown codec %u\n", g_vnote.codec); return; }
     audio_init();
-    struct CODEC2 *c2 = codec2_create(CODEC2_MODE_1200);
+    struct CODEC2 *c2 = codec2_create(g_vnote.codec == 1 ? CODEC2_MODE_700C : CODEC2_MODE_1200);
     if (!c2) { Serial.println("[voice] codec2_create failed"); return; }
-    const int spf = codec2_samples_per_frame(c2);          // 320 @ 40 ms
-    const int bpf = (codec2_bits_per_frame(c2) + 7) / 8;   // 6
+    const int spf = codec2_samples_per_frame(c2);          // 320 @ 40 ms, both modes
+    const int bpf = (codec2_bits_per_frame(c2) + 7) / 8;   // 1200: 6, 700C: 4
     float vol = audio_tone_amp() / 32767.0f;               // ride the master volume
     int16_t pcm[320];
     int16_t out[256];
     // Play the CONTIGUOUS prefix only: a hole would decode the next chunk against the
     // wrong decoder state and everything after it would warble. §4.4: a playable
     // prefix is still playable.
-    int chunks = 0;
-    while (chunks < g_vnote.n && (g_vnote.seen_mask & (1 << chunks))) chunks++;
-    Serial.printf("[voice] playing %d/%u chunks\n", chunks, g_vnote.n);
+    int chunks = 0, unv = 0;
+    while (chunks < g_vnote.n && (play_mask & (1 << chunks))) {
+        if (g_vnote.unv_mask & (1 << chunks)) unv++;
+        chunks++;
+    }
+    Serial.printf("[voice] playing %d/%u chunks (%d unverified) codec %u\n",
+                  chunks, g_vnote.n, unv, g_vnote.codec);
+    uint32_t dec_us = 0; int dec_frames = 0;               // decode cost, measured live
     float pos = 0, step = 8000.0f / AUDIO_RATE;
     int16_t prev = 0;
     for (int ci = 0; ci < chunks; ci++) {
         for (int off = 0; off + bpf <= g_vnote.clen[ci]; off += bpf) {
+            uint32_t d0 = micros();
             codec2_decode(c2, pcm, g_vnote.data[ci] + off);
+            dec_us += (uint32_t)(micros() - d0); dec_frames++;
             int oi = 0;
             for (int s = 0; s < spf; s++) {
                 int16_t cur = (int16_t)(pcm[s] * vol);
@@ -2841,6 +2873,10 @@ static void voice_play_note()
     int16_t z[128] = {0};                     // trailing silence so the clip ends cleanly
     g_i2s.write((const uint8_t *)z, sizeof(z));
     codec2_destroy(c2);
+    if (dec_frames)                            // RTF on real silicon, per codec — for E00
+        Serial.printf("[voice] decode %lums for %d frames (%.2fs audio, RTF %.2f)\n",
+                      (unsigned long)(dec_us / 1000), dec_frames, dec_frames * 0.04f,
+                      (dec_us / 1000.0f) / (dec_frames * 40.0f));
 }
 
 static void voice_note_completed()
@@ -2876,12 +2912,32 @@ static void voice_rx_frame(const uint8_t *b, int len)
     if (ttl < 1 || ttl > 3) { g_rx_corrupt++; return; }   // syntactic clamp, binary edition
     uint8_t plen = b[12];
     if (plen > VOICE_CHUNK_MAX || VOICE_HDR + plen + 2 != len) { g_rx_corrupt++; return; }
-    uint16_t crc = (uint16_t)b[VOICE_HDR + plen] << 8 | b[VOICE_HDR + plen + 1];
+    uint16_t crc = (uint16_t)b[VOICE_HDR + plen] << 8 | b[VOICE_HDR + plen + 1];   // BE on the wire
     if (crc16_ccitt_ttl0(b, VOICE_HDR + plen) != crc) {
+        if (rx_is_noise(g_rx_snr_last)) { g_rx_noise++; return; }   // false lock, not a frame
         g_rx_corrupt++;
-        Serial.printf("[voice] chunk crc16 fail (%d B)\n", len);
+        // §5.2 (E00 proposal, agreed): keep the bytes as UNVERIFIED — a failed CRC is
+        // usually a short burst inside 2 s of audio, and 80 ms of artifact beats a 2 s
+        // hole. The failed CRC covered the header too, so nothing here may START or
+        // retarget a note: the fields must match the note already being assembled, and
+        // a verified copy always outranks this one. Repair still runs (!VN unchanged);
+        // these bytes only ever play from the give-up path.
+        uint16_t usrc = (uint16_t)b[3] | (uint16_t)b[4] << 8;
+        uint16_t uvid = (uint16_t)b[7] | (uint16_t)b[8] << 8;
+        uint8_t  useq = b[9];
+        if (g_vnote.active && !g_vnote.done && usrc == g_vnote.src && uvid == g_vnote.vid &&
+            g_vnote.n && useq < g_vnote.n &&
+            !(g_vnote.seen_mask & (1u << useq)) && !(g_vnote.unv_mask & (1u << useq))) {
+            memcpy(g_vnote.data[useq], b + VOICE_HDR, plen);
+            g_vnote.clen[useq] = plen;
+            g_vnote.unv_mask |= (uint8_t)(1u << useq);
+            Serial.printf("[voice] chunk %u kept unverified (crc16 fail, %d B)\n", useq, len);
+        } else {
+            Serial.printf("[voice] chunk crc16 fail (%d B)\n", len);
+        }
         return;
     }
+    rx_snr_good(g_rx_snr_last);                  // a verified frame is a parsed reception
     uint16_t src = (uint16_t)b[3] | (uint16_t)b[4] << 8;   // LE
     uint16_t dst = (uint16_t)b[5] | (uint16_t)b[6] << 8;
     uint16_t vid = (uint16_t)b[7] | (uint16_t)b[8] << 8;
@@ -2899,6 +2955,7 @@ static void voice_rx_frame(const uint8_t *b, int len)
     g_vnote.dst = dst; g_vnote.n = n; g_vnote.codec = codec;
     if (!(g_vnote.seen_mask & (1 << seq))) {
         g_vnote.seen_mask |= (1 << seq);
+        g_vnote.unv_mask  &= (uint8_t)~(1u << seq);   // verified copy outranks a kept one
         memcpy(g_vnote.data[seq], b + VOICE_HDR, plen);
         g_vnote.clen[seq] = plen;
         g_vnote.have++;
@@ -3072,7 +3129,7 @@ static void voice_tick()
     // blocks for seconds, and !VN answers wait out their §8 hold here too.
     if (g_vtx_req) {
         g_vtx_req = false;
-        voice_send_note(VOICE_TEST_CLIP, VOICE_TEST_CLIP_LEN, 0, voice_addr("P10"), 1);
+        voice_send_note(VOICE_TEST_CLIP, VOICE_TEST_CLIP_LEN, 1, voice_addr("P10"), 1);
     }
     if (g_vtx_burst) {
         static uint32_t burst_last = 0;
@@ -3081,7 +3138,7 @@ static void voice_tick()
             burst_last = bnow;
             uint8_t left = --g_vtx_burst;
             Serial.printf("[voice] burst: sending, %u left\n", left);
-            voice_send_note(VOICE_TEST_CLIP, VOICE_TEST_CLIP_LEN, 0, voice_addr("P10"), 1);
+            voice_send_note(VOICE_TEST_CLIP, VOICE_TEST_CLIP_LEN, 1, voice_addr("P10"), 1);
             if (g_toast) lv_label_set_text_fmt(g_toast, "음성 반복시험 %u회 남음", left);
         }
     }
@@ -3133,8 +3190,8 @@ static void voice_tick()
         if (!provable && !idle) return;
         if (g_vnote.vn_rounds >= 2) {                 // two rounds did not close it
             g_vnote.done = true; g_vnote.partial = true;
-            Serial.printf("[voice] giving up at %u/%u - marked partial\n",
-                          g_vnote.have, g_vnote.n);
+            Serial.printf("[voice] giving up at %u/%u (unv mask %02X) - marked partial\n",
+                          g_vnote.have, g_vnote.n, g_vnote.unv_mask);
             lora_log_print("< ", "[음성] 일부만 수신 (" + String(g_vnote.have) + "/" +
                                  String(g_vnote.n) + ")");
             voice_play_note();               // §4.4: a playable prefix is still playable
@@ -3339,6 +3396,7 @@ static void lora_rx_dispatch(const String &line)
         }
         neigh_update(src, nm, g_lora_rx_rssi, hops);
         g_rx_ok++;
+        rx_snr_good(g_rx_snr_last);              // parsed = admissible baseline sample
         // Envelope context for the L1 handlers: v1.11 scopes (rev, seq) per src, and
         // !RB derives the router id from here. Anything heard from the home router
         // also clears the unanswered-pull counter — it is demonstrably alive.
@@ -3352,9 +3410,27 @@ static void lora_rx_dispatch(const String &line)
     }
     // else: not a valid R| line = RF corruption (CRC is off; all real traffic is
     // wrapped now) → DROP, so a mangled relayed copy can't pollute/break the frame.
+    if (rx_is_noise(g_rx_snr_last)) {            // a false lock is not a damaged frame
+        g_rx_noise++;
+        Serial.printf("[rx] noise (false lock) %d dBm %.1f dB, %dB\n",
+                      g_rx_rssi_last, g_rx_snr_last, line.length());
+        return;
+    }
     g_rx_corrupt++;
-    Serial.printf("[rx] corrupt %d dBm %.1f dB: %.32s\n", g_rx_rssi_last, g_rx_snr_last,
-                  line.c_str());
+    // E00's head-truncation triage, permanently on: a corrupt line whose bytes still
+    // READ is a software loss (RF damage is high-entropy — all five of their burst
+    // samples were), and the hex is what settles it. Kept short but complete enough
+    // to see where readable text starts.
+    int n = line.length() > 32 ? 32 : line.length(), printable = 0;
+    char hx[32 * 2 + 1];
+    for (int i = 0; i < n; i++) {
+        uint8_t ch = (uint8_t)line[i];
+        if (ch >= 0x20 && ch < 0x7F) printable++;
+        snprintf(hx + i * 2, 3, "%02X", ch);
+    }
+    Serial.printf("[rx] corrupt %dB (pkt %dB) %d dBm %.1f dB printable %d/%d hex %s : %.32s\n",
+                  line.length(), g_rx_pkt_len, g_rx_rssi_last, g_rx_snr_last,
+                  printable, n, hx, line.c_str());
 }
 
 static int lora_init()
@@ -3385,6 +3461,7 @@ static void lora_service()            // always-on background RX (called from lo
         uint8_t raw[256];
         size_t  rlen = lora_radio.getPacketLength();
         if (rlen > sizeof(raw)) rlen = sizeof(raw);
+        g_rx_pkt_len = (int)rlen;
         int  st  = lora_radio.readData(raw, rlen);
         int  rs  = (int)lora_radio.getRSSI();
         float sn = lora_radio.getSNR();
@@ -5511,12 +5588,15 @@ void loop()
     // with corrupt climbing is the air, and with PHY CRC off nothing else can tell.
     static uint32_t rx_seen = 0, rx_ms = 0;
     if ((uint32_t)(now - rx_ms) > 5000) {
-        uint32_t tot = g_rx_ok + g_rx_corrupt + g_rx_bad;
+        uint32_t tot = g_rx_ok + g_rx_corrupt + g_rx_bad + g_rx_noise;
         if (tot != rx_seen) {
-            Serial.printf("[rx] ok %lu  corrupt %lu  readfail %lu  (%lu%% unusable)  last %d dBm %.1f dB\n",
+            // noise = false locks (SNR far below the parsed baseline), counted apart so
+            // the damage rate measures frames and only frames (E00 §3.4).
+            Serial.printf("[rx] ok %lu  corrupt %lu  noise %lu  readfail %lu  (%lu%% damaged)  last %d dBm %.1f dB\n",
                           (unsigned long)g_rx_ok, (unsigned long)g_rx_corrupt,
-                          (unsigned long)g_rx_bad,
-                          (unsigned long)(100 * (g_rx_corrupt + g_rx_bad) / (tot ? tot : 1)),
+                          (unsigned long)g_rx_noise, (unsigned long)g_rx_bad,
+                          (unsigned long)(100 * (g_rx_corrupt + g_rx_bad) /
+                                          ((g_rx_ok + g_rx_corrupt + g_rx_bad) ? (g_rx_ok + g_rx_corrupt + g_rx_bad) : 1)),
                           g_rx_rssi_last, g_rx_snr_last);
             rx_seen = tot;
         }

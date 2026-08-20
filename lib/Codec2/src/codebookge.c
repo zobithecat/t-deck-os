@@ -1,14 +1,18 @@
 /* THIS IS A GENERATED FILE. Edit generate_codebook.c and its input */
 
 /*
- * This intermediary file and the files that used to create it are under
+ * This intermediary file and the files that used to create it are under 
  * The LGPL. See the file COPYING.
  */
 
 #include "defines.h"
 
-  /* codebook/gecb.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/gecb.txt */
+#ifdef __EMBEDDED__
 static const float codes0[] = {
+#else
+static const float codes0[] = {
+#endif
   2.71,  12.0184,
   0.04675,  -2.73881,
   0.120993,  8.38895,
@@ -268,7 +272,7 @@ static const float codes0[] = {
 };
 
 const struct lsp_codebook ge_cb[] = {
-  /* codebook/gecb.txt */
+  /* /private/tmp/claude-502/-Users-zobithecat-Documents-projects-etc-projects-t-deck-os/7831c55d-10c8-4454-856a-89cf2063ec5e/scratchpad/codec2-1.2.0/src/codebook/gecb.txt */
   {
     2,
     8,
