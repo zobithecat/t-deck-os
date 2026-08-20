@@ -22,6 +22,9 @@
 #include <sys/time.h>
 #include <BackgroundAudioSpeech.h>   // eSpeak-NG TTS (see tts_say)
 #include <ESP32I2SAudio.h>           // new IDF5 I2S driver — the board's single audio owner
+extern "C" {
+#include <codec2.h>                  // vendored lib/Codec2 — host-gated against c2dec (1 LSB)
+}
 #include <libespeak-ng/voice/ko.h>
 #include <esp_sleep.h>               // power save (light sleep)
 #include <driver/gpio.h>
@@ -2703,6 +2706,64 @@ static void voice_note_reset(uint16_t src, uint16_t vid)
     g_vnote.last_ms = g_vnote.va_ms = millis();
 }
 
+// Decode a finished (or given-up-on) note and put it on the speaker. The same direct
+// g_i2s.write() lane the chime uses — it already coexists with the speech engine, so
+// no ownership change. 8 kHz mono comes out of codec2; the device runs 22,050 stereo
+// (one clock, never re-clocked — see AUDIO_RATE), so we linear-interpolate up and
+// duplicate channels on the way. Blocking for the clip length, like the chime.
+static void voice_play_note()
+{
+    if (!g_vnote.have) return;
+    if (g_vnote.codec != 0) {                 // vendored codec2 has no 700C decoder yet
+        Serial.println("[voice] codec 700C not decodable on-device yet");
+        return;
+    }
+    audio_init();
+    struct CODEC2 *c2 = codec2_create(CODEC2_MODE_1200);
+    if (!c2) { Serial.println("[voice] codec2_create failed"); return; }
+    const int spf = codec2_samples_per_frame(c2);          // 320 @ 40 ms
+    const int bpf = (codec2_bits_per_frame(c2) + 7) / 8;   // 6
+    float vol = audio_tone_amp() / 32767.0f;               // ride the master volume
+    int16_t pcm[320];
+    int16_t out[256];
+    // Play the CONTIGUOUS prefix only: a hole would decode the next chunk against the
+    // wrong decoder state and everything after it would warble. §4.4: a playable
+    // prefix is still playable.
+    int chunks = 0;
+    while (chunks < g_vnote.n && (g_vnote.seen_mask & (1 << chunks))) chunks++;
+    Serial.printf("[voice] playing %d/%u chunks\n", chunks, g_vnote.n);
+    float pos = 0, step = 8000.0f / AUDIO_RATE;
+    int16_t prev = 0;
+    for (int ci = 0; ci < chunks; ci++) {
+        for (int off = 0; off + bpf <= g_vnote.clen[ci]; off += bpf) {
+            codec2_decode(c2, pcm, g_vnote.data[ci] + off);
+            int oi = 0;
+            for (int s = 0; s < spf; s++) {
+                int16_t cur = (int16_t)(pcm[s] * vol);
+                while (pos < 1.0f) {                       // upsample 8000 -> 22050
+                    int16_t v = (int16_t)(prev + (cur - prev) * pos);
+                    out[oi++] = v; out[oi++] = v;          // stereo-only device
+                    if (oi >= 256) {
+                        const uint8_t *p = (const uint8_t *)out; size_t left = oi * 2;
+                        while (left) { size_t w = g_i2s.write(p, left);
+                                       if (!w) { delay(1); continue; } p += w; left -= w; }
+                        oi = 0;
+                    }
+                    pos += step;
+                }
+                pos -= 1.0f;
+                prev = cur;
+            }
+            if (oi) { const uint8_t *p = (const uint8_t *)out; size_t left = oi * 2;
+                      while (left) { size_t w = g_i2s.write(p, left);
+                                     if (!w) { delay(1); continue; } p += w; left -= w; } }
+        }
+    }
+    int16_t z[128] = {0};                     // trailing silence so the clip ends cleanly
+    g_i2s.write((const uint8_t *)z, sizeof(z));
+    codec2_destroy(c2);
+}
+
 static void voice_note_completed()
 {
     g_vnote.done = true;
@@ -2722,8 +2783,9 @@ static void voice_note_completed()
                   who.c_str(), g_vnote.vid, (unsigned)total, secs, g_vnote.codec,
                   verified ? "" : " (announce crc mismatch - unverified)");
     lora_log_print("< ", String("[음성] ") + who + " " + String(secs, 1) + "초 수신"
-                        + (verified ? "" : " (미검증)") + " - 재생은 다음 단계");
+                        + (verified ? "" : " (미검증)"));
     beep_notify();
+    voice_play_note();
 }
 
 // One 0xC2 frame off the air. Called from lora_service BEFORE any String conversion.
@@ -2804,6 +2866,8 @@ struct VoiceTx {
 };
 static VoiceTx       g_vtx;
 static volatile bool g_vtx_req     = false;  // Settings asked; the stream runs from loop()
+static volatile uint8_t g_vtx_burst = 0;     // E00's corruption experiment: N repeats,
+                                             // §6 rate limit deliberately bypassed
 static uint32_t      g_vtx_last_ms = 0;      // §6: one note per src per 30 s
 
 // !VN\t<src>\t<vid>\t<bitmap> — someone asks the note's sender to re-send. Ours iff the
@@ -2897,7 +2961,7 @@ static void voice_send_note(const uint8_t *data, uint16_t len, uint8_t codec,
         return;
     }
     uint32_t now = millis();
-    if (g_vtx_last_ms && (uint32_t)(now - g_vtx_last_ms) < 30000) {
+    if (!g_vtx_burst && g_vtx_last_ms && (uint32_t)(now - g_vtx_last_ms) < 30000) {
         if (g_toast) lv_label_set_text(g_toast, "음성쪽지는 30초에 1건");
         return;
     }
@@ -2930,6 +2994,17 @@ static void voice_tick()
     if (g_vtx_req) {
         g_vtx_req = false;
         voice_send_note(VOICE_TEST_CLIP, VOICE_TEST_CLIP_LEN, 0, voice_addr("P10"), 1);
+    }
+    if (g_vtx_burst) {
+        static uint32_t burst_last = 0;
+        uint32_t bnow = millis();
+        if ((uint32_t)(bnow - burst_last) > 4000) {
+            burst_last = bnow;
+            uint8_t left = --g_vtx_burst;
+            Serial.printf("[voice] burst: sending, %u left\n", left);
+            voice_send_note(VOICE_TEST_CLIP, VOICE_TEST_CLIP_LEN, 0, voice_addr("P10"), 1);
+            if (g_toast) lv_label_set_text_fmt(g_toast, "음성 반복시험 %u회 남음", left);
+        }
     }
     if (g_vtx.active) {
         uint32_t tnow = millis();
@@ -2983,6 +3058,7 @@ static void voice_tick()
                           g_vnote.have, g_vnote.n);
             lora_log_print("< ", "[음성] 일부만 수신 (" + String(g_vnote.have) + "/" +
                                  String(g_vnote.n) + ")");
+            voice_play_note();               // §4.4: a playable prefix is still playable
             return;
         }
         if (g_vnote.dst == 0xFFFF) {                  // §8 deferred slot, verbatim
@@ -4019,6 +4095,15 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lv_label_set_text(vbl, LV_SYMBOL_VOLUME_MID " 음성쪽지 테스트 -> P10");
         lv_obj_add_event_cb(vbtn, [](lv_event_t *) { g_vtx_req = true; }, LV_EVENT_CLICKED, NULL);
         lv_group_add_obj(g, vbtn);
+
+        // E00's size-vs-corruption experiment: the same byte-identical note, twenty
+        // times, rate limit deliberately bypassed for the duration. ~90 s of channel.
+        lv_obj_t *vbb = lv_btn_create(parent);
+        lv_obj_t *vbbl = lv_label_create(vbb);
+        lv_obj_set_style_text_font(vbbl, &font_kr16, 0);
+        lv_label_set_text(vbbl, LV_SYMBOL_LOOP " 음성 반복시험 x20 (계측용)");
+        lv_obj_add_event_cb(vbb, [](lv_event_t *) { g_vtx_burst = 20; }, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, vbb);
 
         lv_obj_t *blbl = lv_label_create(parent);
         lv_label_set_text(blbl, "Message beep volume  (0 = mute)");
