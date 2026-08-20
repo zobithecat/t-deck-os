@@ -3186,6 +3186,10 @@ static void voice_tick()
             uint16_t vid = (uint16_t)(crc & 0xFFFF);
             Serial.printf("[voice] loopback inject: E00->%s vid=%04X 700C %uB\n",
                           NODE_ID, vid, (unsigned)VOICE_TEST_CLIP_LEN);
+            // A repeat press re-injects the SAME (src, vid): on air that is a late
+            // duplicate and idempotency rightly swallows it. This is a test button —
+            // forget the previous note so every press plays.
+            memset(&g_vnote, 0, sizeof(g_vnote));
             g_vrx_loopback = true;
             voice_handle_va("!VA\t" + b36(src) + "\t" + b36(vid) + "\t1\t1\t" +
                             b36((VOICE_TEST_CLIP_LEN / 4) * 4 / 10) + "\t" + b36(crc));
