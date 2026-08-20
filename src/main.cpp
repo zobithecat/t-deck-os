@@ -26,6 +26,7 @@ extern "C" {
 #include <codec2.h>                  // vendored lib/Codec2 — host-gated against c2dec (1 LSB)
 #include <es7210.h>                  // vendored LilyGO quad-ADC driver (mics, I2C)
 #include <driver/i2s_std.h>          // second I2S port: mic RX, we are clock master
+#include <LittleFS.h>                // voice-note ring on the idle spiffs partition
 }
 #include <libespeak-ng/voice/ko.h>
 #include <esp_sleep.h>               // power save (light sleep)
@@ -2817,7 +2818,7 @@ static VoiceNote g_vnote;
 // injected "reception" out of the SNR noise baseline, which must stay air-only.
 static volatile bool g_vrx_loop_req  = false;
 static bool          g_vrx_loopback  = false;
-static volatile bool g_vrx_replay_req = false;  // Voice app: replay the last note once
+static volatile int  g_vn_replay_slot = -1;     // Voice app: saved-note slot to replay
 static lv_obj_t     *g_voice_status   = NULL;   // Voice app status line (NULLed by go_home)
 
 static uint32_t crc32_bytes(const uint8_t *p, size_t n)
@@ -3089,6 +3090,7 @@ static void voice_play_note()
 static lv_obj_t *g_vdlg_body = NULL;
 static struct { uint16_t src, vid; char who[8]; float secs; bool verified; uint8_t have, n; } g_vdlg_meta;
 static String voice_text_for(uint16_t src, uint16_t vid);   // defined with the !VT store below
+static void voice_note_save(bool verified);                 // defined with the ring below
 
 // Body text, composed fresh each time: caption headline, then the !VT full text if any
 // is held for this (src, vid) — which may arrive AFTER the panel went up.
@@ -3175,6 +3177,7 @@ static void voice_note_completed()
     lora_log_print("< ", String("[음성] ") + who + " " + String(secs, 1) + "초 수신"
                         + (verified ? "" : " (미검증)"));
     voice_show_dialog(who.c_str(), secs, verified, g_vnote.n, g_vnote.n);
+    voice_note_save(verified);            // on flash BEFORE the speaker gets it
     beep_notify();
     voice_play_note();
 }
@@ -3271,6 +3274,63 @@ static String voice_text_for(uint16_t src, uint16_t vid)   // "" when none held
 }
 
 static void voice_dialog_refresh();      // text arriving after the takeover updates it
+
+// --- persistent note ring (owner decision 2026-08-20: keep 8) -----------------------
+// A received transmission outweighs a chat line; it must survive a reboot. LittleFS on
+// the otherwise-idle spiffs partition (3.4 MB), /vn0..7.bin, newest tracked in NVS.
+// Each file = fixed header + the contiguous playable prefix (verified + kept-unverified
+// chunks, §5.2), so a partial note is preserved exactly as it would have played.
+#define VN_RING_N 8
+struct __attribute__((packed)) VNoteHdr {
+    uint32_t magic;                     // "VNR1"
+    uint16_t src, vid;
+    uint8_t  codec, flags;              // bit0 = verified, bit1 = partial
+    uint16_t len;
+    uint32_t saved_ms;
+    char     who[8];
+    char     caption[48];
+    char     text[192];                 // !VT full text as assembled at save time
+};
+static bool g_vnfs_ready = false;
+static bool vn_fs()
+{
+    if (!g_vnfs_ready) g_vnfs_ready = LittleFS.begin(true);
+    return g_vnfs_ready;
+}
+static void voice_note_save(bool verified)
+{
+    if (!vn_fs()) { Serial.println("[voice] littlefs mount failed"); return; }
+    static uint8_t pay[VOICE_MAX_CHUNKS * VOICE_CHUNK_MAX];
+    size_t off = 0;
+    uint8_t play_mask = g_vnote.seen_mask | g_vnote.unv_mask;
+    for (int i = 0; i < g_vnote.n && (play_mask & (1 << i)); i++) {
+        memcpy(pay + off, g_vnote.data[i], g_vnote.clen[i]);
+        off += g_vnote.clen[i];
+    }
+    if (!off) return;
+    VNoteHdr h = {};
+    memcpy(&h.magic, "VNR1", 4);
+    h.src = g_vnote.src; h.vid = g_vnote.vid; h.codec = g_vnote.codec;
+    h.flags = (uint8_t)((verified ? 1 : 0) | (g_vnote.partial ? 2 : 0));
+    h.len = (uint16_t)off;
+    h.saved_ms = millis();
+    strncpy(h.who, voice_addr_str(g_vnote.src).c_str(), sizeof(h.who) - 1);
+    strncpy(h.caption, g_vnote.caption, sizeof(h.caption) - 1);
+    String full = voice_text_for(g_vnote.src, g_vnote.vid);
+    strncpy(h.text, full.c_str(), sizeof(h.text) - 1);
+    Preferences p; p.begin("tdeckos", false);
+    uint8_t head = (uint8_t)(p.getUChar("vnhead", 0) % VN_RING_N);
+    File f = LittleFS.open("/vn" + String(head) + ".bin", "w");
+    if (f) {
+        f.write((const uint8_t *)&h, sizeof(h));
+        f.write(pay, off);
+        f.close();
+        p.putUChar("vnhead", (uint8_t)((head + 1) % VN_RING_N));
+        Serial.printf("[voice] note saved: slot %u, %uB%s\n", head, (unsigned)off,
+                      g_vnote.partial ? " (partial)" : "");
+    }
+    p.end();
+}
 
 static void voice_handle_vt(const String &line)
 {
@@ -3737,12 +3797,33 @@ static void voice_tick()
         if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_UP " 무전 송신됨");
         if (g_voice_status) lv_label_set_text(g_voice_status, LV_SYMBOL_UP " 무전 송신됨 (수리 대기)");
     }
-    if (g_vrx_replay_req) {
-        g_vrx_replay_req = false;
-        if (g_vnote.done && g_vnote.have) {
-            g_vplay_reps = 1;                   // a replay is for THIS user; once is enough
-            voice_play_note();
-            g_vplay_reps = 3;
+    if (g_vn_replay_slot >= 0) {
+        int slot = g_vn_replay_slot; g_vn_replay_slot = -1;
+        if (!(g_vnote.active && !g_vnote.done) && vn_fs()) {   // never under a live assembly
+            File f = LittleFS.open("/vn" + String(slot) + ".bin", "r");
+            VNoteHdr h;
+            static uint8_t pay[VOICE_MAX_CHUNKS * VOICE_CHUNK_MAX];
+            if (f && f.read((uint8_t *)&h, sizeof(h)) == sizeof(h) &&
+                !memcmp(&h.magic, "VNR1", 4) && h.len && h.len <= sizeof(pay) &&
+                (int)f.read(pay, h.len) == (int)h.len) {
+                f.close();
+                memset(&g_vnote, 0, sizeof(g_vnote));
+                g_vnote.active = g_vnote.done = true;
+                g_vnote.src = h.src; g_vnote.vid = h.vid; g_vnote.codec = h.codec;
+                strncpy(g_vnote.caption, h.caption, sizeof(g_vnote.caption) - 1);
+                uint8_t csz = voice_tx_chunk(h.codec);         // same boundaries as TX
+                g_vnote.n = (uint8_t)((h.len + csz - 1) / csz);
+                for (int ci = 0; ci < g_vnote.n; ci++) {
+                    uint16_t o = (uint16_t)(ci * csz);
+                    uint8_t  l = (uint8_t)((h.len - o) > csz ? csz : (h.len - o));
+                    memcpy(g_vnote.data[ci], pay + o, l);
+                    g_vnote.clen[ci] = l;
+                    g_vnote.seen_mask |= (uint8_t)(1u << ci);
+                }
+                g_vplay_reps = 1;               // a replay is for THIS user; once is enough
+                voice_play_note();
+                g_vplay_reps = 3;
+            } else if (f) f.close();
         }
     }
     // RX loopback: the golden note as E00 would send it — !VA through the real
@@ -3857,6 +3938,7 @@ static void voice_tick()
                 voice_show_dialog(voice_addr_str(g_vnote.src).c_str(), psecs, false,
                                   g_vnote.have, g_vnote.n);
             }
+            voice_note_save(false);          // a partial transmission still outweighs a chat line
             voice_play_note();               // §4.4: a playable prefix is still playable
             return;
         }
@@ -5280,15 +5362,44 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
             if (c == LV_EVENT_RELEASED || c == LV_EVENT_PRESS_LOST) g_ptt_down = false;
         }, LV_EVENT_ALL, NULL);
         lv_group_add_obj(g, pb);
-        lv_obj_t *rb = lv_btn_create(parent);
-        lv_obj_t *rbl = lv_label_create(rb);
-        lv_obj_set_style_text_font(rbl, &font_kr16, 0);
-        lv_label_set_text(rbl, LV_SYMBOL_REFRESH " 마지막 쪽지 다시 듣기");
-        lv_obj_add_event_cb(rb, [](lv_event_t *) {
-            if (g_vnote.done && g_vnote.have) g_vrx_replay_req = true;
-            else if (g_voice_status) lv_label_set_text(g_voice_status, "받은 쪽지가 없음");
-        }, LV_EVENT_CLICKED, NULL);
-        lv_group_add_obj(g, rb);
+        // Saved-note ring, newest first: sender + text headline, click to replay.
+        // The ring survives reboots — a received transmission outweighs a chat line.
+        int listed = 0;
+        if (vn_fs()) {
+            Preferences pv; pv.begin("tdeckos", true);
+            uint8_t head = (uint8_t)(pv.getUChar("vnhead", 0) % VN_RING_N);
+            pv.end();
+            for (int k = 1; k <= VN_RING_N; k++) {
+                int slot = (head - k + VN_RING_N) % VN_RING_N;
+                File f = LittleFS.open("/vn" + String(slot) + ".bin", "r");
+                if (!f) continue;
+                VNoteHdr h;
+                bool ok = f.read((uint8_t *)&h, sizeof(h)) == sizeof(h) &&
+                          !memcmp(&h.magic, "VNR1", 4) && h.len;
+                f.close();
+                if (!ok) continue;
+                char lbl[64];
+                const char *txt = h.caption[0] ? h.caption : (h.text[0] ? h.text : "(음성만)");
+                snprintf(lbl, sizeof(lbl), "%s%s %.28s", h.who,
+                         (h.flags & 2) ? " (일부)" : "", txt);
+                lv_obj_t *nb  = lv_btn_create(parent);
+                lv_obj_t *nbl = lv_label_create(nb);
+                lv_obj_set_style_text_font(nbl, &font_kr16, 0);
+                lv_label_set_text(nbl, lbl);
+                lv_obj_set_user_data(nb, (void *)(intptr_t)slot);
+                lv_obj_add_event_cb(nb, [](lv_event_t *e) {
+                    g_vn_replay_slot = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+                }, LV_EVENT_CLICKED, NULL);
+                lv_group_add_obj(g, nb);
+                listed++;
+            }
+        }
+        if (!listed) {
+            lv_obj_t *el = lv_label_create(parent);
+            lv_obj_set_style_text_font(el, &font_kr16, 0);
+            lv_obj_set_style_text_color(el, lv_color_hex(COL_MUTED), 0);
+            lv_label_set_text(el, "저장된 쪽지 없음");
+        }
     } else if (strcmp(name, "Alert") == 0) {
         lora_init();
         lv_obj_t *hdr = lv_label_create(parent);
