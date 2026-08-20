@@ -2815,7 +2815,22 @@ struct VoiceNote {
     uint8_t  vn_rounds;                 // §4.4: two repair rounds, then partial
     uint32_t vn_due;
 };
-static VoiceNote g_vnote;
+// The assembly slot lives in PSRAM. Growing VOICE_MAX_CHUNKS to 8 added ~1.6 KB of
+// .bss and BLEDevice::init() stopped coming back — the internal-RAM cliff again, this
+// time as a silent boot hang. Voice buffers are bulk data with no ISR/DMA contact;
+// internal SRAM is the one resource this board actually runs out of.
+static VoiceNote *gp_vnote = nullptr;    // allocated once at boot, before any use
+#define g_vnote (*gp_vnote)
+
+// One PSRAM scratch for join/save/replay. All three run on the loop task, strictly in
+// sequence — sharing is free, and 1.6 KB leaves the internal heap it used to occupy.
+static uint8_t *voice_scratch()
+{
+    static uint8_t *b = nullptr;
+    if (!b) b = (uint8_t *)heap_caps_malloc(VOICE_MAX_CHUNKS * VOICE_CHUNK_MAX,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return b;
+}
 // RX loopback proof (Settings): E00's 0xC2 TX does not exist yet (§7), so until it
 // does, the only way this device's receive path ever runs is injection — the golden
 // 700C frame fed to voice_rx_frame as if the radio delivered it. The bool keeps the
@@ -3169,9 +3184,11 @@ static void voice_note_completed()
     if (g_vnote.have_va) {
         // Every chunk passed its CRC16, so a whole-note mismatch indicts the ANNOUNCE,
         // not the audio (§4.2): keep the note, mark unverified, never discard.
-        uint8_t joined[VOICE_MAX_CHUNKS * VOICE_CHUNK_MAX]; size_t off = 0;
-        for (int i = 0; i < g_vnote.n; i++) { memcpy(joined + off, g_vnote.data[i], g_vnote.clen[i]); off += g_vnote.clen[i]; }
-        verified = (crc32_bytes(joined, off) == g_vnote.va_crc32);
+        uint8_t *joined = voice_scratch(); size_t off = 0;
+        if (joined) {
+            for (int i = 0; i < g_vnote.n; i++) { memcpy(joined + off, g_vnote.data[i], g_vnote.clen[i]); off += g_vnote.clen[i]; }
+            verified = (crc32_bytes(joined, off) == g_vnote.va_crc32);
+        }
     }
     float secs = g_vnote.codec == 1 ? total / 4 * 0.04f : total / 6 * 0.04f;
     String who = voice_addr_str(g_vnote.src);
@@ -3304,7 +3321,8 @@ static bool vn_fs()
 static void voice_note_save(bool verified)
 {
     if (!vn_fs()) { Serial.println("[voice] littlefs mount failed"); return; }
-    static uint8_t pay[VOICE_MAX_CHUNKS * VOICE_CHUNK_MAX];
+    uint8_t *pay = voice_scratch();
+    if (!pay) return;
     size_t off = 0;
     uint8_t play_mask = g_vnote.seen_mask | g_vnote.unv_mask;
     for (int i = 0; i < g_vnote.n && (play_mask & (1 << i)); i++) {
@@ -3812,9 +3830,10 @@ static void voice_tick()
         if (!(g_vnote.active && !g_vnote.done) && vn_fs()) {   // never under a live assembly
             File f = LittleFS.open("/vn" + String(slot) + ".bin", "r");
             VNoteHdr h;
-            static uint8_t pay[VOICE_MAX_CHUNKS * VOICE_CHUNK_MAX];
-            if (f && f.read((uint8_t *)&h, sizeof(h)) == sizeof(h) &&
-                !memcmp(&h.magic, "VNR1", 4) && h.len && h.len <= sizeof(pay) &&
+            uint8_t *pay = voice_scratch();
+            if (f && pay && f.read((uint8_t *)&h, sizeof(h)) == sizeof(h) &&
+                !memcmp(&h.magic, "VNR1", 4) && h.len &&
+                h.len <= VOICE_MAX_CHUNKS * VOICE_CHUNK_MAX &&
                 (int)f.read(pay, h.len) == (int)h.len) {
                 f.close();
                 memset(&g_vnote, 0, sizeof(g_vnote));
@@ -5998,6 +6017,9 @@ void setup()
     g_reset_reason = (int)esp_reset_reason();
     Serial.printf("T-Deck OS booting... (reset reason=%d)\n", g_reset_reason);
     st_heap("setup entry");
+    gp_vnote = (VoiceNote *)heap_caps_calloc(1, sizeof(VoiceNote),
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!gp_vnote) { Serial.println("FATAL: vnote psram alloc"); for (;;) delay(1000); }
     disableLoopWDT();   // allow multi-second blocking ops (SF12 LoRa TX, BLE scan) without WDT reset
 
     // Peripheral power rail MUST be high before touching any peripheral
@@ -6069,16 +6091,21 @@ void setup()
     }
 
     st_heap("after touch");
+    Serial.println("[boot] lvgl");
     setupLvgl();
     st_heap("after setupLvgl");
+    Serial.println("[boot] launcher");
     build_launcher_ui();
     st_heap("after launcher ui");
+    Serial.println("[boot] indev");
     setup_trackball_indev();
     setup_keyboard_indev();
     lv_timer_create(status_update_cb, 1000, NULL);
     lv_timer_create(gps_probe_cb, 1000, NULL);   // auto-detect GPS baud (u-blox/L76K)
+    Serial.println("[boot] lora");
     lora_init();      // bring the radio up at boot so LoRa RX runs in the background
     st_heap("after lora_init");
+    Serial.println("[boot] audio");
     // Claim the audio device BEFORE the radios. Its DMA ring and its service
     // task both need DMA-capable INTERNAL RAM, ~21 KB of it, and Wi-Fi + BLE
     // take ~122 KB of the ~149 KB that is left at this point. Initialised
@@ -6091,8 +6118,10 @@ void setup()
     // DMA descriptor cannot, so audio goes first.
     audio_init();
     st_heap("after audio_init");
+    Serial.println("[boot] restore");
     boot_restore();   // auto-reconnect saved Wi-Fi + restore BT state
     st_heap("after boot_restore");
+    Serial.println("[boot] backlight");
 
     pinMode(BOARD_BL_PIN, OUTPUT);
     setBrightness(g_screen_bright);   // restore saved brightness (boot_restore loaded it above)
