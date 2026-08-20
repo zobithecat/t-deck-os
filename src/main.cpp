@@ -30,6 +30,7 @@ extern "C" {
 }
 #include <libespeak-ng/voice/ko.h>
 #include <esp_sleep.h>               // power save (light sleep)
+#include <esp_task_wdt.h>            // reporter-not-executioner reconfigure at boot
 #include <driver/gpio.h>
 #include <RadioLib.h>
 #include <TinyGPS++.h>
@@ -65,6 +66,9 @@ static uint8_t       g_voice_vol = 6;    // voice-note loudness 0..10 (Settings/
                                          // peak target = 2700 x value; 30000 was measured distorting
 static volatile bool g_ptt_down  = false;   // PTT held (Voice app); declared here because the
                                             // trackball's 3 s sleep-hold must not fire mid-record
+static bool          g_voice_fx = true;     // playback tone chain (HPF+compressor) on/off —
+                                            // E00 clips arrive pre-companded and the double
+                                            // processing eats 1200's edge. NVS "vfx".
 static uint8_t       g_voice_codec = 1;     // PTT TX codec, WIRE enum: 1 = 700C (default),
                                             // 0 = 1200 (better voice, ~3x channel). NVS "vcodec".
                                             // RX is codec-agnostic by spec — this is TX only.
@@ -5997,18 +6001,22 @@ static void boot_restore()
     setKeyboardBrightness(g_kb_bright);   // keyboard backlight on at boot
     if (!g_gps_enabled) gps_set_enabled(false);   // apply saved GPS-off: put the module to backup
 
-    if (ssid.length()) {
-        WiFi.mode(WIFI_STA);
-        WiFi.begin(ssid.c_str(), pass.c_str());
-        g_wifi_autoconn_timer = lv_timer_create(wifi_autoconn_poll, 500, NULL);
-    }
-    st_heap("  after wifi");
+    // BT strictly BEFORE Wi-Fi. The saved AP negotiates WPA3, and the SAE commit's ECC
+    // math (wifi task, core 0) raced BLEDevice::init for the mbedtls crypto lock —
+    // esp_crypto_mpi_lock_acquire abort()ed at boot, a coin-flip per cold start. With
+    // BLE's crypto brought up first, the SAE work finds the lock in a settled state.
     if (bt && !g_ble_inited) {
         BLEDevice::init("T-Deck OS");
         g_ble_inited = true;
         g_bt_on = true;
     }
     st_heap("  after ble");
+    if (ssid.length()) {
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(ssid.c_str(), pass.c_str());
+        g_wifi_autoconn_timer = lv_timer_create(wifi_autoconn_poll, 500, NULL);
+    }
+    st_heap("  after wifi");
 }
 
 void setup()
@@ -6020,7 +6028,23 @@ void setup()
     gp_vnote = (VoiceNote *)heap_caps_calloc(1, sizeof(VoiceNote),
                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!gp_vnote) { Serial.println("FATAL: vnote psram alloc"); for (;;) delay(1000); }
+    // Mount (and on the very first boot, FORMAT) the note ring now, while the internal
+    // heap is still roomy. Doing it lazily put the 3.4 MB format + mount inside the
+    // Voice app's UI builder mid-RX, and fopen died in newlib __sfp — out of internal
+    // heap for a FILE struct. One-time cost here, none at runtime.
+    Serial.printf("[boot] littlefs %s\n", vn_fs() ? "ok" : "FAILED");
     disableLoopWDT();   // allow multi-second blocking ops (SF12 LoRa TX, BLE scan) without WDT reset
+    // The task watchdog stays as a REPORTER, not an executioner: with the saved AP out
+    // of range, the Wi-Fi task's connect storm starved IDLE0 past the 5 s default and
+    // task_wdt ABORTED — a reboot loop with the screen still dark. 15 s and no panic:
+    // the starvation still prints, the device still boots.
+    {
+        esp_task_wdt_config_t twdt = {};
+        twdt.timeout_ms    = 15000;
+        twdt.idle_core_mask = (1 << 0) | (1 << 1);
+        twdt.trigger_panic = false;
+        esp_task_wdt_reconfigure(&twdt);
+    }
 
     // Peripheral power rail MUST be high before touching any peripheral
     pinMode(BOARD_POWERON, OUTPUT);
@@ -6118,13 +6142,19 @@ void setup()
     // DMA descriptor cannot, so audio goes first.
     audio_init();
     st_heap("after audio_init");
+    // Screen BEFORE radios. The backlight used to wait behind boot_restore, so any
+    // Wi-Fi/BLE misadventure presented as a dead device. The UI owes the radios nothing.
+    {
+        Preferences pb; pb.begin("tdeckos", true);
+        g_screen_bright = pb.getUChar("bright", 16);
+        pb.end();
+    }
+    pinMode(BOARD_BL_PIN, OUTPUT);
+    setBrightness(g_screen_bright);
+    Serial.println("[boot] screen on");
     Serial.println("[boot] restore");
     boot_restore();   // auto-reconnect saved Wi-Fi + restore BT state
     st_heap("after boot_restore");
-    Serial.println("[boot] backlight");
-
-    pinMode(BOARD_BL_PIN, OUTPUT);
-    setBrightness(g_screen_bright);   // restore saved brightness (boot_restore loaded it above)
 
     Serial.println("T-Deck OS ready.");
     voice_selftest();               // the 0xC2 frame layer must round-trip before it airs
