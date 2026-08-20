@@ -58,6 +58,8 @@ static lv_indev_t   *enc_indev;     // trackball (encoder)
 static int           g_tb_accel = 2;     // trackball scroll accel level 0..5 (Settings / NVS)
 static uint8_t       g_beep_vol = 7;     // incoming-message beep volume 0..10 (0=mute; Settings/NVS)
 static uint8_t       g_audio_vol = 2;    // MASTER loudness 0..10 for speech + tones (Settings/NVS "ttsvol")
+static uint8_t       g_voice_vol = 6;    // voice-note loudness 0..10 (Settings/NVS "vvol"): normalizer
+                                         // peak target = 2700 x value; 30000 was measured distorting
 static uint8_t       g_screen_bright = 16;   // display brightness 1..16 (Settings/NVS "bright")
 static lv_obj_t     *g_toast;       // bottom status / selection-feedback line
 static lv_obj_t     *g_home_list;   // launcher app list
@@ -2833,7 +2835,6 @@ static void voice_play_note_body()
     if (!c2) { Serial.println("[voice] codec2_create failed"); return; }
     const int spf = codec2_samples_per_frame(c2);          // 320 @ 40 ms, both modes
     const int bpf = (codec2_bits_per_frame(c2) + 7) / 8;   // 1200: 6, 700C: 4
-    float vol = audio_tone_amp() / 32767.0f;               // ride the master volume
     int16_t pcm[320];
     int16_t out[256];
     // Play the CONTIGUOUS prefix only: a hole would decode the next chunk against the
@@ -2844,8 +2845,39 @@ static void voice_play_note_body()
         if (g_vnote.unv_mask & (1 << chunks)) unv++;
         chunks++;
     }
-    Serial.printf("[voice] playing %d/%u chunks (%d unverified) codec %u\n",
-                  chunks, g_vnote.n, unv, g_vnote.codec);
+    // Loudness normalizer, RMS-based. Two lessons paid for in a row: the tone-amp scale
+    // left speech at ~7% of full scale (inaudible), and PEAK normalization slammed it —
+    // vocoder output has a low crest factor, so pinning the peak at 92% FS drives the
+    // average level into physical speaker saturation. Pass 1 decodes for RMS and peak
+    // (RTF 0.21 → ~0.2 s lead-in per second of clip); gain aims the RMS at a
+    // comfortable speech level on a perceptual (sqrt) master-volume curve, and is then
+    // ceilinged so the PEAK never exceeds 92% FS (no digital clip) and capped at 8x
+    // (a near-silent clip must not become an amplified noise floor).
+    int32_t  peak = 0; uint64_t sumsq = 0; uint32_t nsamp = 0;
+    for (int ci = 0; ci < chunks; ci++)
+        for (int off = 0; off + bpf <= g_vnote.clen[ci]; off += bpf) {
+            codec2_decode(c2, pcm, g_vnote.data[ci] + off);
+            for (int s = 0; s < spf; s++) {
+                int32_t a = pcm[s] < 0 ? -pcm[s] : pcm[s];
+                if (a > peak) peak = a;
+                sumsq += (uint64_t)((int32_t)pcm[s] * pcm[s]);
+            }
+            nsamp += spf;
+        }
+    codec2_destroy(c2);                        // decoder state must restart for the audible pass
+    c2 = codec2_create(g_vnote.codec == 1 ? CODEC2_MODE_700C : CODEC2_MODE_1200);
+    if (!c2) { Serial.println("[voice] re-create failed"); return; }
+    // Third calibration, and the one anchored to the hardware: measured output at a
+    // 30000 peak distorts AUDIBLY even though no sample clips — this speaker/amp runs
+    // clean only in the envelope everything else already uses (tones peak at 6000 at
+    // volume 2, espeak at ~6500). So: normalize the PEAK into that envelope — at most
+    // 15000 even at full master volume, sqrt curve below it.
+    float rms = nsamp ? sqrtf((float)(sumsq / nsamp)) : 0.0f;   // logged for calibration
+    float ptarget = 2700.0f * g_voice_vol;      // its own Settings knob, decoupled from master
+    float vol = peak > 0 ? ptarget / peak : 0.0f;
+    if (vol > 8.0f) vol = 8.0f;
+    Serial.printf("[voice] playing %d/%u chunks (%d unverified) codec %u  peak %ld rms %.0f gain %.2f out_peak %.0f\n",
+                  chunks, g_vnote.n, unv, g_vnote.codec, (long)peak, rms, vol, peak * vol);
     uint32_t dec_us = 0; int dec_frames = 0;               // decode cost, measured live
     float pos = 0, step = 8000.0f / AUDIO_RATE;
     int16_t prev = 0;
@@ -4308,6 +4340,23 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         }, LV_EVENT_VALUE_CHANGED, NULL);
         lv_group_add_obj(g, tslider);
 
+        // Voice-note loudness: the normalizer's peak target, live. Its own knob because
+        // the master volume frames beeps and espeak; voice notes have their own
+        // normalize stage and their own sweet spot on this small speaker.
+        lv_obj_t *vvlbl = lv_label_create(parent);
+        lv_obj_set_style_text_font(vvlbl, &font_kr16, 0);
+        lv_label_set_text(vvlbl, "음성쪽지 크기  (0 = 무음)");
+        lv_obj_set_style_text_color(vvlbl, lv_color_white(), 0);
+        lv_obj_t *vvs = lv_slider_create(parent);
+        lv_obj_set_width(vvs, 260);
+        lv_slider_set_range(vvs, 0, 10);
+        lv_slider_set_value(vvs, g_voice_vol, LV_ANIM_OFF);
+        lv_obj_add_event_cb(vvs, [](lv_event_t *e) {
+            g_voice_vol = (uint8_t)lv_slider_get_value(lv_event_get_target(e));
+            Preferences p; p.begin("tdeckos", false); p.putUChar("vvol", g_voice_vol); p.end();
+        }, LV_EVENT_VALUE_CHANGED, NULL);
+        lv_group_add_obj(g, vvs);
+
         // Voice plane one-way test (VOICE.md v1.12): send the canned 2 s clip to P10
         // as a real note — !VA announce + 2 paced 0xC2 chunks, then hold for repair.
         lv_obj_t *vbtn = lv_btn_create(parent);
@@ -5183,6 +5232,7 @@ static void boot_restore()
     bool   bt   = p.getBool("bt", false);
     g_kb_bright = p.getUChar("kbl", 127);
     g_tb_accel  = p.getUChar("tbaccel", 2);
+    g_voice_vol = p.getUChar("vvol", 6);
     g_beep_vol  = p.getUChar("beepvol", 7);
     g_gps_enabled = p.getBool("gpsen", true);
     g_tts_enabled = p.getBool("tts", true);
