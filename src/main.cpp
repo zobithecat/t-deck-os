@@ -2758,6 +2758,13 @@ static void book_show_shelf()
 #define VOICE_MAGIC      0xC2
 #define VOICE_MAX_CHUNKS 6          // §6: 8 s cap at C2-1200 = 6 chunks
 #define VOICE_CHUNK_MAX  200
+// TX chunk size must be a whole number of CODEC FRAMES (§4.2, 40 ms alignment). 200 is
+// exact for 700C (4 B/frame) but 200/6 = 33.33 frames at 1200 — the two-chunk 1200
+// golden vector shipped with that violation (E00's PR #12 review caught it): wire
+// reassembly is unharmed, but per-chunk prefix playback decodes chunk 1 mid-frame and
+// garbles everything after. 198 is the largest frame-aligned size under the cap for
+// 1200 mode.
+static inline uint8_t voice_tx_chunk(uint8_t codec) { return codec == 1 ? 200 : 198; }
 #define VOICE_HDR        13         // magic..len inclusive; payload starts here
 
 // CRC-16/CCITT (poly 0x1021, init 0xFFFF), computed with the ttl byte read as 0x00 —
@@ -3306,10 +3313,11 @@ static bool alert_real_active()              // §4.5: voice yields to a live re
 
 static void voice_tx_frame(uint8_t seq)
 {
-    uint16_t off = (uint16_t)seq * VOICE_CHUNK_MAX;
+    uint8_t  csz = voice_tx_chunk(g_vtx.codec);  // frame-aligned per codec (§4.2)
+    uint16_t off = (uint16_t)seq * csz;
     if (off >= g_vtx.len) return;
     uint16_t rem = g_vtx.len - off;
-    uint8_t  pl  = rem > VOICE_CHUNK_MAX ? VOICE_CHUNK_MAX : (uint8_t)rem;
+    uint8_t  pl  = rem > csz ? csz : (uint8_t)rem;
     uint8_t f[VOICE_HDR + VOICE_CHUNK_MAX + 2];
     f[0] = VOICE_MAGIC;
     f[1] = 0x10 | (g_vtx.round & 0x0F);          // high nibble v1, low = transmission round
@@ -3348,7 +3356,7 @@ static void voice_send_note(const uint8_t *data, uint16_t len, uint8_t codec,
     uint32_t crc = crc32_bytes(data, len);
     g_vtx.active = true; g_vtx.data = data; g_vtx.len = len;
     g_vtx.codec = codec; g_vtx.dst = dst; g_vtx.ttl = ttl; g_vtx.round = 0;
-    g_vtx.n = (uint8_t)((len + VOICE_CHUNK_MAX - 1) / VOICE_CHUNK_MAX);
+    g_vtx.n = (uint8_t)((len + voice_tx_chunk(codec) - 1) / voice_tx_chunk(codec));
     g_vtx.vid = (uint16_t)(crc & 0xFFFF);        // §3: content-derived on purpose
     g_vtx.resend_mask = 0; g_vtx.resend_due = 0;
     uint16_t frames = (codec == 1) ? len / 4 : len / 6;
@@ -3368,6 +3376,11 @@ static void voice_send_note(const uint8_t *data, uint16_t len, uint8_t codec,
     }
     lora_tx_ttl(va + "\n", RELAY_TTL_MESH);      // the announce floods even where chunks cannot
     for (uint8_t s = 0; s < g_vtx.n; s++) voice_tx_frame(s);
+    // v1.13 caption repair path (E00's PR review): the caption rides ONLY the announce,
+    // and the announce's whole argument is reaching nodes the audio cannot — so it must
+    // not hang on a single frame. Repeat it once after the chunks (fresh envelope pktid
+    // relays fine; receivers are (src, vid)-idempotent). ~2% of a 4-chunk clip's air.
+    if (caption && caption[0]) lora_tx_ttl(va + "\n", RELAY_TTL_MESH);
     g_vtx.sent_ms = millis();
     Serial.printf("[voice] note sent: vid=%04X n=%u %u.%us -> %04X ttl%u\n",
                   g_vtx.vid, g_vtx.n, dur_ds / 10, dur_ds % 10, dst, ttl);
@@ -3558,10 +3571,11 @@ static void ptt_task(void *)
             memset(&g_vnote, 0, sizeof(g_vnote));
             g_vnote.active = g_vnote.done = true;
             g_vnote.src = voice_addr(NODE_ID); g_vnote.codec = 1;
-            g_vnote.n = (uint8_t)((elen + VOICE_CHUNK_MAX - 1) / VOICE_CHUNK_MAX);
+            uint8_t scsz = voice_tx_chunk(1);   // same frame-aligned boundaries as the TX
+            g_vnote.n = (uint8_t)((elen + scsz - 1) / scsz);
             for (int ci2 = 0; ci2 < g_vnote.n; ci2++) {
-                uint16_t o = (uint16_t)(ci2 * VOICE_CHUNK_MAX);
-                uint8_t  l = (uint8_t)((elen - o) > VOICE_CHUNK_MAX ? VOICE_CHUNK_MAX : (elen - o));
+                uint16_t o = (uint16_t)(ci2 * scsz);
+                uint8_t  l = (uint8_t)((elen - o) > scsz ? scsz : (elen - o));
                 memcpy(g_vnote.data[ci2], g_enc_buf + o, l);
                 g_vnote.clen[ci2] = l; g_vnote.seen_mask |= (uint8_t)(1u << ci2);
             }
