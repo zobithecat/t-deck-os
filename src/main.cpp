@@ -63,7 +63,13 @@ static lv_obj_t     *g_toast;       // bottom status / selection-feedback line
 static lv_obj_t     *g_home_list;   // launcher app list
 static lv_obj_t     *g_app_view;    // current app screen (NULL when home)
 static lv_obj_t     *g_title;       // status-bar title label
-static lv_obj_t     *g_home_btns[16];
+// Every launcher row, cached for the go_home() group rebuild. This MUST hold the whole
+// apps[] table: rows past the cap still get drawn at boot, but after the first trip into
+// any app they can never be focused again — and a row the trackball cannot reach is a
+// row the list never scrolls to. That is how Settings "disappeared" when Books pushed
+// it to 17th of 16. The static_assert at the table keeps this from regressing silently.
+#define HOME_BTN_MAX 24
+static lv_obj_t     *g_home_btns[HOME_BTN_MAX];
 static int           g_home_btn_cnt;
 static int           g_focus_idx;   // last-opened launcher row (for focus restore)
 static lv_obj_t     *g_status;      // status-bar right label (battery / clock / icons)
@@ -870,6 +876,8 @@ static void build_launcher_ui()
         { LV_SYMBOL_SETTINGS, "Settings",          0x9CA3AF },
         { LV_SYMBOL_LIST,     "About",             0x2DD4BF },
     };
+    static_assert(sizeof(apps) / sizeof(apps[0]) <= HOME_BTN_MAX,
+                  "apps[] outgrew g_home_btns: rows past the cap vanish after go_home()");
 
     lv_group_t *g = lv_group_get_default();
     g_home_btn_cnt = 0;
@@ -885,7 +893,7 @@ static void build_launcher_ui()
         lv_group_add_obj(g, btn);   // trackball/keyboard focus navigation
         lv_obj_t *ic = lv_obj_get_child(btn, 0);   // icon label -> per-app color
         if (ic) lv_obj_set_style_text_color(ic, lv_color_hex(a.color), 0);
-        if (g_home_btn_cnt < 16) g_home_btns[g_home_btn_cnt++] = btn;
+        if (g_home_btn_cnt < HOME_BTN_MAX) g_home_btns[g_home_btn_cnt++] = btn;
     }
 
     // --- Soft-key hint / selection feedback ---
@@ -1529,6 +1537,10 @@ static bool lora_tx_enqueue(const uint8_t *b, size_t len, uint16_t gap_ms)
     while (g_txq_n >= TXQ_N && (uint32_t)(millis() - t0) < 8000) {
         lora_tx_service(); lora_tx_pump(); delay(2);
     }
+    uint32_t waited = millis() - t0;
+    if (waited > 5)                              // this wait IS a loop stall — name it
+        Serial.printf("[stall] txq wait %lums (q %u, len %u)\n",
+                      (unsigned long)waited, (unsigned)g_txq_n, (unsigned)len);
     if (g_txq_n >= TXQ_N) { Serial.println("[tx] queue full, frame dropped"); return false; }
     TxJob &j = g_txq[(g_txq_head + g_txq_n) % TXQ_N];
     memcpy(j.buf, b, len);
@@ -5434,18 +5446,55 @@ void loop()
         lv_group_set_editing(lv_group_get_default(), false);
         power_save_run();
     }
-    lv_timer_handler();
-    gps_feed();        // keep the NMEA parser fed regardless of which app is open
-    lora_service();    // always-on LoRa RX so messages arrive even with the app closed
-    lora_hb_tick();    // 60 s beacon, ttl 1, never on top of an arriving stream
-    news_tick();       // deferred announce (chime + speech + hijack), repair, expiry
+    // --- stall profiler: measure, never infer. Every pass through loop() times each
+    // service; each second the WORST pass is printed with its per-service breakdown, and
+    // any pass (or gap between passes — Serial flushes, delay, anything outside the five)
+    // over 50 ms is printed the moment it happens. This exists because "the scroll is
+    // stiff" has now survived two fixes that were aimed by reasoning instead of numbers.
+    static uint32_t pf_last_end = 0;
+    uint32_t it0 = micros();
+    uint32_t pf_gap = pf_last_end ? (uint32_t)(it0 - pf_last_end) : 0;
+    if (pf_gap > 5000000UL) pf_gap = 0;            // waking from power save is not a stall
+    uint32_t us[5];
+#define PF_RUN(i, expr) do { uint32_t _u = micros(); expr; us[i] = (uint32_t)(micros() - _u); } while (0)
+    PF_RUN(0, lv_timer_handler());
+    PF_RUN(1, gps_feed());       // keep the NMEA parser fed regardless of which app is open
+    PF_RUN(2, lora_service());   // always-on LoRa RX so messages arrive even with the app closed
+    PF_RUN(3, lora_hb_tick());   // 60 s beacon, ttl 1, never on top of an arriving stream
+    PF_RUN(4, news_tick());      // deferred announce (chime + speech + hijack), repair, expiry
+#undef PF_RUN
+    uint32_t it_us = (uint32_t)(micros() - it0);
+    pf_last_end = it0 + it_us;
 
-    // How the last second of drawing went. Only while the screen is genuinely busy —
-    // the clock in the status bar paints one small frame a second forever, and a console
-    // line for that would bury everything else worth reading.
+    static uint32_t pf_n = 0, pf_worst = 0, pf_wus[5], pf_wgap = 0;
+    static uint32_t pf_sum_lv = 0, pf_sum_lora = 0, pf_sum_news = 0, pf_sum_gap = 0;
+    pf_n++;
+    pf_sum_lv += us[0]; pf_sum_lora += us[2]; pf_sum_news += us[4]; pf_sum_gap += pf_gap;
+    if (pf_gap > pf_wgap) pf_wgap = pf_gap;
+    if (it_us > pf_worst) { pf_worst = it_us; memcpy(pf_wus, us, sizeof(us)); }
+    if (it_us > 50000 || pf_gap > 50000)
+        Serial.printf("[stall] pass %lums (lv %lu gps %lu lora %lu hb %lu news %lu)  gap %lums\n",
+                      (unsigned long)(it_us / 1000),
+                      (unsigned long)(us[0] / 1000), (unsigned long)(us[1] / 1000),
+                      (unsigned long)(us[2] / 1000), (unsigned long)(us[3] / 1000),
+                      (unsigned long)(us[4] / 1000), (unsigned long)(pf_gap / 1000));
+
+    // How the last second went, unconditionally — the whole point of this build is that
+    // the console tells the story even when nothing looks busy from here.
     static uint32_t perf_ms = 0;
     uint32_t now = millis();
     if ((uint32_t)(now - perf_ms) > 1000) {
+        Serial.printf("[loop] %lu/s worst %lu.%lums(lv %lu gps %lu lora %lu hb %lu news %lu) gapmax %lu  busy lv %lu%% lora %lu%% news %lu%% gap %lu%%\n",
+                      (unsigned long)pf_n,
+                      (unsigned long)(pf_worst / 1000), (unsigned long)((pf_worst % 1000) / 100),
+                      (unsigned long)(pf_wus[0] / 1000), (unsigned long)(pf_wus[1] / 1000),
+                      (unsigned long)(pf_wus[2] / 1000), (unsigned long)(pf_wus[3] / 1000),
+                      (unsigned long)(pf_wus[4] / 1000), (unsigned long)(pf_wgap / 1000),
+                      (unsigned long)(pf_sum_lv / 10000), (unsigned long)(pf_sum_lora / 10000),
+                      (unsigned long)(pf_sum_news / 10000), (unsigned long)(pf_sum_gap / 10000));
+        pf_n = pf_worst = pf_wgap = 0;
+        pf_sum_lv = pf_sum_lora = pf_sum_news = pf_sum_gap = 0;
+        memset(pf_wus, 0, sizeof(pf_wus));
         if (g_perf_frames >= 5)
             Serial.printf("[perf] %lu fps  %lu ms/frame  %lu px/frame  ball %lu edges/s\n",
                           (unsigned long)g_perf_frames,
