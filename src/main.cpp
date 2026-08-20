@@ -2964,7 +2964,7 @@ static void voice_play_note_body()
         for (int off = 0; off + bpf <= g_vnote.clen[ci]; off += bpf) {
             codec2_decode(c2, pcm, g_vnote.data[ci] + off);
             for (int s = 0; s < spf; s++) {
-                float x = hpf.run((float)pcm[s]);   // measure what will actually play
+                float x = g_voice_fx ? hpf.run((float)pcm[s]) : (float)pcm[s];   // measure what will actually play
                 float a = fabsf(x);
                 if (a > peak) peak = a;
                 sumsq += (double)x * x;
@@ -3045,6 +3045,7 @@ static void voice_play_note_body()
                 codec2_decode(c2, pcm, g_vnote.data[ci] + off);
                 dec_us += (uint32_t)(micros() - d0); dec_frames++;
                 for (int s = 0; s < spf; s++) {
+                    if (!g_voice_fx) { vup_push(pcm[s] * vol); continue; }   // tone chain off
                     float xs = hpf.run((float)pcm[s]) * vol;
                     float ax = fabsf(xs);
                     float cc = (ax > cenv) ? catt : crel;
@@ -5045,6 +5046,21 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         }, LV_EVENT_CLICKED, NULL);
         lv_group_add_obj(g, vcb);
 
+        // Playback tone chain on/off. E00 clips arrive pre-companded; stacking our
+        // HPF+compressor on top eats the higher codec's edge. Normalizer and the
+        // sinc upsampler stay either way — loudness and resampling are not tone.
+        lv_obj_t *vfb  = lv_btn_create(parent);
+        lv_obj_t *vfbl = lv_label_create(vfb);
+        lv_obj_set_style_text_font(vfbl, &font_kr16, 0);
+        lv_label_set_text_fmt(vfbl, LV_SYMBOL_SETTINGS " 재생 필터: %s", g_voice_fx ? "켬" : "끔");
+        lv_obj_add_event_cb(vfb, [](lv_event_t *e) {
+            g_voice_fx = !g_voice_fx;
+            Preferences p; p.begin("tdeckos", false); p.putBool("vfx", g_voice_fx); p.end();
+            lv_label_set_text_fmt(lv_obj_get_child(lv_event_get_target(e), 0),
+                                  LV_SYMBOL_SETTINGS " 재생 필터: %s", g_voice_fx ? "켬" : "끔");
+        }, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, vfb);
+
         // Voice plane one-way test (VOICE.md v1.12): send the canned 2 s clip to P10
         // as a real note — !VA announce + 2 paced 0xC2 chunks, then hold for repair.
         lv_obj_t *vbtn = lv_btn_create(parent);
@@ -5986,6 +6002,7 @@ static void boot_restore()
     g_tb_accel  = p.getUChar("tbaccel", 2);
     g_voice_vol = p.getUChar("vvol", 6);
     g_voice_codec = p.getUChar("vcodec", 1) ? 1 : 0;
+    g_voice_fx    = p.getBool("vfx", true);
     g_beep_vol  = p.getUChar("beepvol", 7);
     g_gps_enabled = p.getBool("gpsen", true);
     g_tts_enabled = p.getBool("tts", true);
