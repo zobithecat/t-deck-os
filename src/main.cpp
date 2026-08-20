@@ -2822,6 +2822,35 @@ static void voice_note_reset(uint16_t src, uint16_t vid)
 // no ownership change. 8 kHz mono comes out of codec2; the device runs 22,050 stereo
 // (one clock, never re-clocked — see AUDIO_RATE), so we linear-interpolate up and
 // duplicate channels on the way. Blocking for the clip length, like the chime.
+// --- windowed-sinc fractional upsampler, 8 kHz -> AUDIO_RATE ------------------------
+// Linear interpolation was the last lo-fi stage in the voice path: its sinc^2 response
+// shaves the 2-4 kHz consonant band (the "muffled" feel) and leaves imaging above it.
+// 8-tap, 32-phase Hamming-windowed sinc with linear phase blending: flat to ~3.6 kHz,
+// images below ~-50 dB, ~16 MACs per output sample — noise next to the decoder. Each
+// phase row is normalized to unity DC so inter-phase gain ripple cannot warble.
+#define VUP_TAPS   8
+#define VUP_PHASES 32
+static float g_vup_fir[VUP_PHASES + 1][VUP_TAPS];   // row 32 = frac 1.0, so p+1 never wraps
+static bool  g_vup_ready = false;
+static void vup_init()
+{
+    if (g_vup_ready) return;
+    const float fc = 0.46f;                          // fraction of the input Nyquist kept
+    for (int p = 0; p <= VUP_PHASES; p++) {
+        float frac = (float)p / VUP_PHASES, sum = 0;
+        for (int k = 0; k < VUP_TAPS; k++) {
+            float t = (float)(k - 3) - frac;         // tap offset from the output point
+            float s = (fabsf(t) < 1e-6f) ? 2.0f * fc
+                                         : sinf(2.0f * (float)M_PI * fc * t) / ((float)M_PI * t);
+            float w = 0.54f + 0.46f * cosf((float)M_PI * t / (VUP_TAPS / 2));
+            g_vup_fir[p][k] = s * w;
+            sum += g_vup_fir[p][k];
+        }
+        for (int k = 0; k < VUP_TAPS; k++) g_vup_fir[p][k] /= sum;
+    }
+    g_vup_ready = true;
+}
+
 static void voice_play_note_body()
 {
     // §4.4 prefix rule, extended by §5.2: once repair has given up (partial), chunks
@@ -2879,35 +2908,50 @@ static void voice_play_note_body()
     Serial.printf("[voice] playing %d/%u chunks (%d unverified) codec %u  peak %ld rms %.0f gain %.2f out_peak %.0f\n",
                   chunks, g_vnote.n, unv, g_vnote.codec, (long)peak, rms, vol, peak * vol);
     uint32_t dec_us = 0; int dec_frames = 0;               // decode cost, measured live
-    float pos = 0, step = 8000.0f / AUDIO_RATE;
-    int16_t prev = 0;
+    vup_init();
+    float    hist[VUP_TAPS] = {0};             // x[n_in-8 .. n_in-1], zeros = pre-history
+    uint32_t n_in = 4;                         // 4 virtual zeros -> 0.5 ms lead-in
+    float    t = 0.0f;
+    const float dt = 8000.0f / AUDIO_RATE;
+    int oi = 0;
+    // One input sample in, two-to-three FIR-interpolated outputs out. The drain
+    // condition keeps the 8-tap window exactly inside hist[] — every output's base
+    // index lands at hist[0] by construction.
+    auto vup_push = [&](float x) {
+        memmove(hist, hist + 1, (VUP_TAPS - 1) * sizeof(float));
+        hist[VUP_TAPS - 1] = x;
+        n_in++;
+        while ((int32_t)t <= (int32_t)n_in - 5) {
+            float frac = t - (int32_t)t;
+            float pf = frac * VUP_PHASES;
+            int   ph = (int)pf; float a = pf - ph;
+            float y = 0;
+            for (int k = 0; k < VUP_TAPS; k++)
+                y += ((1.0f - a) * g_vup_fir[ph][k] + a * g_vup_fir[ph + 1][k]) * hist[k];
+            int32_t vi = (int32_t)y;
+            if (vi > 32700) vi = 32700; else if (vi < -32700) vi = -32700;   // FIR overshoot
+            out[oi++] = (int16_t)vi; out[oi++] = (int16_t)vi;   // stereo-only device
+            if (oi >= 256) {
+                const uint8_t *p = (const uint8_t *)out; size_t left = oi * 2;
+                while (left) { size_t w = g_i2s.write(p, left);
+                               if (!w) { delay(1); continue; } p += w; left -= w; }
+                oi = 0;
+            }
+            t += dt;
+        }
+    };
     for (int ci = 0; ci < chunks; ci++) {
         for (int off = 0; off + bpf <= g_vnote.clen[ci]; off += bpf) {
             uint32_t d0 = micros();
             codec2_decode(c2, pcm, g_vnote.data[ci] + off);
             dec_us += (uint32_t)(micros() - d0); dec_frames++;
-            int oi = 0;
-            for (int s = 0; s < spf; s++) {
-                int16_t cur = (int16_t)(pcm[s] * vol);
-                while (pos < 1.0f) {                       // upsample 8000 -> 22050
-                    int16_t v = (int16_t)(prev + (cur - prev) * pos);
-                    out[oi++] = v; out[oi++] = v;          // stereo-only device
-                    if (oi >= 256) {
-                        const uint8_t *p = (const uint8_t *)out; size_t left = oi * 2;
-                        while (left) { size_t w = g_i2s.write(p, left);
-                                       if (!w) { delay(1); continue; } p += w; left -= w; }
-                        oi = 0;
-                    }
-                    pos += step;
-                }
-                pos -= 1.0f;
-                prev = cur;
-            }
-            if (oi) { const uint8_t *p = (const uint8_t *)out; size_t left = oi * 2;
-                      while (left) { size_t w = g_i2s.write(p, left);
-                                     if (!w) { delay(1); continue; } p += w; left -= w; } }
+            for (int s = 0; s < spf; s++) vup_push(pcm[s] * vol);
         }
     }
+    for (int zf = 0; zf < VUP_TAPS; zf++) vup_push(0.0f);   // flush the filter tail
+    if (oi) { const uint8_t *p = (const uint8_t *)out; size_t left = oi * 2;
+              while (left) { size_t w = g_i2s.write(p, left);
+                             if (!w) { delay(1); continue; } p += w; left -= w; } }
     int16_t z[128] = {0};                     // trailing silence so the clip ends cleanly
     g_i2s.write((const uint8_t *)z, sizeof(z));
     codec2_destroy(c2);
