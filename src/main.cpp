@@ -2851,6 +2851,28 @@ static void vup_init()
     g_vup_ready = true;
 }
 
+// 300 Hz 2nd-order Butterworth high-pass, run at 8 kHz before the upsampler. This
+// speaker cannot turn sub-300 Hz into sound — that energy only burns cone excursion,
+// which is the distortion budget. Cutting it is free loudness for the speech band.
+struct VoiceHpf {
+    float b0, b1, b2, a1, a2, x1, x2, y1, y2;
+    void init()
+    {
+        const float w0 = 2.0f * (float)M_PI * 300.0f / 8000.0f;
+        const float c = cosf(w0), al = sinf(w0) / (2.0f * 0.7071f);
+        const float a0 = 1.0f + al;
+        b0 = (1.0f + c) / 2.0f / a0; b1 = -(1.0f + c) / a0; b2 = b0;
+        a1 = -2.0f * c / a0; a2 = (1.0f - al) / a0;
+        x1 = x2 = y1 = y2 = 0.0f;
+    }
+    float run(float x)
+    {
+        float y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        x2 = x1; x1 = x; y2 = y1; y1 = y;
+        return y;
+    }
+};
+
 static void voice_play_note_body()
 {
     // §4.4 prefix rule, extended by §5.2: once repair has given up (partial), chunks
@@ -2882,14 +2904,16 @@ static void voice_play_note_body()
     // comfortable speech level on a perceptual (sqrt) master-volume curve, and is then
     // ceilinged so the PEAK never exceeds 92% FS (no digital clip) and capped at 8x
     // (a near-silent clip must not become an amplified noise floor).
-    int32_t  peak = 0; uint64_t sumsq = 0; uint32_t nsamp = 0;
+    VoiceHpf hpf; hpf.init();
+    float    peak = 0; double sumsq = 0; uint32_t nsamp = 0;
     for (int ci = 0; ci < chunks; ci++)
         for (int off = 0; off + bpf <= g_vnote.clen[ci]; off += bpf) {
             codec2_decode(c2, pcm, g_vnote.data[ci] + off);
             for (int s = 0; s < spf; s++) {
-                int32_t a = pcm[s] < 0 ? -pcm[s] : pcm[s];
+                float x = hpf.run((float)pcm[s]);   // measure what will actually play
+                float a = fabsf(x);
                 if (a > peak) peak = a;
-                sumsq += (uint64_t)((int32_t)pcm[s] * pcm[s]);
+                sumsq += (double)x * x;
             }
             nsamp += spf;
         }
@@ -2903,10 +2927,23 @@ static void voice_play_note_body()
     // 15000 even at full master volume, sqrt curve below it.
     float rms = nsamp ? sqrtf((float)(sumsq / nsamp)) : 0.0f;   // logged for calibration
     float ptarget = 2700.0f * g_voice_vol;      // its own Settings knob, decoupled from master
-    float vol = peak > 0 ? ptarget / peak : 0.0f;
+    float vol = peak > 0.5f ? ptarget / peak : 0.0f;
     if (vol > 8.0f) vol = 8.0f;
-    Serial.printf("[voice] playing %d/%u chunks (%d unverified) codec %u  peak %ld rms %.0f gain %.2f out_peak %.0f\n",
-                  chunks, g_vnote.n, unv, g_vnote.codec, (long)peak, rms, vol, peak * vol);
+    // Soft compressor, 3:1 above -9 dB of the peak target, 5 ms attack / 100 ms
+    // release, with makeup gain that puts the loudest peak back AT the target. Net
+    // effect: peaks unchanged, everything under them lifted ~5 dB — the "빵빵" body
+    // the raw vocoder output lacks. Memoryless clamp at emit stays the last resort.
+    const float cth = 0.35f * ptarget;
+    const float cratio = 1.0f / 3.0f;
+    const float cmakeup = (ptarget > 0.5f) ? ptarget / (cth + (ptarget - cth) * cratio) : 0.0f;
+    const float catt = 0.8825f, crel = 0.99875f;   // exp(-1/(8000*1ms)), exp(-1/(8000*100ms));
+                                                   // 5 ms attack let transients overshoot the
+                                                   // peak target by 37% (host-measured), 1 ms
+                                                   // holds them to +16% with the RMS lift intact
+    float cenv = 0.0f;
+    hpf.init();                                    // pass 2 replays the same filter fresh
+    Serial.printf("[voice] playing %d/%u chunks (%d unverified) codec %u  peak %.0f rms %.0f gain %.2f makeup %.2f\n",
+                  chunks, g_vnote.n, unv, g_vnote.codec, peak, rms, vol, cmakeup);
     uint32_t dec_us = 0; int dec_frames = 0;               // decode cost, measured live
     vup_init();
     float    hist[VUP_TAPS] = {0};             // x[n_in-8 .. n_in-1], zeros = pre-history
@@ -2945,7 +2982,14 @@ static void voice_play_note_body()
             uint32_t d0 = micros();
             codec2_decode(c2, pcm, g_vnote.data[ci] + off);
             dec_us += (uint32_t)(micros() - d0); dec_frames++;
-            for (int s = 0; s < spf; s++) vup_push(pcm[s] * vol);
+            for (int s = 0; s < spf; s++) {
+                float xs = hpf.run((float)pcm[s]) * vol;
+                float ax = fabsf(xs);
+                float cc = (ax > cenv) ? catt : crel;
+                cenv = cc * cenv + (1.0f - cc) * ax;
+                float g = (cenv > cth) ? (cth + (cenv - cth) * cratio) / cenv : 1.0f;
+                vup_push(xs * g * cmakeup);
+            }
         }
     }
     for (int zf = 0; zf < VUP_TAPS; zf++) vup_push(0.0f);   // flush the filter tail
