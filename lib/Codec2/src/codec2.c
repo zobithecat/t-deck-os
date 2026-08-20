@@ -489,7 +489,9 @@ void codec2_decode_3200(struct CODEC2 *c2, short speech[],
   float ak[2][LPC_ORD + 1];
   int i, j;
   unsigned int nbit = 0;
-  COMP Aw[FFT_ENC];
+  /* [t-deck vendor patch] heap, not stack: an 8 KB combined frame walked the SP
+     past the canary watchpoint into the neighbouring heap block. Host-gated. */
+  COMP *Aw = (COMP *)malloc(sizeof(COMP) * FFT_ENC);
 
   assert(c2 != NULL);
 
@@ -545,6 +547,7 @@ void codec2_decode_3200(struct CODEC2 *c2, short speech[],
   c2->prev_model_dec = model[1];
   c2->prev_e_dec = e[1];
   for (i = 0; i < LPC_ORD; i++) c2->prev_lsps_dec[i] = lsps[1][i];
+  free(Aw);
 }
 
 /*---------------------------------------------------------------------------*\
@@ -632,7 +635,9 @@ void codec2_decode_2400(struct CODEC2 *c2, short speech[],
   float ak[2][LPC_ORD + 1];
   int i, j;
   unsigned int nbit = 0;
-  COMP Aw[FFT_ENC];
+  /* [t-deck vendor patch] heap, not stack: an 8 KB combined frame walked the SP
+     past the canary watchpoint into the neighbouring heap block. Host-gated. */
+  COMP *Aw = (COMP *)malloc(sizeof(COMP) * FFT_ENC);
 
   assert(c2 != NULL);
 
@@ -697,6 +702,7 @@ void codec2_decode_2400(struct CODEC2 *c2, short speech[],
   c2->prev_model_dec = model[1];
   c2->prev_e_dec = e[1];
   for (i = 0; i < LPC_ORD; i++) c2->prev_lsps_dec[i] = lsps[1][i];
+  free(Aw);
 }
 
 /*---------------------------------------------------------------------------*\
@@ -807,7 +813,9 @@ void codec2_decode_1600(struct CODEC2 *c2, short speech[],
   int i, j;
   unsigned int nbit = 0;
   float weight;
-  COMP Aw[FFT_ENC];
+  /* [t-deck vendor patch] heap, not stack: an 8 KB combined frame walked the SP
+     past the canary watchpoint into the neighbouring heap block. Host-gated. */
+  COMP *Aw = (COMP *)malloc(sizeof(COMP) * FFT_ENC);
 
   assert(c2 != NULL);
 
@@ -878,6 +886,7 @@ void codec2_decode_1600(struct CODEC2 *c2, short speech[],
   c2->prev_model_dec = model[3];
   c2->prev_e_dec = e[3];
   for (i = 0; i < LPC_ORD; i++) c2->prev_lsps_dec[i] = lsps[3][i];
+  free(Aw);
 }
 
 /*---------------------------------------------------------------------------*\
@@ -982,7 +991,9 @@ void codec2_decode_1400(struct CODEC2 *c2, short speech[],
   int i, j;
   unsigned int nbit = 0;
   float weight;
-  COMP Aw[FFT_ENC];
+  /* [t-deck vendor patch] heap, not stack: an 8 KB combined frame walked the SP
+     past the canary watchpoint into the neighbouring heap block. Host-gated. */
+  COMP *Aw = (COMP *)malloc(sizeof(COMP) * FFT_ENC);
 
   assert(c2 != NULL);
 
@@ -1045,6 +1056,7 @@ void codec2_decode_1400(struct CODEC2 *c2, short speech[],
   c2->prev_model_dec = model[3];
   c2->prev_e_dec = e[3];
   for (i = 0; i < LPC_ORD; i++) c2->prev_lsps_dec[i] = lsps[3][i];
+  free(Aw);
 }
 
 /*---------------------------------------------------------------------------*\
@@ -1147,7 +1159,9 @@ void codec2_decode_1300(struct CODEC2 *c2, short speech[],
   int i, j;
   unsigned int nbit = 0;
   float weight;
-  COMP Aw[FFT_ENC];
+  /* [t-deck vendor patch] heap, not stack: an 8 KB combined frame walked the SP
+     past the canary watchpoint into the neighbouring heap block. Host-gated. */
+  COMP *Aw = (COMP *)malloc(sizeof(COMP) * FFT_ENC);
 
   assert(c2 != NULL);
 
@@ -1232,6 +1246,7 @@ void codec2_decode_1300(struct CODEC2 *c2, short speech[],
   c2->prev_model_dec = model[3];
   c2->prev_e_dec = e[3];
   for (i = 0; i < LPC_ORD; i++) c2->prev_lsps_dec[i] = lsps[3][i];
+  free(Aw);
 }
 
 /*---------------------------------------------------------------------------*\
@@ -1340,7 +1355,9 @@ void codec2_decode_1200(struct CODEC2 *c2, short speech[],
   int i, j;
   unsigned int nbit = 0;
   float weight;
-  COMP Aw[FFT_ENC];
+  /* [t-deck vendor patch] heap, not stack: an 8 KB combined frame walked the SP
+     past the canary watchpoint into the neighbouring heap block. Host-gated. */
+  COMP *Aw = (COMP *)malloc(sizeof(COMP) * FFT_ENC);
 
   assert(c2 != NULL);
 
@@ -1403,6 +1420,7 @@ void codec2_decode_1200(struct CODEC2 *c2, short speech[],
   c2->prev_model_dec = model[3];
   c2->prev_e_dec = e[3];
   for (i = 0; i < LPC_ORD; i++) c2->prev_lsps_dec[i] = lsps[3][i];
+  free(Aw);
 }
 
 /*---------------------------------------------------------------------------*\

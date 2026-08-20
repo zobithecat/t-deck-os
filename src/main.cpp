@@ -2792,6 +2792,12 @@ struct VoiceNote {
     uint32_t vn_due;
 };
 static VoiceNote g_vnote;
+// RX loopback proof (Settings): E00's 0xC2 TX does not exist yet (§7), so until it
+// does, the only way this device's receive path ever runs is injection — the golden
+// 700C frame fed to voice_rx_frame as if the radio delivered it. The bool keeps the
+// injected "reception" out of the SNR noise baseline, which must stay air-only.
+static volatile bool g_vrx_loop_req  = false;
+static bool          g_vrx_loopback  = false;
 
 static uint32_t crc32_bytes(const uint8_t *p, size_t n)
 {
@@ -2814,7 +2820,7 @@ static void voice_note_reset(uint16_t src, uint16_t vid)
 // no ownership change. 8 kHz mono comes out of codec2; the device runs 22,050 stereo
 // (one clock, never re-clocked — see AUDIO_RATE), so we linear-interpolate up and
 // duplicate channels on the way. Blocking for the clip length, like the chime.
-static void voice_play_note()
+static void voice_play_note_body()
 {
     // §4.4 prefix rule, extended by §5.2: once repair has given up (partial), chunks
     // whose crc16 failed but whose bytes were kept extend the playable prefix. Before
@@ -2879,6 +2885,39 @@ static void voice_play_note()
                       (dec_us / 1000.0f) / (dec_frames * 40.0f));
 }
 
+// codec2 1.2.0 assumes desktop-sized stacks: measured frames are codec2_create 22.2 KB,
+// decode_700c 5.5 KB with fft_inplace 4.1 KB nested — no 8 KB task survives it, and the
+// overflow TELEPORTS past the canary watchpoint (one entry instruction moves SP whole
+// kilobytes below the stack block) into neighbouring internal heap blocks, which is how
+// task_wdt's list kept dying on core 0. Internal RAM has no 20 KB to give (NimBLE boot
+// starves) — but the framework ships CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y, so
+// the whole playback runs in a throwaway task whose 32 KB stack lives in PSRAM. The
+// task parks when done and the waiter reclaims it (self-delete would free the stack
+// under its own feet).
+static volatile bool g_vplay_running = false;
+static void voice_play_task(void *)
+{
+    voice_play_note_body();
+    Serial.printf("[voice] vplay stack headroom %u B\n",
+                  (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    g_vplay_running = false;
+    for (;;) vTaskDelay(portMAX_DELAY);
+}
+static void voice_play_note()
+{
+    if (g_vplay_running) return;
+    g_vplay_running = true;
+    TaskHandle_t h = NULL;
+    if (xTaskCreatePinnedToCoreWithCaps(voice_play_task, "vplay", 32768, NULL, 1, &h, 1,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        g_vplay_running = false;
+        Serial.println("[voice] play task alloc failed");
+        return;
+    }
+    while (g_vplay_running) delay(5);
+    vTaskDeleteWithCaps(h);
+}
+
 static void voice_note_completed()
 {
     g_vnote.done = true;
@@ -2937,7 +2976,8 @@ static void voice_rx_frame(const uint8_t *b, int len)
         }
         return;
     }
-    rx_snr_good(g_rx_snr_last);                  // a verified frame is a parsed reception
+    if (!g_vrx_loopback)
+        rx_snr_good(g_rx_snr_last);              // a verified frame is a parsed reception
     uint16_t src = (uint16_t)b[3] | (uint16_t)b[4] << 8;   // LE
     uint16_t dst = (uint16_t)b[5] | (uint16_t)b[6] << 8;
     uint16_t vid = (uint16_t)b[7] | (uint16_t)b[8] << 8;
@@ -3130,6 +3170,38 @@ static void voice_tick()
     if (g_vtx_req) {
         g_vtx_req = false;
         voice_send_note(VOICE_TEST_CLIP, VOICE_TEST_CLIP_LEN, 1, voice_addr("P10"), 1);
+    }
+    // RX loopback: the golden note as E00 would send it — !VA through the real
+    // dispatcher path, then the wire-exact 215 B frame (same builder as the vectors,
+    // BE crc16, ttl-zeroed). n=1, so completion, playback and the decode-RTF print
+    // all fire from this one injection. Runs here because playback blocks for the
+    // clip length, which has no business inside an LVGL callback.
+    if (g_vrx_loop_req) {
+        g_vrx_loop_req = false;
+        if (g_vnote.active && !g_vnote.done) {
+            Serial.println("[voice] loopback skipped: a real note is assembling");
+        } else {
+            uint16_t src = voice_addr("E00"), dst = voice_addr(NODE_ID);
+            uint32_t crc = crc32_bytes(VOICE_TEST_CLIP, VOICE_TEST_CLIP_LEN);
+            uint16_t vid = (uint16_t)(crc & 0xFFFF);
+            Serial.printf("[voice] loopback inject: E00->%s vid=%04X 700C %uB\n",
+                          NODE_ID, vid, (unsigned)VOICE_TEST_CLIP_LEN);
+            g_vrx_loopback = true;
+            voice_handle_va("!VA\t" + b36(src) + "\t" + b36(vid) + "\t1\t1\t" +
+                            b36((VOICE_TEST_CLIP_LEN / 4) * 4 / 10) + "\t" + b36(crc));
+            uint8_t f[VOICE_HDR + VOICE_CHUNK_MAX + 2];
+            f[0] = VOICE_MAGIC; f[1] = 0x10; f[2] = 1;
+            f[3] = src & 0xFF; f[4] = src >> 8;
+            f[5] = dst & 0xFF; f[6] = dst >> 8;
+            f[7] = vid & 0xFF; f[8] = vid >> 8;
+            f[9] = 0; f[10] = 1; f[11] = 1; f[12] = (uint8_t)VOICE_TEST_CLIP_LEN;
+            memcpy(f + VOICE_HDR, VOICE_TEST_CLIP, VOICE_TEST_CLIP_LEN);
+            uint16_t c = crc16_ccitt_ttl0(f, VOICE_HDR + VOICE_TEST_CLIP_LEN);
+            f[VOICE_HDR + VOICE_TEST_CLIP_LEN]     = c >> 8;           // BE, per §4.2
+            f[VOICE_HDR + VOICE_TEST_CLIP_LEN + 1] = c & 0xFF;
+            voice_rx_frame(f, VOICE_HDR + VOICE_TEST_CLIP_LEN + 2);
+            g_vrx_loopback = false;
+        }
     }
     if (g_vtx_burst) {
         static uint32_t burst_last = 0;
@@ -4249,6 +4321,15 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lv_label_set_text(vbbl, LV_SYMBOL_LOOP " 음성 반복시험 x20 (계측용)");
         lv_obj_add_event_cb(vbb, [](lv_event_t *) { g_vtx_burst = 20; }, LV_EVENT_CLICKED, NULL);
         lv_group_add_obj(g, vbb);
+
+        // Receive-path proof with no peer TX in existence: inject the golden 700C note
+        // as if E00 sent it — assembly, playback and the decode-RTF measurement.
+        lv_obj_t *vlb  = lv_btn_create(parent);
+        lv_obj_t *vlpl = lv_label_create(vlb);
+        lv_obj_set_style_text_font(vlpl, &font_kr16, 0);
+        lv_label_set_text(vlpl, LV_SYMBOL_DOWNLOAD " 음성 수신 루프백 시험");
+        lv_obj_add_event_cb(vlb, [](lv_event_t *) { g_vrx_loop_req = true; }, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, vlb);
 
         lv_obj_t *blbl = lv_label_create(parent);
         lv_label_set_text(blbl, "Message beep volume  (0 = mute)");

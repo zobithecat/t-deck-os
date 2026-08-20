@@ -323,7 +323,9 @@ void lpc_post_filter(codec2_fftr_cfg fftr_fwd_cfg, float Pw[], float ak[],
                      int order, int dump, float beta, float gamma,
                      int bass_boost, float E) {
   int i;
-  float x[FFT_ENC];          /* input to FFTs                */
+  /* [t-deck vendor patch] heap, not stack: an 8 KB combined frame walked the SP
+     past the canary watchpoint into the neighbouring heap block. Host-gated. */
+  float *x = (float *)malloc(sizeof(float) * FFT_ENC);  /* input to FFTs */
   COMP Ww[FFT_ENC / 2 + 1];  /* weighting spectrum           */
   float Rw[FFT_ENC / 2 + 1]; /* R = WA                       */
   float e_before, e_after, gain;
@@ -409,6 +411,7 @@ void lpc_post_filter(codec2_fftr_cfg fftr_fwd_cfg, float Pw[], float ak[],
   }
 
   PROFILE_SAMPLE_AND_LOG2(tr, "        filt");
+  free(x);
 }
 
 /*---------------------------------------------------------------------------*\
@@ -447,7 +450,7 @@ void aks_to_M2(codec2_fftr_cfg fftr_fwd_cfg, float ak[], /* LPC's */
 
   /* Determine DFT of A(exp(jw)) --------------------------------------------*/
   {
-    float a[FFT_ENC]; /* input to FFT for power spectrum */
+    float *a = (float *)malloc(sizeof(float) * FFT_ENC); /* [t-deck vendor patch] */
 
     for (i = 0; i < FFT_ENC; i++) {
       a[i] = 0.0;
@@ -455,6 +458,7 @@ void aks_to_M2(codec2_fftr_cfg fftr_fwd_cfg, float ak[], /* LPC's */
 
     for (i = 0; i <= order; i++) a[i] = ak[i];
     codec2_fftr(fftr_fwd_cfg, a, Aw);
+    free(a);
   }
   PROFILE_SAMPLE_AND_LOG(tfft, tstart, "      fft");
 

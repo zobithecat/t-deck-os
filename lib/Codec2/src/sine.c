@@ -36,6 +36,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <assert.h>
 
 #include "defines.h"
 #include "kiss_fft.h"
@@ -102,7 +103,10 @@ C2CONST c2const_create(int Fs, float framelength_s) {
 void make_analysis_window(C2CONST *c2const, codec2_fft_cfg fft_fwd_cfg,
                           float w[], float W[]) {
   float m;
-  COMP wshift[FFT_ENC];
+  /* [t-deck vendor patch] wshift/temp were 4 KB stack frames each — 8.2 KB in one
+     frame, more than the whole 8 KB loopTask stack. Heap for the create call only;
+     output bytes host-gated identical against brew c2dec after this change. */
+  COMP *wshift = (COMP *)malloc(sizeof(COMP) * FFT_ENC);
   int i, j;
   int m_pitch = c2const->m_pitch;
   int nw = c2const->nw;
@@ -155,7 +159,8 @@ void make_analysis_window(C2CONST *c2const, codec2_fft_cfg fft_fwd_cfg,
        nw/2              nw/2
   */
 
-  COMP temp[FFT_ENC];
+  COMP *temp = (COMP *)malloc(sizeof(COMP) * FFT_ENC);
+  assert(wshift != NULL && temp != NULL);
 
   for (i = 0; i < FFT_ENC; i++) {
     wshift[i].real = 0.0;
@@ -194,6 +199,9 @@ void make_analysis_window(C2CONST *c2const, codec2_fft_cfg fft_fwd_cfg,
     W[i] = temp[i + FFT_ENC / 2].real;
     W[i + FFT_ENC / 2] = temp[i].real;
   }
+
+  free(wshift);
+  free(temp);
 }
 
 /*---------------------------------------------------------------------------*\
@@ -260,7 +268,9 @@ void dft_speech(C2CONST *c2const, codec2_fft_cfg fft_fwd_cfg, COMP Sw[],
 void dft_speech(codec2_fftr_cfg fftr_fwd_cfg, COMP Sw[], float Sn[],
                 float w[]) {
   int i;
-  float sw[FFT_ENC];
+  /* [t-deck vendor patch] heap, not stack: an 8 KB combined frame walked the SP
+     past the canary watchpoint into the neighbouring heap block. Host-gated. */
+  float *sw = (float *)malloc(sizeof(float) * FFT_ENC);
 
   for (i = 0; i < FFT_ENC; i++) {
     sw[i] = 0.0;
@@ -280,6 +290,7 @@ void dft_speech(codec2_fftr_cfg fftr_fwd_cfg, COMP Sw[], float Sn[],
         Sn[i + m_pitch / 2 - nw / 2] * w[i + m_pitch / 2 - nw / 2];
 
   codec2_fftr(fftr_fwd_cfg, sw, Sw);
+  free(sw);
 }
 #endif
 
@@ -598,7 +609,9 @@ void synthesise(int n_samp, codec2_fftr_cfg fftr_inv_cfg,
 ) {
   int i, l, j, b;            /* loop variables */
   COMP Sw_[FFT_DEC / 2 + 1]; /* DFT of synthesised signal */
-  float sw_[FFT_DEC];        /* synthesised signal */
+  /* [t-deck vendor patch] heap, not stack: an 8 KB combined frame walked the SP
+     past the canary watchpoint into the neighbouring heap block. Host-gated. */
+  float *sw_ = (float *)malloc(sizeof(float) * FFT_DEC);  /* synthesised signal */
 
   if (shift) {
     /* Update memories */
@@ -646,6 +659,7 @@ void synthesise(int n_samp, codec2_fftr_cfg fftr_inv_cfg,
   else
     for (i = n_samp - 1, j = 0; i < 2 * n_samp; i++, j++)
       Sn_[i] += sw_[j] * Pn[i] * FFTI_FACTOR;
+  free(sw_);
 }
 
 /* todo: this should probably be in some states rather than a static */
