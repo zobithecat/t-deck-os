@@ -1475,8 +1475,79 @@ static void lora_emit_msg(String msg)
 //   !CS distance report · !SYS fleet cmd · !GA/!GH/!GQ/!GD Gopher · !AL alert · !SR sitrep.
 // News UI is a small state machine inside g_news_root: LIST ⇄ ARTICLE. Views rebuild
 // that container (never g_app_view — the framework Back button lives there).
-static void lora_tx_line(const String &payload);   // defined below; used by news_send_gq()
-static void lora_tx_ttl(const String &payload, uint8_t ttl);   // voice !VA rides mesh ttl
+// --- async TX engine ---------------------------------------------------------------
+// transmit() blocks the whole loop for its ToA, and our post-TX settle added 2x more —
+// so every pull froze the UI for ~1 s ("request headlines" = scroll dead) and a voice
+// chunk for ~3 s. Same lesson the pager already paid for: TX must be a queue, not a
+// wait. startTransmit() returns immediately; DIO1 fires on TX-done (while a transmit
+// is in flight, any DIO1 IS the TX-done — the radio cannot also be receiving); the
+// settle gap becomes a timestamp the pump respects instead of a delay anyone sits in.
+#define TXQ_N   12
+#define TXQ_MAX 220
+struct TxJob { uint8_t len; uint16_t gap_ms; uint8_t buf[TXQ_MAX]; };
+static TxJob            g_txq[TXQ_N];
+static uint8_t          g_txq_head = 0;
+static volatile uint8_t g_txq_n = 0;
+static volatile bool    g_tx_inflight = false;
+static uint32_t         g_tx_gap_until = 0;
+static uint16_t         g_tx_gap_pending = 0;
+
+static void lora_tx_pump()
+{
+    if (!g_lora_ok || g_range_active || g_tx_inflight || !g_txq_n) return;
+    if (g_tx_gap_until && (int32_t)(millis() - g_tx_gap_until) < 0) return;
+    TxJob &j = g_txq[g_txq_head];
+    g_tx_gap_pending = j.gap_ms;
+    g_tx_inflight = true;
+    int st = lora_radio.startTransmit(j.buf, j.len);
+    g_txq_head = (g_txq_head + 1) % TXQ_N;
+    g_txq_n--;
+    if (st != RADIOLIB_ERR_NONE) {               // refused: fall back to listening
+        g_tx_inflight = false;
+        lora_radio.startReceive();
+        Serial.printf("[tx] startTransmit err %d\n", st);
+    }
+}
+
+static void lora_tx_service()                     // the TX-done edge
+{
+    if (!g_tx_inflight || !g_lora_rx_flag) return;
+    g_lora_rx_flag = false;
+    lora_radio.finishTransmit();
+    lora_radio.startReceive();
+    g_tx_inflight = false;
+    g_tx_gap_until = millis() + g_tx_gap_pending;
+}
+
+static bool lora_tx_enqueue(const uint8_t *b, size_t len, uint16_t gap_ms)
+{
+    if (!len || len > TXQ_MAX) return false;
+    // Loop-context callers with a long burst (chat) may wait briefly for a slot; the
+    // wait services TX-done edges, so it drains at air speed. UI callbacks only ever
+    // queue one frame and never reach the wait.
+    uint32_t t0 = millis();
+    while (g_txq_n >= TXQ_N && (uint32_t)(millis() - t0) < 8000) {
+        lora_tx_service(); lora_tx_pump(); delay(2);
+    }
+    if (g_txq_n >= TXQ_N) { Serial.println("[tx] queue full, frame dropped"); return false; }
+    TxJob &j = g_txq[(g_txq_head + g_txq_n) % TXQ_N];
+    memcpy(j.buf, b, len);
+    j.len = (uint8_t)len; j.gap_ms = gap_ms;
+    g_txq_n++;
+    lora_tx_pump();
+    return true;
+}
+
+static void lora_tx_ttl(const String &payload, uint8_t ttl)
+{
+    String w = relay_wrap(payload, ttl);
+    uint32_t toa = (uint32_t)(lora_radio.getTimeOnAir(w.length()) / 1000);
+    // ~2x ToA so a half-duplex relay can forward before our next frame; ttl-1 frames
+    // are never relayed, so they owe the channel nothing.
+    uint16_t gap = (ttl > RELAY_TTL_LOCAL) ? (uint16_t)(2 * toa + 50) : 0;
+    lora_tx_enqueue((const uint8_t *)w.c_str(), w.length(), gap);
+}
+static void lora_tx_line(const String &payload) { lora_tx_ttl(payload, RELAY_TTL_MESH); }
 static String   b36(uint32_t n);                   // the one base36 encoder (books section)
 static uint32_t unb36(const String &s);
 static uint32_t crc32_of(const String &s);         // zlib-compatible, over chunks AS SENT
@@ -1922,7 +1993,6 @@ static void news_send_gl()
     g_news_gl_ms = now;
     bool complete = g_news_rev[0] && g_news_count >= 0 && g_news_n >= g_news_count;
     lora_tx_line(String("!GL\t") + (complete ? g_news_rev : "-") + router_pull_suffix() + "\n");
-    lora_radio.startReceive();
     if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_REFRESH " requesting headlines...");
 }
 
@@ -2309,7 +2379,6 @@ static void book_send_bl()
     if (g_book_bl_ms && (uint32_t)(millis() - g_book_bl_ms) < 8000) return;
     g_book_bl_ms = millis();
     lora_tx_line(String("!BL\t") + (g_book_rev[0] ? g_book_rev : "-") + router_pull_suffix() + "\n");
-    lora_radio.startReceive();
 }
 
 static void book_send_bq(const char *id, int page)
@@ -2337,7 +2406,6 @@ static void book_send_bq(const char *id, int page)
     g_rd_land_top = !g_rd_land_bottom;
     if (g_rd_land_top && g_rd_scroll) lv_obj_scroll_to_y(g_rd_scroll, 0, LV_ANIM_OFF);
     lora_tx_line("!BQ\t" + String(id) + "\t" + b36((uint32_t)page) + router_pull_suffix() + "\n");
-    lora_radio.startReceive();
     Serial.printf("[book] BQ %s p%d\n", id, page);
     book_render_page();
 }
@@ -2350,7 +2418,6 @@ static void book_send_bn()
     uint32_t have = 0;
     for (int i = 0; i < g_rd_n && i < 32; i++) if (g_rd_seen[i]) have |= (1u << i);
     lora_tx_line("!BN\t" + String(g_rd_id) + "\t" + b36((uint32_t)g_rd_page) + "\t" + b36(have) + router_pull_suffix() + "\n");
-    lora_radio.startReceive();
     Serial.printf("[book] BN %s p%d have=%s (%d/%d)\n", g_rd_id, g_rd_page,
                   b36(have).c_str(), g_rd_have, g_rd_n);
 }
@@ -2945,11 +3012,11 @@ static void voice_tx_frame(uint8_t seq)
     uint16_t c = crc16_ccitt_ttl0(f, VOICE_HDR + pl);
     f[VOICE_HDR + pl] = c >> 8; f[VOICE_HDR + pl + 1] = c & 0xFF;
     int tot = VOICE_HDR + pl + 2;
-    lora_radio.transmit(f, (size_t)tot);         // the (uint8_t*, len) API — NULs inside
-    lora_radio.startReceive();
     uint32_t toa = (uint32_t)(lora_radio.getTimeOnAir(tot) / 1000);
-    Serial.printf("[voice] TX chunk %u/%u  %dB  round %u\n", seq, g_vtx.n, tot, g_vtx.round);
-    delay(toa * 13 / 10);                        // §7: inter-chunk gap = 1.3 x ToA, from TX end
+    // §7 pacing (gap = 1.3 x ToA from TX end) is the queue's gap field now — nobody
+    // sits in a delay for it, and the whole note streams while the UI keeps moving.
+    lora_tx_enqueue(f, (size_t)tot, (uint16_t)(toa * 13 / 10));
+    Serial.printf("[voice] TX chunk %u/%u  %dB  round %u queued\n", seq, g_vtx.n, tot, g_vtx.round);
 }
 
 static void voice_send_note(const uint8_t *data, uint16_t len, uint8_t codec,
@@ -3295,8 +3362,10 @@ static int lora_init()
 static void lora_service()            // always-on background RX (called from loop())
 {
     if (!g_lora_ok || g_range_active) return;   // radio down, or Range app owns the radio
+    lora_tx_service();                          // a TX-done edge is not a packet
+    lora_tx_pump();                             // ...and a freed channel may start the next
     int guard = 0;
-    while (g_lora_rx_flag && guard++ < 6) {     // drain bursts so fast SF9 packets don't pile up/corrupt
+    while (!g_tx_inflight && g_lora_rx_flag && guard++ < 6) {   // drain bursts so fast SF9 packets don't pile up/corrupt
         g_lora_rx_flag = false;
         // Read into bytes, not a String: a 0xC2 voice frame is binary and a String
         // truncates at its first NUL. The branch happens on the first byte, BEFORE any
@@ -3335,22 +3404,6 @@ static void lora_service()            // always-on background RX (called from lo
     }
 }
 
-static void lora_tx_ttl(const String &payload, uint8_t ttl)
-{
-    String w = relay_wrap(payload, ttl);
-    lora_radio.transmit(w.c_str());
-    // ~2x ToA gap so the half-duplex relay can RX+forward this packet before the next.
-    // Listen through it. transmit() leaves the radio in standby, so this wait used to
-    // be a second of deliberate deafness on top of the transmission itself — and the
-    // frames it was spent on are !GN and !BN, sent precisely when a stream we are
-    // trying not to miss any more of is still in the air.
-    lora_radio.startReceive();
-    // Nothing relays a ttl-1 frame, so there is no half-duplex hop to make room for and
-    // the settle is pure cost — a second of frozen UI every time the beacon fires.
-    if (ttl > RELAY_TTL_LOCAL) delay(lora_radio.getTimeOnAir(w.length()) / 500 + 50);
-}
-
-static void lora_tx_line(const String &payload) { lora_tx_ttl(payload, RELAY_TTL_MESH); }
 
 // PROTOCOL.md §5: every node beacons once a minute at ttl 1, so the rest of the mesh can
 // hold a neighbour table instead of only seeing this device when it asks for something.
@@ -3407,7 +3460,6 @@ static void lora_send(const char *text)
         i = end;
     }
     lora_tx_line("[EOF]\n");
-    lora_radio.startReceive();
 }
 
 static void lora_send_cb(lv_event_t *e)
