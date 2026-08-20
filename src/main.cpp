@@ -64,6 +64,8 @@ static uint8_t       g_voice_vol = 6;    // voice-note loudness 0..10 (Settings/
                                          // peak target = 2700 x value; 30000 was measured distorting
 static volatile bool g_ptt_down  = false;   // PTT held (Voice app); declared here because the
                                             // trackball's 3 s sleep-hold must not fire mid-record
+static lv_obj_t     *g_vdlg = NULL;         // incoming voice-note takeover (alert-style)
+static volatile bool g_vdlg_dismiss = false;
 static uint8_t       g_screen_bright = 16;   // display brightness 1..16 (Settings/NVS "bright")
 static lv_obj_t     *g_toast;       // bottom status / selection-feedback line
 static lv_obj_t     *g_home_list;   // launcher app list
@@ -476,7 +478,8 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     static bool     swallow    = false;          // hold the press until it is let go
     static uint32_t hold_ms    = 0;
     static bool     back_armed = false;
-    if (g_alert_scr && press_edge) { g_alert_dismiss_req = true; swallow = true; }
+    if      (g_alert_scr && press_edge) { g_alert_dismiss_req = true; swallow = true; }
+    else if (g_vdlg      && press_edge) { g_vdlg_dismiss      = true; swallow = true; }
 
     // One press, three possible meanings, decided by how long it is held. The deciding
     // has to happen WHILE it is held, not on release: a press that reaches a second has
@@ -2865,9 +2868,9 @@ static uint8_t g_vplay_reps = 3;   // incoming notes repeat 3x; PTT self-monitor
 // which is the distortion budget. Cutting it is free loudness for the speech band.
 struct VoiceHpf {
     float b0, b1, b2, a1, a2, x1, x2, y1, y2;
-    void init()
+    void init(float fc = 300.0f)
     {
-        const float w0 = 2.0f * (float)M_PI * 300.0f / 8000.0f;
+        const float w0 = 2.0f * (float)M_PI * fc / 8000.0f;
         const float c = cosf(w0), al = sinf(w0) / (2.0f * 0.7071f);
         const float a0 = 1.0f + al;
         b0 = (1.0f + c) / 2.0f / a0; b1 = -(1.0f + c) / a0; b2 = b0;
@@ -3057,6 +3060,43 @@ static void voice_play_note()
     vTaskDeleteWithCaps(h);                    // stack is PSRAM; free it only off-CPU
 }
 
+// Incoming voice note = the drill-alert treatment: a full-screen takeover on the top
+// layer with the metadata as text, painted BEFORE playback blocks the loop (the 3x
+// repeats take seconds — lv_refr_now gets the panel on glass first). Ball click closes.
+static void voice_show_dialog(const char *who, float secs, bool verified, uint8_t have, uint8_t n)
+{
+    if (g_vdlg) { lv_obj_del(g_vdlg); g_vdlg = NULL; }
+    g_vdlg = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(g_vdlg, 320, 240);
+    lv_obj_center(g_vdlg);
+    lv_obj_set_style_bg_color(g_vdlg, lv_color_hex(0x1E3A8A), 0);   // blue: mail, not danger
+    lv_obj_set_style_border_width(g_vdlg, 0, 0);
+    lv_obj_set_style_pad_all(g_vdlg, 12, 0);
+    lv_obj_set_flex_flow(g_vdlg, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(g_vdlg, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(g_vdlg, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *head = lv_label_create(g_vdlg);
+    lv_obj_set_style_text_font(head, &font_kr16, 0);
+    lv_obj_set_style_text_color(head, lv_color_white(), 0);
+    lv_label_set_text_fmt(head, LV_SYMBOL_VOLUME_MAX " 음성쪽지        %s", who);
+    lv_obj_t *body = lv_label_create(g_vdlg);
+    lv_obj_set_width(body, 296);
+    lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(body, &font_kr16, 0);
+    lv_obj_set_style_text_color(body, lv_color_white(), 0);
+    if (have >= n)
+        lv_label_set_text_fmt(body, "%s 발신, %.1f초\n%s\n\n3회 반복 재생됩니다.",
+                              who, secs, verified ? "무결성 확인됨" : "미검증 (announce 불일치)");
+    else
+        lv_label_set_text_fmt(body, "%s 발신, %.1f초\n일부만 수신 (%u/%u) - 수리 실패분 포함 재생\n\n3회 반복 재생됩니다.",
+                              who, secs, have, n);
+    lv_obj_t *hint = lv_label_create(g_vdlg);
+    lv_obj_set_style_text_font(hint, &font_kr16, 0);
+    lv_obj_set_style_text_color(hint, lv_color_hex(0x93C5FD), 0);
+    lv_label_set_text(hint, LV_SYMBOL_OK " 볼 클릭: 닫기      다시 듣기: Voice 앱");
+    lv_refr_now(NULL);                        // on glass NOW — playback blocks after this
+}
+
 static void voice_note_completed()
 {
     g_vnote.done = true;
@@ -3077,6 +3117,7 @@ static void voice_note_completed()
                   verified ? "" : " (announce crc mismatch - unverified)");
     lora_log_print("< ", String("[음성] ") + who + " " + String(secs, 1) + "초 수신"
                         + (verified ? "" : " (미검증)"));
+    voice_show_dialog(who.c_str(), secs, verified, g_vnote.n, g_vnote.n);
     beep_notify();
     voice_play_note();
 }
@@ -3311,6 +3352,7 @@ static i2s_chan_handle_t g_mic_rx    = NULL;
 static bool              g_mic_ok    = false;
 static volatile bool     g_ptt_req   = false;   // g_ptt_down lives up top (sleep-hold guard)
 static volatile bool     g_ptt_busy  = false;
+static volatile bool     g_ptt_fail  = false;   // task -> tick: show the failure in the UI
 static volatile uint16_t g_ptt_txlen = 0;       // encoded note ready for the loop to send
 static TaskHandle_t      g_ptt_task_h = NULL;
 static int16_t          *g_rec_buf   = NULL;    // PSRAM, 16 kHz mono capture
@@ -3330,10 +3372,16 @@ static bool mic_init()                          // loop context only: I2C is not
     if (es7210_adc_init(&Wire, &cfg) != ESP_OK) { Serial.println("[ptt] es7210 init failed"); return false; }
     es7210_adc_config_i2s(cfg.codec_mode, &cfg.i2s_iface);
     es7210_adc_set_gain((es7210_input_mics_t)(ES7210_INPUT_MIC1 | ES7210_INPUT_MIC2),
-                        (es7210_gain_value_t)GAIN_30DB);
+                        (es7210_gain_value_t)GAIN_37_5DB);   // 30 dB captured at -29 dBFS —
+                                                             // starved 700C's pitch tracker
     es7210_adc_ctrl_state(cfg.codec_mode, AUDIO_HAL_CTRL_START);
 
     i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    // I2S DMA buffers MUST live in internal RAM, and this board's internal heap runs at
+    // kilobyte margins — the default 6x240-frame allocation (~5.8 KB) failed outright.
+    // 4x64 frames = 1 KB of buffer, 16 ms of cover; the reader drains far faster.
+    cc.dma_desc_num  = 4;
+    cc.dma_frame_num = 64;
     if (i2s_new_channel(&cc, NULL, &g_mic_rx) != ESP_OK) { Serial.println("[ptt] i2s rx alloc failed"); return false; }
     i2s_std_config_t sc = {};
     sc.clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(PTT_RATE);          // MCLK = 256 x fs
@@ -3344,28 +3392,55 @@ static bool mic_init()                          // loop context only: I2C is not
     sc.gpio_cfg.dout = I2S_GPIO_UNUSED;
     sc.gpio_cfg.din  = (gpio_num_t)BOARD_ES7210_DIN;
     if (i2s_channel_init_std_mode(g_mic_rx, &sc) != ESP_OK || i2s_channel_enable(g_mic_rx) != ESP_OK) {
-        Serial.println("[ptt] i2s rx init failed"); return false;
+        Serial.println("[ptt] i2s rx init failed");
+        i2s_del_channel(g_mic_rx);              // a leaked handle turned one failure into
+        g_mic_rx = NULL;                        // "no available channel found" forever
+        return false;
     }
     g_rec_buf = (int16_t *)heap_caps_malloc(PTT_RATE * PTT_MAX_S * sizeof(int16_t),
                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!g_rec_buf) { Serial.println("[ptt] rec buf alloc failed"); return false; }
+    // The channel is claimed at BOOT and held for life: its DMA memory must be internal,
+    // and by the time WiFi + NimBLE + speech are up there is not 1 KB of that left (the
+    // runtime-init attempt failed exactly there, twice). Disabled between uses — enable
+    // is cheap and MCLK does not need to run while nobody records.
+    i2s_channel_disable(g_mic_rx);
     g_mic_ok = true;
-    Serial.println("[ptt] mic up: es7210 + i2s rx @16k");
+    Serial.println("[ptt] mic reserved at boot: es7210 + i2s rx @16k (parked)");
     return true;
 }
 
 static void ptt_task(void *)
 {
+    i2s_channel_enable(g_mic_rx);               // parked since boot; wake it for the hold
     uint32_t t0 = millis();
     static int16_t frame[256 * 2];              // one read: 256 stereo pairs
     size_t got = 0; uint32_t n16 = 0;
-    while (g_ptt_down && (uint32_t)(millis() - t0) < PTT_MAX_S * 1000) {
-        if (i2s_channel_read(g_mic_rx, frame, sizeof(frame), &got, 100) == ESP_OK) {
+    bool first = true;
+    // Release debounce: the hold ends only after 150 ms of CONTINUOUS release. Both
+    // input paths bounce — the BOOT-pin ball click mechanically, a finger on glass by
+    // drifting — and a 1-frame RELEASED must not cut a recording.
+    uint32_t last_down = millis();
+    uint32_t n_ok = 0, n_to = 0; const char *why = "cap";
+    while ((uint32_t)(millis() - t0) < PTT_MAX_S * 1000) {
+        if (g_ptt_down) last_down = millis();
+        else if ((uint32_t)(millis() - last_down) > 150) { why = "released"; break; }
+        esp_err_t rr = i2s_channel_read(g_mic_rx, frame, sizeof(frame), &got, 100);
+        if (first) { Serial.printf("[ptt] first read: err=%d got=%u\n", (int)rr, (unsigned)got); first = false; }
+        if (rr == ESP_OK) {
+            n_ok++;
             int ns = (int)(got / 4);
             for (int i = 0; i < ns && n16 < PTT_RATE * PTT_MAX_S; i++)
                 g_rec_buf[n16++] = frame[i * 2];         // left mic
-        }
+        } else n_to++;
     }
+    i2s_channel_disable(g_mic_rx);              // back to parked; MCLK off between holds
+    uint32_t wall = millis() - t0;
+    // The two open symptoms in one line: wall vs sample count = the TRUE delivery rate
+    // (pitch), and `why` = who ended the hold (the 0.7 s cut).
+    Serial.printf("[ptt] hold %lums end=%s reads ok %lu timeout %lu -> %lu samples = %.0f Hz real\n",
+                  (unsigned long)wall, why, (unsigned long)n_ok, (unsigned long)n_to,
+                  (unsigned long)n16, wall ? n16 * 1000.0f / wall : 0);
     Serial.printf("[ptt] captured %.2fs, mic rms %.0f\n", n16 / (float)PTT_RATE,
                   [&]{ double s = 0; for (uint32_t i = 0; i < n16; i++) s += (double)g_rec_buf[i] * g_rec_buf[i];
                        return n16 ? sqrt(s / n16) : 0.0; }());
@@ -3394,6 +3469,27 @@ static void ptt_task(void *)
             pcm8[n8++] = (int16_t)y;
         }
         int frames = (int)(n8 / 320);           // 40 ms alignment, hard (VOICE.md §2)
+        // Pre-encode conditioning: 100 Hz rumble cut (male F0 starts ~100 Hz — the
+        // fundamental must SURVIVE, only the room below it goes) and peak-normalize to
+        // a healthy level. A -29 dBFS capture starved the 700C pitch tracker into
+        // octave jumps — the "로우" warble.
+        if (frames > 0 && pcm8) {
+            VoiceHpf mh; mh.init(100.0f);
+            float mpk = 0;
+            for (uint32_t i2 = 0; i2 < n8; i2++) {
+                float v = mh.run((float)pcm8[i2]);
+                pcm8[i2] = (int16_t)(v > 32700 ? 32700 : (v < -32700 ? -32700 : v));
+                float a2 = fabsf(v); if (a2 > mpk) mpk = a2;
+            }
+            float mg = (mpk > 100.0f) ? 24000.0f / mpk : 1.0f;
+            if (mg > 8.0f) mg = 8.0f;
+            if (mg < 1.0f) mg = 1.0f;           // already hot: leave it
+            for (uint32_t i2 = 0; i2 < n8; i2++) {
+                float v = pcm8[i2] * mg;
+                pcm8[i2] = (int16_t)(v > 32700 ? 32700 : (v < -32700 ? -32700 : v));
+            }
+            Serial.printf("[ptt] conditioned: peak %.0f gain %.2f\n", mpk, mg);
+        }
         if (frames > 0 && pcm8) {
             struct CODEC2 *ce = codec2_create(CODEC2_MODE_700C);
             uint32_t e0 = micros(); uint16_t elen = 0;
@@ -3423,7 +3519,8 @@ static void ptt_task(void *)
             g_ptt_txlen = elen;                 // the loop sends; the queue stays 1-producer
         }
     } else {
-        Serial.println("[ptt] too short, dropped");
+        Serial.println("[ptt] too short or no mic data, dropped");
+        g_ptt_fail = true;                      // LVGL is loop-only; the tick shows this
     }
     g_ptt_busy = false;
     vTaskSuspend(NULL);                         // parked; the loop deletes a SUSPENDED task
@@ -3460,6 +3557,15 @@ static void voice_tick()
     if (g_ptt_task_h && !g_ptt_busy && eTaskGetState(g_ptt_task_h) == eSuspended) {
         vTaskDeleteWithCaps(g_ptt_task_h);
         g_ptt_task_h = NULL;
+    }
+    if (g_ptt_fail) {
+        g_ptt_fail = false;
+        if (g_voice_status) lv_label_set_text(g_voice_status, LV_SYMBOL_WARNING " 녹음 실패 - 마이크 데이터 없음");
+        if (g_toast)        lv_label_set_text(g_toast, LV_SYMBOL_WARNING " 녹음 실패");
+    }
+    if (g_vdlg_dismiss) {
+        g_vdlg_dismiss = false;
+        if (g_vdlg) { lv_obj_del(g_vdlg); g_vdlg = NULL; }
     }
     if (g_ptt_txlen) {
         uint16_t plen2 = g_ptt_txlen; g_ptt_txlen = 0;
@@ -3574,6 +3680,14 @@ static void voice_tick()
                           g_vnote.have, g_vnote.n, g_vnote.unv_mask);
             lora_log_print("< ", "[음성] 일부만 수신 (" + String(g_vnote.have) + "/" +
                                  String(g_vnote.n) + ")");
+            {
+                size_t pt = 0;
+                for (int i = 0; i < g_vnote.n; i++)
+                    if ((g_vnote.seen_mask | g_vnote.unv_mask) & (1 << i)) pt += g_vnote.clen[i];
+                float psecs = g_vnote.codec == 1 ? pt / 4 * 0.04f : pt / 6 * 0.04f;
+                voice_show_dialog(voice_addr_str(g_vnote.src).c_str(), psecs, false,
+                                  g_vnote.have, g_vnote.n);
+            }
             voice_play_note();               // §4.4: a playable prefix is still playable
             return;
         }
@@ -5620,6 +5734,11 @@ void setup()
     pinMode(BOARD_TOUCH_INT, INPUT);
     delay(20);
     Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
+
+    // Claim the mic's I2S RX channel NOW, while internal DMA-capable RAM still exists —
+    // after WiFi + NimBLE + speech are up there is not 1 KB of it left, measured twice.
+    // The channel parks disabled until the first PTT hold.
+    mic_init();
 
     // A GT911 put to sleep stays asleep across an ESP32 reset, and with no RST wired
     // (setPins passes -1) begin() cannot bring it back — so a reset taken while power
