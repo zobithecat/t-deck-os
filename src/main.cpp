@@ -24,6 +24,8 @@
 #include <ESP32I2SAudio.h>           // new IDF5 I2S driver — the board's single audio owner
 extern "C" {
 #include <codec2.h>                  // vendored lib/Codec2 — host-gated against c2dec (1 LSB)
+#include <es7210.h>                  // vendored LilyGO quad-ADC driver (mics, I2C)
+#include <driver/i2s_std.h>          // second I2S port: mic RX, we are clock master
 }
 #include <libespeak-ng/voice/ko.h>
 #include <esp_sleep.h>               // power save (light sleep)
@@ -60,6 +62,8 @@ static uint8_t       g_beep_vol = 7;     // incoming-message beep volume 0..10 (
 static uint8_t       g_audio_vol = 2;    // MASTER loudness 0..10 for speech + tones (Settings/NVS "ttsvol")
 static uint8_t       g_voice_vol = 6;    // voice-note loudness 0..10 (Settings/NVS "vvol"): normalizer
                                          // peak target = 2700 x value; 30000 was measured distorting
+static volatile bool g_ptt_down  = false;   // PTT held (Voice app); declared here because the
+                                            // trackball's 3 s sleep-hold must not fire mid-record
 static uint8_t       g_screen_bright = 16;   // display brightness 1..16 (Settings/NVS "bright")
 static lv_obj_t     *g_toast;       // bottom status / selection-feedback line
 static lv_obj_t     *g_home_list;   // launcher app list
@@ -493,7 +497,7 @@ static void trackball_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
         }
         // 3 s: power save, and it outranks going back. Only the request is made here —
         // sleeping inside an input callback would stop LVGL mid-read.
-        if (hold_ms && held > 3000) {
+        if (hold_ms && held > 3000 && !g_ptt_down) {   // an 8 s PTT hold is not a sleep request
             hold_ms = 0; back_armed = false;
             g_sleep_req = true;
             swallow = true;                      // the rest of this press belongs to us
@@ -892,6 +896,7 @@ static void build_launcher_ui()
         { LV_SYMBOL_BELL,     "News",              0xFCD34D },
         { LV_SYMBOL_WARNING,  "Alert",             0xF87171 },
         { LV_SYMBOL_FILE,     "Books",             0xA5B4FC },
+        { LV_SYMBOL_AUDIO,    "Voice",             0xF9A8D4 },
         { LV_SYMBOL_GPS,      "GPS",               0xF87171 },
         { LV_SYMBOL_KEYBOARD, "KbTest",            0x60A5FA },
         { LV_SYMBOL_BELL,     "Messages",          0xFBBF24 },
@@ -2800,6 +2805,8 @@ static VoiceNote g_vnote;
 // injected "reception" out of the SNR noise baseline, which must stay air-only.
 static volatile bool g_vrx_loop_req  = false;
 static bool          g_vrx_loopback  = false;
+static volatile bool g_vrx_replay_req = false;  // Voice app: replay the last note once
+static lv_obj_t     *g_voice_status   = NULL;   // Voice app status line (NULLed by go_home)
 
 static uint32_t crc32_bytes(const uint8_t *p, size_t n)
 {
@@ -2850,6 +2857,8 @@ static void vup_init()
     }
     g_vup_ready = true;
 }
+
+static uint8_t g_vplay_reps = 3;   // incoming notes repeat 3x; PTT self-monitor plays once
 
 // 300 Hz 2nd-order Butterworth high-pass, run at 8 kHz before the upsampler. This
 // speaker cannot turn sub-300 Hz into sound — that energy only burns cone excursion,
@@ -2940,67 +2949,77 @@ static void voice_play_note_body()
                                                    // 5 ms attack let transients overshoot the
                                                    // peak target by 37% (host-measured), 1 ms
                                                    // holds them to +16% with the RMS lift intact
-    float cenv = 0.0f;
-    hpf.init();                                    // pass 2 replays the same filter fresh
     Serial.printf("[voice] playing %d/%u chunks (%d unverified) codec %u  peak %.0f rms %.0f gain %.2f makeup %.2f\n",
                   chunks, g_vnote.n, unv, g_vnote.codec, peak, rms, vol, cmakeup);
+    codec2_destroy(c2);                        // pass 1's decoder; each repeat makes its own
     uint32_t dec_us = 0; int dec_frames = 0;               // decode cost, measured live
     vup_init();
-    float    hist[VUP_TAPS] = {0};             // x[n_in-8 .. n_in-1], zeros = pre-history
-    uint32_t n_in = 4;                         // 4 virtual zeros -> 0.5 ms lead-in
-    float    t = 0.0f;
-    const float dt = 8000.0f / AUDIO_RATE;
-    int oi = 0;
-    // One input sample in, two-to-three FIR-interpolated outputs out. The drain
-    // condition keeps the 8-tap window exactly inside hist[] — every output's base
-    // index lands at hist[0] by construction.
-    auto vup_push = [&](float x) {
-        memmove(hist, hist + 1, (VUP_TAPS - 1) * sizeof(float));
-        hist[VUP_TAPS - 1] = x;
-        n_in++;
-        while ((int32_t)t <= (int32_t)n_in - 5) {
-            float frac = t - (int32_t)t;
-            float pf = frac * VUP_PHASES;
-            int   ph = (int)pf; float a = pf - ph;
-            float y = 0;
-            for (int k = 0; k < VUP_TAPS; k++)
-                y += ((1.0f - a) * g_vup_fir[ph][k] + a * g_vup_fir[ph + 1][k]) * hist[k];
-            int32_t vi = (int32_t)y;
-            if (vi > 32700) vi = 32700; else if (vi < -32700) vi = -32700;   // FIR overshoot
-            out[oi++] = (int16_t)vi; out[oi++] = (int16_t)vi;   // stereo-only device
-            if (oi >= 256) {
-                const uint8_t *p = (const uint8_t *)out; size_t left = oi * 2;
-                while (left) { size_t w = g_i2s.write(p, left);
-                               if (!w) { delay(1); continue; } p += w; left -= w; }
-                oi = 0;
+    // Radio practice for a channel you cannot ACK: say it three times. Each repeat
+    // decodes fresh (decoder state must restart from frame 0) with ~0.5 s of silence
+    // between, so a listener who missed the onset still gets two whole copies.
+    // (g_vplay_reps: incoming notes 3, PTT self-monitor 1.)
+    for (int rep = 0; rep < g_vplay_reps; rep++) {
+        c2 = codec2_create(g_vnote.codec == 1 ? CODEC2_MODE_700C : CODEC2_MODE_1200);
+        if (!c2) { Serial.println("[voice] repeat create failed"); break; }
+        hpf.init();
+        float cenv = 0.0f;
+        float    hist[VUP_TAPS] = {0};         // x[n_in-8 .. n_in-1], zeros = pre-history
+        uint32_t n_in = 4;                     // 4 virtual zeros -> 0.5 ms lead-in
+        float    t = 0.0f;
+        const float dt = 8000.0f / AUDIO_RATE;
+        int oi = 0;
+        // One input sample in, two-to-three FIR-interpolated outputs out. The drain
+        // condition keeps the 8-tap window exactly inside hist[] — every output's base
+        // index lands at hist[0] by construction.
+        auto vup_push = [&](float x) {
+            memmove(hist, hist + 1, (VUP_TAPS - 1) * sizeof(float));
+            hist[VUP_TAPS - 1] = x;
+            n_in++;
+            while ((int32_t)t <= (int32_t)n_in - 5) {
+                float frac = t - (int32_t)t;
+                float pf = frac * VUP_PHASES;
+                int   ph = (int)pf; float a = pf - ph;
+                float y = 0;
+                for (int k = 0; k < VUP_TAPS; k++)
+                    y += ((1.0f - a) * g_vup_fir[ph][k] + a * g_vup_fir[ph + 1][k]) * hist[k];
+                int32_t vi = (int32_t)y;
+                if (vi > 32700) vi = 32700; else if (vi < -32700) vi = -32700;   // FIR overshoot
+                out[oi++] = (int16_t)vi; out[oi++] = (int16_t)vi;   // stereo-only device
+                if (oi >= 256) {
+                    const uint8_t *p = (const uint8_t *)out; size_t left = oi * 2;
+                    while (left) { size_t w = g_i2s.write(p, left);
+                                   if (!w) { delay(1); continue; } p += w; left -= w; }
+                    oi = 0;
+                }
+                t += dt;
             }
-            t += dt;
-        }
-    };
-    for (int ci = 0; ci < chunks; ci++) {
-        for (int off = 0; off + bpf <= g_vnote.clen[ci]; off += bpf) {
-            uint32_t d0 = micros();
-            codec2_decode(c2, pcm, g_vnote.data[ci] + off);
-            dec_us += (uint32_t)(micros() - d0); dec_frames++;
-            for (int s = 0; s < spf; s++) {
-                float xs = hpf.run((float)pcm[s]) * vol;
-                float ax = fabsf(xs);
-                float cc = (ax > cenv) ? catt : crel;
-                cenv = cc * cenv + (1.0f - cc) * ax;
-                float g = (cenv > cth) ? (cth + (cenv - cth) * cratio) / cenv : 1.0f;
-                vup_push(xs * g * cmakeup);
+        };
+        for (int ci = 0; ci < chunks; ci++) {
+            for (int off = 0; off + bpf <= g_vnote.clen[ci]; off += bpf) {
+                uint32_t d0 = micros();
+                codec2_decode(c2, pcm, g_vnote.data[ci] + off);
+                dec_us += (uint32_t)(micros() - d0); dec_frames++;
+                for (int s = 0; s < spf; s++) {
+                    float xs = hpf.run((float)pcm[s]) * vol;
+                    float ax = fabsf(xs);
+                    float cc = (ax > cenv) ? catt : crel;
+                    cenv = cc * cenv + (1.0f - cc) * ax;
+                    float g = (cenv > cth) ? (cth + (cenv - cth) * cratio) / cenv : 1.0f;
+                    vup_push(xs * g * cmakeup);
+                }
             }
         }
+        for (int zf = 0; zf < VUP_TAPS; zf++) vup_push(0.0f);   // flush the filter tail
+        if (oi) { const uint8_t *p = (const uint8_t *)out; size_t left = oi * 2;
+                  while (left) { size_t w = g_i2s.write(p, left);
+                                 if (!w) { delay(1); continue; } p += w; left -= w; } }
+        codec2_destroy(c2);
+        int16_t z[128] = {0};                 // ~0.5 s of silence between repeats
+        for (int zn = 0; zn < (rep < g_vplay_reps - 1 ? 172 : 1); zn++)
+            g_i2s.write((const uint8_t *)z, sizeof(z));
     }
-    for (int zf = 0; zf < VUP_TAPS; zf++) vup_push(0.0f);   // flush the filter tail
-    if (oi) { const uint8_t *p = (const uint8_t *)out; size_t left = oi * 2;
-              while (left) { size_t w = g_i2s.write(p, left);
-                             if (!w) { delay(1); continue; } p += w; left -= w; } }
-    int16_t z[128] = {0};                     // trailing silence so the clip ends cleanly
-    g_i2s.write((const uint8_t *)z, sizeof(z));
-    codec2_destroy(c2);
     if (dec_frames)                            // RTF on real silicon, per codec — for E00
-        Serial.printf("[voice] decode %lums for %d frames (%.2fs audio, RTF %.2f)\n",
+        Serial.printf("[voice] decode %lums for %d frames (%.2fs audio x3, RTF %.2f)\n",
                       (unsigned long)(dec_us / 1000), dec_frames, dec_frames * 0.04f,
                       (dec_us / 1000.0f) / (dec_frames * 40.0f));
 }
@@ -3021,7 +3040,7 @@ static void voice_play_task(void *)
     Serial.printf("[voice] vplay stack headroom %u B\n",
                   (unsigned)uxTaskGetStackHighWaterMark(NULL));
     g_vplay_running = false;
-    for (;;) vTaskDelay(portMAX_DELAY);
+    vTaskSuspend(NULL);                        // parked; the waiter deletes a SUSPENDED task
 }
 static void voice_play_note()
 {
@@ -3034,8 +3053,8 @@ static void voice_play_note()
         Serial.println("[voice] play task alloc failed");
         return;
     }
-    while (g_vplay_running) delay(5);
-    vTaskDeleteWithCaps(h);
+    while (g_vplay_running || eTaskGetState(h) != eSuspended) delay(5);
+    vTaskDeleteWithCaps(h);                    // stack is PSRAM; free it only off-CPU
 }
 
 static void voice_note_completed()
@@ -3249,7 +3268,7 @@ static void voice_tx_frame(uint8_t seq)
 }
 
 static void voice_send_note(const uint8_t *data, uint16_t len, uint8_t codec,
-                            uint16_t dst, uint8_t ttl)
+                            uint16_t dst, uint8_t ttl, bool force = false)
 {
     if (!g_lora_ok || !len || !data) return;
     if (alert_real_active()) {                   // an evacuation order outranks voice mail
@@ -3257,7 +3276,7 @@ static void voice_send_note(const uint8_t *data, uint16_t len, uint8_t codec,
         return;
     }
     uint32_t now = millis();
-    if (!g_vtx_burst && g_vtx_last_ms && (uint32_t)(now - g_vtx_last_ms) < 30000) {
+    if (!force && !g_vtx_burst && g_vtx_last_ms && (uint32_t)(now - g_vtx_last_ms) < 30000) {
         if (g_toast) lv_label_set_text(g_toast, "음성쪽지는 30초에 1건");
         return;
     }
@@ -3280,6 +3299,136 @@ static void voice_send_note(const uint8_t *data, uint16_t len, uint8_t codec,
     if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_OK " 음성쪽지 송신됨 (수리 대기 2분)");
 }
 
+// --- PTT: ES7210 mics -> 16 kHz I2S RX -> 8 kHz -> C2-700C -> broadcast note --------
+// Capture runs at 16 kHz (the example-proven ES7210 configuration) and is decimated to
+// codec2's 8 kHz by a 23-tap windowed-sinc low-pass. The record/encode work runs in a
+// PSRAM-stack task (codec2_encode wants the same desktop-sized stack its decoder does);
+// the actual radio send is flagged back to the loop — the TX queue is single-producer
+// by design and stays that way.
+#define PTT_RATE   16000
+#define PTT_MAX_S  8                            // §6 note length cap
+static i2s_chan_handle_t g_mic_rx    = NULL;
+static bool              g_mic_ok    = false;
+static volatile bool     g_ptt_req   = false;   // g_ptt_down lives up top (sleep-hold guard)
+static volatile bool     g_ptt_busy  = false;
+static volatile uint16_t g_ptt_txlen = 0;       // encoded note ready for the loop to send
+static TaskHandle_t      g_ptt_task_h = NULL;
+static int16_t          *g_rec_buf   = NULL;    // PSRAM, 16 kHz mono capture
+static uint8_t           g_enc_buf[PTT_MAX_S * 200];   // 700C = 200 B/s; the sender holds
+                                                       // this through the repair window
+
+static bool mic_init()                          // loop context only: I2C is not shared-safe
+{
+    if (g_mic_ok) return true;
+    audio_hal_codec_config_t cfg = {};
+    cfg.adc_input          = AUDIO_HAL_ADC_INPUT_ALL;
+    cfg.codec_mode         = AUDIO_HAL_CODEC_MODE_ENCODE;
+    cfg.i2s_iface.mode     = AUDIO_HAL_MODE_SLAVE;
+    cfg.i2s_iface.fmt      = AUDIO_HAL_I2S_NORMAL;
+    cfg.i2s_iface.samples  = AUDIO_HAL_16K_SAMPLES;
+    cfg.i2s_iface.bits     = AUDIO_HAL_BIT_LENGTH_16BITS;
+    if (es7210_adc_init(&Wire, &cfg) != ESP_OK) { Serial.println("[ptt] es7210 init failed"); return false; }
+    es7210_adc_config_i2s(cfg.codec_mode, &cfg.i2s_iface);
+    es7210_adc_set_gain((es7210_input_mics_t)(ES7210_INPUT_MIC1 | ES7210_INPUT_MIC2),
+                        (es7210_gain_value_t)GAIN_30DB);
+    es7210_adc_ctrl_state(cfg.codec_mode, AUDIO_HAL_CTRL_START);
+
+    i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    if (i2s_new_channel(&cc, NULL, &g_mic_rx) != ESP_OK) { Serial.println("[ptt] i2s rx alloc failed"); return false; }
+    i2s_std_config_t sc = {};
+    sc.clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(PTT_RATE);          // MCLK = 256 x fs
+    sc.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
+    sc.gpio_cfg.mclk = (gpio_num_t)BOARD_ES7210_MCLK;
+    sc.gpio_cfg.bclk = (gpio_num_t)BOARD_ES7210_SCK;
+    sc.gpio_cfg.ws   = (gpio_num_t)BOARD_ES7210_LRCK;
+    sc.gpio_cfg.dout = I2S_GPIO_UNUSED;
+    sc.gpio_cfg.din  = (gpio_num_t)BOARD_ES7210_DIN;
+    if (i2s_channel_init_std_mode(g_mic_rx, &sc) != ESP_OK || i2s_channel_enable(g_mic_rx) != ESP_OK) {
+        Serial.println("[ptt] i2s rx init failed"); return false;
+    }
+    g_rec_buf = (int16_t *)heap_caps_malloc(PTT_RATE * PTT_MAX_S * sizeof(int16_t),
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!g_rec_buf) { Serial.println("[ptt] rec buf alloc failed"); return false; }
+    g_mic_ok = true;
+    Serial.println("[ptt] mic up: es7210 + i2s rx @16k");
+    return true;
+}
+
+static void ptt_task(void *)
+{
+    uint32_t t0 = millis();
+    static int16_t frame[256 * 2];              // one read: 256 stereo pairs
+    size_t got = 0; uint32_t n16 = 0;
+    while (g_ptt_down && (uint32_t)(millis() - t0) < PTT_MAX_S * 1000) {
+        if (i2s_channel_read(g_mic_rx, frame, sizeof(frame), &got, 100) == ESP_OK) {
+            int ns = (int)(got / 4);
+            for (int i = 0; i < ns && n16 < PTT_RATE * PTT_MAX_S; i++)
+                g_rec_buf[n16++] = frame[i * 2];         // left mic
+        }
+    }
+    Serial.printf("[ptt] captured %.2fs, mic rms %.0f\n", n16 / (float)PTT_RATE,
+                  [&]{ double s = 0; for (uint32_t i = 0; i < n16; i++) s += (double)g_rec_buf[i] * g_rec_buf[i];
+                       return n16 ? sqrt(s / n16) : 0.0; }());
+    if (n16 >= PTT_RATE / 4) {
+        // decimate 16k -> 8k: 23-tap windowed-sinc low-pass at 3.4 kHz, every 2nd sample
+        static float dfir[23]; static bool dinit = false;
+        if (!dinit) {
+            float sum = 0;
+            for (int k = 0; k < 23; k++) {
+                float t = (float)(k - 11), fc = 3400.0f / 16000.0f;
+                float s = (fabsf(t) < 1e-6f) ? 2 * fc : sinf(2.0f * (float)M_PI * fc * t) / ((float)M_PI * t);
+                dfir[k] = s * (0.54f + 0.46f * cosf((float)M_PI * t / 11.0f));
+                sum += dfir[k];
+            }
+            for (int k = 0; k < 23; k++) dfir[k] /= sum;
+            dinit = true;
+        }
+        uint32_t n8 = 0;
+        static int16_t *pcm8 = NULL;            // PSRAM scratch, sized once
+        if (!pcm8) pcm8 = (int16_t *)heap_caps_malloc(8000 * PTT_MAX_S * sizeof(int16_t),
+                                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        for (uint32_t i = 11; i + 12 < n16 && pcm8; i += 2) {
+            float y = 0;
+            for (int k = 0; k < 23; k++) y += dfir[k] * g_rec_buf[i - 11 + k];
+            if (y > 32700) y = 32700; else if (y < -32700) y = -32700;
+            pcm8[n8++] = (int16_t)y;
+        }
+        int frames = (int)(n8 / 320);           // 40 ms alignment, hard (VOICE.md §2)
+        if (frames > 0 && pcm8) {
+            struct CODEC2 *ce = codec2_create(CODEC2_MODE_700C);
+            uint32_t e0 = micros(); uint16_t elen = 0;
+            for (int f = 0; f < frames && elen + 4 <= sizeof(g_enc_buf); f++) {
+                codec2_encode(ce, g_enc_buf + elen, pcm8 + f * 320);
+                elen += 4;
+            }
+            uint32_t eus = (uint32_t)(micros() - e0);
+            codec2_destroy(ce);
+            Serial.printf("[ptt] encoded %d frames -> %uB in %lums (RTF %.2f)\n",
+                          frames, elen, (unsigned long)(eus / 1000), (eus / 1000.0f) / (frames * 40.0f));
+            // self-monitor ONCE through the real playback chain, then hand to the loop
+            memset(&g_vnote, 0, sizeof(g_vnote));
+            g_vnote.active = g_vnote.done = true;
+            g_vnote.src = voice_addr(NODE_ID); g_vnote.codec = 1;
+            g_vnote.n = (uint8_t)((elen + VOICE_CHUNK_MAX - 1) / VOICE_CHUNK_MAX);
+            for (int ci2 = 0; ci2 < g_vnote.n; ci2++) {
+                uint16_t o = (uint16_t)(ci2 * VOICE_CHUNK_MAX);
+                uint8_t  l = (uint8_t)((elen - o) > VOICE_CHUNK_MAX ? VOICE_CHUNK_MAX : (elen - o));
+                memcpy(g_vnote.data[ci2], g_enc_buf + o, l);
+                g_vnote.clen[ci2] = l; g_vnote.seen_mask |= (uint8_t)(1u << ci2);
+            }
+            g_vplay_reps = 1;
+            voice_play_note_body();             // we ARE the PSRAM-stack task
+            g_vplay_reps = 3;
+            memset(&g_vnote, 0, sizeof(g_vnote));
+            g_ptt_txlen = elen;                 // the loop sends; the queue stays 1-producer
+        }
+    } else {
+        Serial.println("[ptt] too short, dropped");
+    }
+    g_ptt_busy = false;
+    vTaskSuspend(NULL);                         // parked; the loop deletes a SUSPENDED task
+}
+
 // §4.4 repair discipline. Never immediate: hold 4×ToA + jitter (unicast), or the §8
 // deferred slot (broadcast). Two rounds, then the note is marked partial and kept —
 // a playable prefix is still playable (40 ms alignment).
@@ -3290,6 +3439,41 @@ static void voice_tick()
     if (g_vtx_req) {
         g_vtx_req = false;
         voice_send_note(VOICE_TEST_CLIP, VOICE_TEST_CLIP_LEN, 1, voice_addr("P10"), 1);
+    }
+    // PTT driver. Record/encode runs in a PSRAM-stack task; the SEND happens here in
+    // the loop because the TX queue is single-producer by design. The task parks in
+    // vTaskSuspend when done and is reclaimed only once the scheduler confirms it —
+    // deleting a caps-task frees its stack, which must never happen under running code.
+    if (g_ptt_req) {
+        g_ptt_req = false;
+        if (!g_ptt_busy && mic_init()) {
+            g_ptt_busy = true;
+            if (xTaskCreatePinnedToCoreWithCaps(ptt_task, "ptt", 32768, NULL, 1, &g_ptt_task_h, 1,
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+                g_ptt_busy = false; g_ptt_task_h = NULL;
+                Serial.println("[ptt] task alloc failed");
+            } else if (g_toast) {
+                lv_label_set_text(g_toast, LV_SYMBOL_AUDIO " 녹음중 - 놓으면 송신 (최대 8초)");
+            }
+        }
+    }
+    if (g_ptt_task_h && !g_ptt_busy && eTaskGetState(g_ptt_task_h) == eSuspended) {
+        vTaskDeleteWithCaps(g_ptt_task_h);
+        g_ptt_task_h = NULL;
+    }
+    if (g_ptt_txlen) {
+        uint16_t plen2 = g_ptt_txlen; g_ptt_txlen = 0;
+        voice_send_note(g_enc_buf, plen2, 1, 0xFFFF, 1, true);   // walkie: broadcast, no 30 s gate
+        if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_UP " 무전 송신됨");
+        if (g_voice_status) lv_label_set_text(g_voice_status, LV_SYMBOL_UP " 무전 송신됨 (수리 대기)");
+    }
+    if (g_vrx_replay_req) {
+        g_vrx_replay_req = false;
+        if (g_vnote.done && g_vnote.have) {
+            g_vplay_reps = 1;                   // a replay is for THIS user; once is enough
+            voice_play_note();
+            g_vplay_reps = 3;
+        }
     }
     // RX loopback: the golden note as E00 would send it — !VA through the real
     // dispatcher path, then the wire-exact 215 B frame (same builder as the vectors,
@@ -4787,6 +4971,40 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         // Ask once, and only when there is nothing to show. Never on a timer: a catalogue
         // costs (count+1) relayed frames and the mesh carries alerts on the same channel.
         if (!g_books_n) book_send_bl();
+    } else if (strcmp(name, "Voice") == 0) {
+        lora_init();
+        lv_obj_t *st = lv_label_create(parent);
+        g_voice_status = st;
+        lv_obj_set_style_text_font(st, &font_kr16, 0);
+        lv_obj_set_style_text_color(st, lv_color_hex(COL_TEXT), 0);
+        lv_label_set_text(st, "대기중 - 아래를 누르고 있는 동안 녹음");
+        // The PTT control: recording lives inside one PRESSED..RELEASED window. A
+        // trackball center press-and-hold on the focused button does exactly that.
+        lv_obj_t *pb = lv_btn_create(parent);
+        lv_obj_set_size(pb, 260, 84);
+        lv_obj_set_style_bg_color(pb, lv_color_hex(0xB91C1C), 0);
+        lv_obj_t *pbl = lv_label_create(pb);
+        lv_obj_set_style_text_font(pbl, &font_kr16, 0);
+        lv_label_set_text(pbl, LV_SYMBOL_AUDIO " 무전 (꾹)");
+        lv_obj_center(pbl);
+        lv_obj_add_event_cb(pb, [](lv_event_t *e) {
+            lv_event_code_t c = lv_event_get_code(e);
+            if (c == LV_EVENT_PRESSED && !g_ptt_busy) {
+                g_ptt_down = true; g_ptt_req = true;
+                if (g_voice_status) lv_label_set_text(g_voice_status, LV_SYMBOL_AUDIO " 녹음중... (놓으면 송신, 최대 8초)");
+            }
+            if (c == LV_EVENT_RELEASED || c == LV_EVENT_PRESS_LOST) g_ptt_down = false;
+        }, LV_EVENT_ALL, NULL);
+        lv_group_add_obj(g, pb);
+        lv_obj_t *rb = lv_btn_create(parent);
+        lv_obj_t *rbl = lv_label_create(rb);
+        lv_obj_set_style_text_font(rbl, &font_kr16, 0);
+        lv_label_set_text(rbl, LV_SYMBOL_REFRESH " 마지막 쪽지 다시 듣기");
+        lv_obj_add_event_cb(rb, [](lv_event_t *) {
+            if (g_vnote.done && g_vnote.have) g_vrx_replay_req = true;
+            else if (g_voice_status) lv_label_set_text(g_voice_status, "받은 쪽지가 없음");
+        }, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, rb);
     } else if (strcmp(name, "Alert") == 0) {
         lora_init();
         lv_obj_t *hdr = lv_label_create(parent);
@@ -4927,6 +5145,7 @@ static void go_home()
     g_rng_rssi = NULL; g_rng_stats = NULL; g_rng_log = NULL;
     g_gps_fix = NULL; g_gps_coord = NULL; g_gps_det = NULL; g_gps_time = NULL; g_gps_wifi = NULL;
     g_edit_slider = NULL;
+    g_voice_status = NULL;
     lv_obj_clear_flag(g_home_list, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(g_title, "T-Deck OS");
 

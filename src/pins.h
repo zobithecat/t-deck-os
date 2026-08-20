@@ -59,3 +59,9 @@
 #define BOARD_GPS_RX_PIN    44   // ESP receives NMEA here
 #define BOARD_GPS_TX_PIN    43   // ESP sends to GPS here (config; usually unused)
 #define BOARD_GPS_BAUD      9600 // u-blox M10 default NMEA baud
+// ES7210 quad-ADC (mics) — I2C on the shared bus (SDA18/SCL8), I2S RX with us as
+// clock master. Pin map verbatim from LilyGO T-Deck examples/Microphone/utilities.h.
+#define BOARD_ES7210_MCLK   48
+#define BOARD_ES7210_LRCK   21
+#define BOARD_ES7210_SCK    47
+#define BOARD_ES7210_DIN    14
