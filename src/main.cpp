@@ -65,6 +65,9 @@ static uint8_t       g_voice_vol = 6;    // voice-note loudness 0..10 (Settings/
                                          // peak target = 2700 x value; 30000 was measured distorting
 static volatile bool g_ptt_down  = false;   // PTT held (Voice app); declared here because the
                                             // trackball's 3 s sleep-hold must not fire mid-record
+static uint8_t       g_voice_codec = 1;     // PTT TX codec, WIRE enum: 1 = 700C (default),
+                                            // 0 = 1200 (better voice, ~3x channel). NVS "vcodec".
+                                            // RX is codec-agnostic by spec — this is TX only.
 static lv_obj_t     *g_vdlg = NULL;         // incoming voice-note takeover (alert-style)
 static volatile bool g_vdlg_dismiss = false;
 static uint8_t       g_screen_bright = 16;   // display brightness 1..16 (Settings/NVS "bright")
@@ -2758,7 +2761,8 @@ static void book_show_shelf()
 // side land next — the frame layer has to be provably right first, hence the boot
 // self-test below.
 #define VOICE_MAGIC      0xC2
-#define VOICE_MAX_CHUNKS 6          // §6: 8 s cap at C2-1200 = 6 chunks
+#define VOICE_MAX_CHUNKS 8          // §6 8 s cap: 4 chunks at 700C, 7 at 1200 (198 B
+                                    // frame-aligned) — u8 masks hold exactly 8
 #define VOICE_CHUNK_MAX  200
 // TX chunk size must be a whole number of CODEC FRAMES (§4.2, 40 ms alignment). 200 is
 // exact for 700C (4 B/frame) but 200/6 = 33.33 frames at 1200 — the two-chunk 1200
@@ -3553,6 +3557,8 @@ static volatile bool     g_ptt_req   = false;   // g_ptt_down lives up top (slee
 static volatile bool     g_ptt_busy  = false;
 static volatile bool     g_ptt_fail  = false;   // task -> tick: show the failure in the UI
 static volatile uint16_t g_ptt_txlen = 0;       // encoded note ready for the loop to send
+static volatile uint8_t  g_ptt_txcodec = 1;     // codec that note was encoded with (pinned
+                                                // at record time — the toggle may move later)
 static TaskHandle_t      g_ptt_task_h = NULL;
 static int16_t          *g_rec_buf   = NULL;    // PSRAM, 16 kHz mono capture
 static uint8_t           g_enc_buf[PTT_MAX_S * 200];   // 700C = 200 B/s; the sender holds
@@ -3709,21 +3715,25 @@ static void ptt_task(void *)
             }
         }
         if (frames > 0 && pcm8) {
-            struct CODEC2 *ce = codec2_create(CODEC2_MODE_700C);
+            uint8_t ec = g_voice_codec;         // pin the codec for record->send coherence
+            g_ptt_txcodec = ec;
+            int ebpf = ec == 1 ? 4 : 6;
+            struct CODEC2 *ce = codec2_create(ec == 1 ? CODEC2_MODE_700C : CODEC2_MODE_1200);
             uint32_t e0 = micros(); uint16_t elen = 0;
-            for (int f = 0; f < frames && elen + 4 <= sizeof(g_enc_buf); f++) {
+            for (int f = 0; f < frames && elen + ebpf <= (int)sizeof(g_enc_buf); f++) {
                 codec2_encode(ce, g_enc_buf + elen, pcm8 + f * 320);
-                elen += 4;
+                elen += (uint16_t)ebpf;
             }
             uint32_t eus = (uint32_t)(micros() - e0);
             codec2_destroy(ce);
-            Serial.printf("[ptt] encoded %d frames -> %uB in %lums (RTF %.2f)\n",
-                          frames, elen, (unsigned long)(eus / 1000), (eus / 1000.0f) / (frames * 40.0f));
+            Serial.printf("[ptt] encoded %d frames -> %uB @%s in %lums (RTF %.2f)\n",
+                          frames, elen, ec == 1 ? "700C" : "1200",
+                          (unsigned long)(eus / 1000), (eus / 1000.0f) / (frames * 40.0f));
             // self-monitor ONCE through the real playback chain, then hand to the loop
             memset(&g_vnote, 0, sizeof(g_vnote));
             g_vnote.active = g_vnote.done = true;
-            g_vnote.src = voice_addr(NODE_ID); g_vnote.codec = 1;
-            uint8_t scsz = voice_tx_chunk(1);   // same frame-aligned boundaries as the TX
+            g_vnote.src = voice_addr(NODE_ID); g_vnote.codec = ec;
+            uint8_t scsz = voice_tx_chunk(ec);  // same frame-aligned boundaries as the TX
             g_vnote.n = (uint8_t)((elen + scsz - 1) / scsz);
             for (int ci2 = 0; ci2 < g_vnote.n; ci2++) {
                 uint16_t o = (uint16_t)(ci2 * scsz);
@@ -3793,7 +3803,7 @@ static void voice_tick()
         memset(&g_vtext, 0, sizeof(g_vtext));
     if (g_ptt_txlen) {
         uint16_t plen2 = g_ptt_txlen; g_ptt_txlen = 0;
-        voice_send_note(g_enc_buf, plen2, 1, 0xFFFF, 1, true);   // walkie: broadcast, no 30 s gate
+        voice_send_note(g_enc_buf, plen2, g_ptt_txcodec, 0xFFFF, 1, true);   // walkie: broadcast, no 30 s gate
         if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_UP " 무전 송신됨");
         if (g_voice_status) lv_label_set_text(g_voice_status, LV_SYMBOL_UP " 무전 송신됨 (수리 대기)");
     }
@@ -4995,6 +5005,23 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         }, LV_EVENT_VALUE_CHANGED, NULL);
         lv_group_add_obj(g, vvs);
 
+        // PTT TX codec. Reception never asks (the codec byte rides every chunk); this
+        // only decides what OUR transmissions cost: 700C = 1 frame per 2 s, 1200 =
+        // audibly better voice for ~3x the channel.
+        lv_obj_t *vcb  = lv_btn_create(parent);
+        lv_obj_t *vcbl = lv_label_create(vcb);
+        lv_obj_set_style_text_font(vcbl, &font_kr16, 0);
+        lv_label_set_text_fmt(vcbl, LV_SYMBOL_SHUFFLE " 무전 코덱: %s",
+                              g_voice_codec == 1 ? "700C (절약)" : "1200 (고음질)");
+        lv_obj_add_event_cb(vcb, [](lv_event_t *e) {
+            g_voice_codec = g_voice_codec == 1 ? 0 : 1;
+            Preferences p; p.begin("tdeckos", false); p.putUChar("vcodec", g_voice_codec); p.end();
+            lv_label_set_text_fmt(lv_obj_get_child(lv_event_get_target(e), 0),
+                                  LV_SYMBOL_SHUFFLE " 무전 코덱: %s",
+                                  g_voice_codec == 1 ? "700C (절약)" : "1200 (고음질)");
+        }, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, vcb);
+
         // Voice plane one-way test (VOICE.md v1.12): send the canned 2 s clip to P10
         // as a real note — !VA announce + 2 paced 0xC2 chunks, then hold for repair.
         lv_obj_t *vbtn = lv_btn_create(parent);
@@ -5935,6 +5962,7 @@ static void boot_restore()
     g_kb_bright = p.getUChar("kbl", 127);
     g_tb_accel  = p.getUChar("tbaccel", 2);
     g_voice_vol = p.getUChar("vvol", 6);
+    g_voice_codec = p.getUChar("vcodec", 1) ? 1 : 0;
     g_beep_vol  = p.getUChar("beepvol", 7);
     g_gps_enabled = p.getBool("gpsen", true);
     g_tts_enabled = p.getBool("tts", true);
