@@ -2795,6 +2795,7 @@ struct VoiceNote {
     uint8_t  clen[VOICE_MAX_CHUNKS];
     uint8_t  data[VOICE_MAX_CHUNKS][VOICE_CHUNK_MAX];
     bool     have_va;                   // !VA meta (advisory crc32 + duration)
+    char     caption[48];               // v1.13: announce-borne text half of the message
     uint32_t va_crc32, va_ms;
     uint16_t dur_ds;
     uint32_t last_ms, toa_ms;           // last chunk in + its measured ToA
@@ -2868,12 +2869,21 @@ static uint8_t g_vplay_reps = 3;   // incoming notes repeat 3x; PTT self-monitor
 // which is the distortion budget. Cutting it is free loudness for the speech band.
 struct VoiceHpf {
     float b0, b1, b2, a1, a2, x1, x2, y1, y2;
-    void init(float fc = 300.0f)
+    void init(float fc = 300.0f)                // RBJ high-pass, Q 0.707
     {
         const float w0 = 2.0f * (float)M_PI * fc / 8000.0f;
         const float c = cosf(w0), al = sinf(w0) / (2.0f * 0.7071f);
         const float a0 = 1.0f + al;
         b0 = (1.0f + c) / 2.0f / a0; b1 = -(1.0f + c) / a0; b2 = b0;
+        a1 = -2.0f * c / a0; a2 = (1.0f - al) / a0;
+        x1 = x2 = y1 = y2 = 0.0f;
+    }
+    void init_lp(float fc)                      // RBJ low-pass, Q 0.707
+    {
+        const float w0 = 2.0f * (float)M_PI * fc / 8000.0f;
+        const float c = cosf(w0), al = sinf(w0) / (2.0f * 0.7071f);
+        const float a0 = 1.0f + al;
+        b0 = (1.0f - c) / 2.0f / a0; b1 = (1.0f - c) / a0; b2 = b0;
         a1 = -2.0f * c / a0; a2 = (1.0f - al) / a0;
         x1 = x2 = y1 = y2 = 0.0f;
     }
@@ -3084,11 +3094,14 @@ static void voice_show_dialog(const char *who, float secs, bool verified, uint8_
     lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_font(body, &font_kr16, 0);
     lv_obj_set_style_text_color(body, lv_color_white(), 0);
+    const char *cap = g_vnote.caption[0] ? g_vnote.caption : NULL;   // v1.13 text half
     if (have >= n)
-        lv_label_set_text_fmt(body, "%s 발신, %.1f초\n%s\n\n3회 반복 재생됩니다.",
+        lv_label_set_text_fmt(body, "%s%s%s 발신, %.1f초\n%s\n\n3회 반복 재생됩니다.",
+                              cap ? cap : "", cap ? "\n\n" : "",
                               who, secs, verified ? "무결성 확인됨" : "미검증 (announce 불일치)");
     else
-        lv_label_set_text_fmt(body, "%s 발신, %.1f초\n일부만 수신 (%u/%u) - 수리 실패분 포함 재생\n\n3회 반복 재생됩니다.",
+        lv_label_set_text_fmt(body, "%s%s%s 발신, %.1f초\n일부만 수신 (%u/%u) - 수리 실패분 포함 재생\n\n3회 반복 재생됩니다.",
+                              cap ? cap : "", cap ? "\n\n" : "",
                               who, secs, have, n);
     lv_obj_t *hint = lv_label_create(g_vdlg);
     lv_obj_set_style_text_font(hint, &font_kr16, 0);
@@ -3191,8 +3204,8 @@ static void voice_rx_frame(const uint8_t *b, int len)
 // !VA\t<src>\t<vid>\t<n>\t<codec>\t<dur_ds>\t<crc32> — push announce (text plane, relayed)
 static void voice_handle_va(const String &line)
 {
-    int t[6], p = 0, at = line.indexOf('\t');
-    while (p < 6 && at >= 0) { t[p++] = at; at = line.indexOf('\t', at + 1); }
+    int t[7], p = 0, at = line.indexOf('\t');
+    while (p < 7 && at >= 0) { t[p++] = at; at = line.indexOf('\t', at + 1); }
     if (p < 6) return;
     uint16_t src = (uint16_t)unb36(line.substring(t[0] + 1, t[1]));   // b36 of the u16
     uint16_t vid = (uint16_t)unb36(line.substring(t[1] + 1, t[2]));
@@ -3203,7 +3216,16 @@ static void voice_handle_va(const String &line)
     g_vnote.n        = (uint8_t)unb36(line.substring(t[2] + 1, t[3]));
     g_vnote.codec    = (uint8_t)unb36(line.substring(t[3] + 1, t[4]));
     g_vnote.dur_ds   = (uint16_t)unb36(line.substring(t[4] + 1, t[5]));
-    g_vnote.va_crc32 = unb36(line.substring(t[5] + 1));
+    // v1.13: crc32 ends at the seventh tab when a caption follows — a scan to
+    // end-of-line would eat the caption into the number (strtoul happens to stop at
+    // the tab, but the spec says stop, so stop).
+    g_vnote.va_crc32 = unb36(p >= 7 ? line.substring(t[5] + 1, t[6]) : line.substring(t[5] + 1));
+    g_vnote.caption[0] = 0;
+    if (p >= 7) {
+        String cap = line.substring(t[6] + 1);
+        strncpy(g_vnote.caption, cap.c_str(), sizeof(g_vnote.caption) - 1);
+        g_vnote.caption[sizeof(g_vnote.caption) - 1] = 0;
+    }
     g_vnote.va_ms    = millis();
     Serial.printf("[voice] VA %s vid=%04X n=%u codec=%u %u.%us\n",
                   voice_addr_str(src).c_str(), vid, g_vnote.n, g_vnote.codec,
@@ -3309,7 +3331,8 @@ static void voice_tx_frame(uint8_t seq)
 }
 
 static void voice_send_note(const uint8_t *data, uint16_t len, uint8_t codec,
-                            uint16_t dst, uint8_t ttl, bool force = false)
+                            uint16_t dst, uint8_t ttl, bool force = false,
+                            const char *caption = NULL)
 {
     if (!g_lora_ok || !len || !data) return;
     if (alert_real_active()) {                   // an evacuation order outranks voice mail
@@ -3330,9 +3353,20 @@ static void voice_send_note(const uint8_t *data, uint16_t len, uint8_t codec,
     g_vtx.resend_mask = 0; g_vtx.resend_due = 0;
     uint16_t frames = (codec == 1) ? len / 4 : len / 6;
     uint16_t dur_ds = frames * 4 / 10;           // 40 ms a frame, in deciseconds
-    lora_tx_ttl("!VA\t" + b36(voice_addr(NODE_ID)) + "\t" + b36(g_vtx.vid) + "\t" +
-                b36(g_vtx.n) + "\t" + b36(codec) + "\t" + b36(dur_ds) + "\t" + b36(crc) + "\n",
-                RELAY_TTL_MESH);                 // the announce floods even where chunks cannot
+    String va = "!VA\t" + b36(voice_addr(NODE_ID)) + "\t" + b36(g_vtx.vid) + "\t" +
+                b36(g_vtx.n) + "\t" + b36(codec) + "\t" + b36(dur_ds) + "\t" + b36(crc);
+    if (caption && caption[0]) {
+        // v1.13: caption is the verbatim last field; the LINE budget is 60 UTF-8 bytes,
+        // truncated on a character boundary — strip whole codepoints, never mid-sequence.
+        String cap = caption;
+        while (va.length() + 1 + cap.length() > 60 && cap.length()) {
+            int cut = cap.length() - 1;
+            while (cut > 0 && ((uint8_t)cap[cut] & 0xC0) == 0x80) cut--;
+            cap = cap.substring(0, cut);
+        }
+        if (cap.length()) va += "\t" + cap;
+    }
+    lora_tx_ttl(va + "\n", RELAY_TTL_MESH);      // the announce floods even where chunks cannot
     for (uint8_t s = 0; s < g_vtx.n; s++) voice_tx_frame(s);
     g_vtx.sent_ms = millis();
     Serial.printf("[voice] note sent: vid=%04X n=%u %u.%us -> %04X ttl%u\n",
@@ -3469,26 +3503,45 @@ static void ptt_task(void *)
             pcm8[n8++] = (int16_t)y;
         }
         int frames = (int)(n8 / 320);           // 40 ms alignment, hard (VOICE.md §2)
-        // Pre-encode conditioning: 100 Hz rumble cut (male F0 starts ~100 Hz — the
-        // fundamental must SURVIVE, only the room below it goes) and peak-normalize to
-        // a healthy level. A -29 dBFS capture starved the 700C pitch tracker into
-        // octave jumps — the "로우" warble.
+        // Codec-friendly conditioning, telephone-band discipline (Codec2 was born in
+        // ham/telco band speech): low-cut 220 Hz (boom and room go, F0 harmonics carry
+        // the pitch), high-cut 3.3 kHz (outside the model — energy there only steals
+        // quantizer bits), mild pre-emphasis (+ tilt toward consonants: the VQ spends
+        // bits where the energy is), then a 3:1 compressor and peak normalize so quiet
+        // syllables reach the quantizer with real SNR. Float throughout, one buffer.
         if (frames > 0 && pcm8) {
-            VoiceHpf mh; mh.init(100.0f);
-            float mpk = 0;
-            for (uint32_t i2 = 0; i2 < n8; i2++) {
-                float v = mh.run((float)pcm8[i2]);
-                pcm8[i2] = (int16_t)(v > 32700 ? 32700 : (v < -32700 ? -32700 : v));
-                float a2 = fabsf(v); if (a2 > mpk) mpk = a2;
+            static float *fbuf = NULL;
+            if (!fbuf) fbuf = (float *)heap_caps_malloc(8000 * PTT_MAX_S * sizeof(float),
+                                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            VoiceHpf hp; hp.init(220.0f);
+            VoiceHpf lp; lp.init_lp(3300.0f);
+            const float PE = 0.55f;             // y[n] = x[n] - PE*x[n-1]
+            float xprev = 0, mpk = 0;
+            for (uint32_t i2 = 0; i2 < n8 && fbuf; i2++) {
+                float v = lp.run(hp.run((float)pcm8[i2]));
+                float y = v - PE * xprev; xprev = v;
+                fbuf[i2] = y;
+                float a2 = fabsf(y); if (a2 > mpk) mpk = a2;
             }
-            float mg = (mpk > 100.0f) ? 24000.0f / mpk : 1.0f;
-            if (mg > 8.0f) mg = 8.0f;
-            if (mg < 1.0f) mg = 1.0f;           // already hot: leave it
-            for (uint32_t i2 = 0; i2 < n8; i2++) {
-                float v = pcm8[i2] * mg;
-                pcm8[i2] = (int16_t)(v > 32700 ? 32700 : (v < -32700 ? -32700 : v));
+            if (fbuf) {
+                float mg = (mpk > 100.0f) ? 24000.0f / mpk : 1.0f;
+                if (mg > 10.0f) mg = 10.0f;
+                const float th = 0.35f * 24000.0f, ratio = 1.0f / 3.0f;
+                const float mk = 24000.0f / (th + (24000.0f - th) * ratio);
+                const float catt2 = 0.8825f, crel2 = 0.99875f;
+                float env = 0;
+                for (uint32_t i2 = 0; i2 < n8; i2++) {
+                    float xs = fbuf[i2] * mg;
+                    float ax = fabsf(xs);
+                    float cc = (ax > env) ? catt2 : crel2;
+                    env = cc * env + (1.0f - cc) * ax;
+                    float g2 = (env > th) ? (th + (env - th) * ratio) / env : 1.0f;
+                    float o = xs * g2 * mk;
+                    pcm8[i2] = (int16_t)(o > 32700 ? 32700 : (o < -32700 ? -32700 : o));
+                }
+                Serial.printf("[ptt] conditioned: band 220-3300 preemph %.2f peak %.0f gain %.2f\n",
+                              PE, mpk, mg);
             }
-            Serial.printf("[ptt] conditioned: peak %.0f gain %.2f\n", mpk, mg);
         }
         if (frames > 0 && pcm8) {
             struct CODEC2 *ce = codec2_create(CODEC2_MODE_700C);
@@ -3602,7 +3655,8 @@ static void voice_tick()
             memset(&g_vnote, 0, sizeof(g_vnote));
             g_vrx_loopback = true;
             voice_handle_va("!VA\t" + b36(src) + "\t" + b36(vid) + "\t1\t1\t" +
-                            b36((VOICE_TEST_CLIP_LEN / 4) * 4 / 10) + "\t" + b36(crc));
+                            b36((VOICE_TEST_CLIP_LEN / 4) * 4 / 10) + "\t" + b36(crc) +
+                            "\t대피 안내 시험 방송");   // v1.13 caption, exercised end to end
             uint8_t f[VOICE_HDR + VOICE_CHUNK_MAX + 2];
             f[0] = VOICE_MAGIC; f[1] = 0x10; f[2] = 1;
             f[3] = src & 0xFF; f[4] = src >> 8;
