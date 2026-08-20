@@ -3075,7 +3075,11 @@ static void voice_tick()
     g_vnote.vn_rounds++;
     uint32_t have = 0;
     for (int i = 0; i < g_vnote.n; i++) if (g_vnote.seen_mask & (1 << i)) have |= 1u << i;
-    voice_send_vn(b36(have).c_str());
+    // Self-check the encoding before it airs: the !GN reversed-digit bitmap cost this
+    // project days, and a wrong subset requests the wrong chunks. If the round-trip
+    // disagrees, '-' (resend everything) is the answer that cannot lie.
+    String bm = b36(have);
+    voice_send_vn(unb36(bm) == have ? bm.c_str() : "-");
     g_vnote.last_ms = now;                            // restart the idle clock
 }
 
