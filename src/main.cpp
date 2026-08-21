@@ -3949,9 +3949,13 @@ static void voice_tick()
     if (g_crexp) {
         static uint32_t crexp_last = 0;
         uint32_t cnow = millis();
-        if ((uint32_t)(cnow - crexp_last) > 4000) {
+        uint8_t idx   = (uint8_t)(80 - g_crexp);              // 0-based note index
+        // 30 s of OUR silence marks a block boundary — received frames carry no CR
+        // anywhere E00 can read (the header is demodulation-only), so the gap IS the
+        // label. 4 s cadence inside a block, 30 s between blocks, nothing else on air.
+        uint32_t need = (idx > 0 && idx % 20 == 0) ? 30000 : 4000;
+        if ((uint32_t)(cnow - crexp_last) > need) {
             crexp_last = cnow;
-            uint8_t idx   = (uint8_t)(80 - g_crexp);          // 0-based note index
             uint8_t block = (uint8_t)(idx / 20);              // 0=A1 1=B1 2=A2 3=B2
             g_tx_cr = (block & 1) ? 8 : RF_CR_DENOM;
             if (idx % 20 == 0) {
@@ -4356,6 +4360,8 @@ static uint32_t g_hb_last = 0;
 static void lora_hb_tick()
 {
     if (!g_lora_ok || g_range_active) return;
+    if (g_crexp) return;   // the CR experiment's block boundary IS 30 s of our silence —
+                           // a beacon landing inside that window erases the label
     uint32_t now = millis();
     if (now < 15000) return;                                  // let the radio settle first
     if (g_hb_last && (uint32_t)(now - g_hb_last) < 60000) return;
