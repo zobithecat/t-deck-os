@@ -1542,10 +1542,21 @@ static volatile bool    g_tx_inflight = false;
 static uint32_t         g_tx_gap_until = 0;
 static uint16_t         g_tx_gap_pending = 0;
 
+// TX coding rate, runtime-switchable (E00's CR experiment, 2026-08-20). Explicit-header
+// LoRa carries the payload CR in the header (itself always 4/8), so ONE side may change
+// alone and mixed traffic keeps working — this is deliberately not in lora_rf.h's
+// flag-day set. Applied in the pump, the one place no transmit is in flight.
+static uint8_t g_tx_cr = RF_CR_DENOM, g_tx_cr_applied = RF_CR_DENOM;
+
 static void lora_tx_pump()
 {
     if (!g_lora_ok || g_range_active || g_tx_inflight || !g_txq_n) return;
     if (g_tx_gap_until && (int32_t)(millis() - g_tx_gap_until) < 0) return;
+    if (g_tx_cr != g_tx_cr_applied) {
+        lora_radio.setCodingRate(g_tx_cr);
+        g_tx_cr_applied = g_tx_cr;
+        Serial.printf("[crexp] TX coding rate now 4/%u\n", g_tx_cr);
+    }
     TxJob &j = g_txq[g_txq_head];
     g_tx_gap_pending = j.gap_ms;
     g_tx_inflight = true;
@@ -2805,6 +2816,7 @@ static String voice_addr_str(uint16_t a)      // reversible by construction
 
 struct VoiceNote {
     bool     active, done, partial, ranged_out;
+    bool     played;                    // audio already played once (unverified early cut)
     uint16_t src, dst, vid;
     uint8_t  n, codec;                  // n=0 until first chunk or !VA
     uint8_t  have, seen_mask;
@@ -2932,7 +2944,9 @@ static void voice_play_note_body()
     // §4.4 prefix rule, extended by §5.2: once repair has given up (partial), chunks
     // whose crc16 failed but whose bytes were kept extend the playable prefix. Before
     // give-up only verified chunks play — repair may still replace the kept ones.
-    uint8_t play_mask = g_vnote.seen_mask | (g_vnote.partial ? g_vnote.unv_mask : 0);
+    uint8_t play_mask = g_vnote.seen_mask | g_vnote.unv_mask;   // a verified copy clears
+                                                                 // its unv bit, so this is
+                                                                 // always the best cut
     if (!play_mask) return;
     if (g_vnote.codec > 1) { Serial.printf("[voice] unknown codec %u\n", g_vnote.codec); return; }
     audio_init();
@@ -3202,6 +3216,11 @@ static void voice_note_completed()
                   verified ? "" : " (announce crc mismatch - unverified)");
     lora_log_print("< ", String("[음성] ") + who + " " + String(secs, 1) + "초 수신"
                         + (verified ? "" : " (미검증)"));
+    if (g_vnote.played) {                 // the unverified cut was already heard; bank
+        voice_note_save(verified);        // the repaired bytes and update the panel only
+        voice_dialog_refresh();
+        return;
+    }
     voice_show_dialog(who.c_str(), secs, verified, g_vnote.n, g_vnote.n);
     voice_note_save(verified);            // on flash BEFORE the speaker gets it
     beep_notify();
@@ -3237,6 +3256,23 @@ static void voice_rx_frame(const uint8_t *b, int len)
             g_vnote.clen[useq] = plen;
             g_vnote.unv_mask |= (uint8_t)(1u << useq);
             Serial.printf("[voice] chunk %u kept unverified (crc16 fail, %d B)\n", useq, len);
+            // E00's amendment, adopted both sides: once every slot holds bytes — verified
+            // or not — play NOW rather than hold 2 s of speech hostage to a repair that
+            // may never complete on a link whose damage arrives as 300 ms bursts. The
+            // repair still runs; the ring banks the best version at the end.
+            uint8_t all = (uint8_t)((1u << g_vnote.n) - 1);
+            if (!g_vnote.played && g_vnote.n &&
+                ((g_vnote.seen_mask | g_vnote.unv_mask) & all) == all) {
+                g_vnote.played = true;
+                size_t tb = 0;
+                for (int i = 0; i < g_vnote.n; i++) tb += g_vnote.clen[i];
+                float es = g_vnote.codec == 1 ? tb / 4 * 0.04f : tb / 6 * 0.04f;
+                Serial.println("[voice] full coverage with unverified chunks - playing early");
+                voice_show_dialog(voice_addr_str(g_vnote.src).c_str(), es, false,
+                                  g_vnote.have, g_vnote.n);
+                beep_notify();
+                voice_play_note();
+            }
         } else {
             Serial.printf("[voice] chunk crc16 fail (%d B)\n", len);
         }
@@ -3430,6 +3466,11 @@ struct VoiceTx {
 };
 static VoiceTx       g_vtx;
 static volatile bool g_vtx_req     = false;  // Settings asked; the stream runs from loop()
+static volatile uint8_t g_crexp = 0;         // CR experiment: notes remaining of 80
+                                             // (A1 4/6 · B1 4/8 · A2 4/6 · B2 4/8, 20 each,
+                                             // interleaved in ONE sitting per E00's design —
+                                             // two identical bursts 6 h apart measured 13.3%
+                                             // and 0.0%, so A-then-B across sessions is void)
 static volatile uint8_t g_vtx_burst = 0;     // E00's corruption experiment: N repeats,
                                              // §6 rate limit deliberately bypassed
 static uint32_t      g_vtx_last_ms = 0;      // §6: one note per src per 30 s
@@ -3901,6 +3942,31 @@ static void voice_tick()
             g_vrx_loopback = false;
         }
     }
+    // CR experiment driver: 80 notes of the 700C golden clip toward P10, blocks of 20
+    // with OUR transmit CR alternating 4/6 -> 4/8 -> 4/6 -> 4/8. Only the sender's CR
+    // moves (explicit header carries it); everything else — clip, dst, power, cadence —
+    // is pinned so the one variable stays the one variable. Restores 4/6 when done.
+    if (g_crexp) {
+        static uint32_t crexp_last = 0;
+        uint32_t cnow = millis();
+        if ((uint32_t)(cnow - crexp_last) > 4000) {
+            crexp_last = cnow;
+            uint8_t idx   = (uint8_t)(80 - g_crexp);          // 0-based note index
+            uint8_t block = (uint8_t)(idx / 20);              // 0=A1 1=B1 2=A2 3=B2
+            g_tx_cr = (block & 1) ? 8 : RF_CR_DENOM;
+            if (idx % 20 == 0) {
+                static const char *bn[4] = { "A1", "B1", "A2", "B2" };
+                Serial.printf("[crexp] block %s begins: TX CR 4/%u, 20 notes\n", bn[block], g_tx_cr);
+                if (g_toast) lv_label_set_text_fmt(g_toast, "CR실험 %s (4/%u)", bn[block], g_tx_cr);
+            }
+            voice_send_note(VOICE_TEST_CLIP, VOICE_TEST_CLIP_LEN, 1, voice_addr("P10"), 1, true);
+            if (--g_crexp == 0) {
+                g_tx_cr = RF_CR_DENOM;                        // the experiment cleans up
+                Serial.println("[crexp] done - 80 notes sent, TX CR restored to 4/6");
+                if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_OK " CR실험 완료 (4/6 복원)");
+            }
+        }
+    }
     if (g_vtx_burst) {
         static uint32_t burst_last = 0;
         uint32_t bnow = millis();
@@ -3973,7 +4039,7 @@ static void voice_tick()
                                   g_vnote.have, g_vnote.n);
             }
             voice_note_save(false);          // a partial transmission still outweighs a chat line
-            voice_play_note();               // §4.4: a playable prefix is still playable
+            if (!g_vnote.played) voice_play_note();   // §4.4; skip if the early cut already played
             return;
         }
         if (g_vnote.dst == 0xFFFF) {                  // §8 deferred slot, verbatim
@@ -5078,6 +5144,16 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lv_label_set_text(vbbl, LV_SYMBOL_LOOP " 음성 반복시험 x20 (계측용)");
         lv_obj_add_event_cb(vbb, [](lv_event_t *) { g_vtx_burst = 20; }, LV_EVENT_CLICKED, NULL);
         lv_group_add_obj(g, vbb);
+
+        // E00's coding-rate experiment: 80 golden-clip notes, blocks of 20, OUR TX CR
+        // alternating 4/6 and 4/8 in one sitting. One button so the operator cannot
+        // introduce a variable.
+        lv_obj_t *vcr  = lv_btn_create(parent);
+        lv_obj_t *vcrl = lv_label_create(vcr);
+        lv_obj_set_style_text_font(vcrl, &font_kr16, 0);
+        lv_label_set_text(vcrl, LV_SYMBOL_CHARGE " CR 실험 x80 (A/B 교차, ~6분)");
+        lv_obj_add_event_cb(vcr, [](lv_event_t *) { if (!g_crexp) g_crexp = 80; }, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, vcr);
 
         // Receive-path proof with no peer TX in existence: inject the golden 700C note
         // as if E00 sent it — assembly, playback and the decode-RTF measurement.
