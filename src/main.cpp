@@ -3487,6 +3487,11 @@ static void voice_handle_vn(const String &line)
     uint16_t vid = (uint16_t)unb36(line.substring(t[1] + 1, t[2]));
     String   bm  = line.substring(t[2] + 1);
     if (!g_vtx.active || src != voice_addr(NODE_ID) || vid != g_vtx.vid) return;
+    // During the CR experiment the block populations must be EXACTLY the 20 planned
+    // frames — repair re-sends put extra vid=334F frames inside the silence gaps and
+    // into E00's counts (their run 1 saw 89 chunks for 80 sent). Repair resumes the
+    // moment the run ends.
+    if (g_crexp) { Serial.println("[crexp] !VN suppressed during experiment"); return; }
     uint32_t all = ((uint32_t)1 << g_vtx.n) - 1, miss;
     if (bm == "-") miss = all;                    // announce-only requester (§4.3)
     else {
@@ -3953,7 +3958,11 @@ static void voice_tick()
         // 30 s of OUR silence marks a block boundary — received frames carry no CR
         // anywhere E00 can read (the header is demodulation-only), so the gap IS the
         // label. 4 s cadence inside a block, 30 s between blocks, nothing else on air.
-        uint32_t need = (idx > 0 && idx % 20 == 0) ? 30000 : 4000;
+        uint32_t need = (idx > 0 && idx % 20 == 0) ? 40000 : 4000;   // 40 s: queue-time
+                                                                     // minus trailing air
+                                                                     // still clears any
+                                                                     // threshold (30 s
+                                                                     // measured as 28)
         if ((uint32_t)(cnow - crexp_last) > need) {
             crexp_last = cnow;
             uint8_t block = (uint8_t)(idx / 20);              // 0=A1 1=B1 2=A2 3=B2
