@@ -1548,6 +1548,15 @@ static uint16_t         g_tx_gap_pending = 0;
 // flag-day set. Applied in the pump, the one place no transmit is in flight.
 static uint8_t g_tx_cr = RF_CR_DENOM, g_tx_cr_applied = RF_CR_DENOM;
 
+// v1.15 beacon deferral: streams reserve, beacons yield. Set by stream announces
+// (!VA/!GR/!BR), renewed 3xToA by every stream frame heard; lora_hb_tick honors it,
+// capped at ONE own period (the MUST DoS boundary — announces are unauthenticated).
+static uint32_t g_chan_resv = 0;
+static void chan_reserve(uint32_t until_ms)
+{
+    if ((int32_t)(until_ms - g_chan_resv) > 0) g_chan_resv = until_ms;
+}
+
 static void lora_tx_pump()
 {
     if (!g_lora_ok || g_range_active || g_tx_inflight || !g_txq_n) return;
@@ -2821,6 +2830,9 @@ struct VoiceNote {
     uint8_t  n, codec;                  // n=0 until first chunk or !VA
     uint8_t  have, seen_mask;
     uint8_t  unv_mask;                  // §5.2: crc16-failed bytes kept, awaiting repair
+    bool     have_par;                  // v1.14: parity chunk (seq == n) held
+    uint8_t  par_len;
+    uint8_t  par[VOICE_CHUNK_MAX];
     uint8_t  clen[VOICE_MAX_CHUNKS];
     uint8_t  data[VOICE_MAX_CHUNKS][VOICE_CHUNK_MAX];
     bool     have_va;                   // !VA meta (advisory crc32 + duration)
@@ -3227,6 +3239,53 @@ static void voice_note_completed()
     voice_play_note();
 }
 
+// v1.14: one missing data chunk + the parity chunk = reconstruction, no repair round
+// trip. Non-last chunks are full-size, so XOR alone is exact; the LAST chunk's length
+// is recovered by crc32 trial over the frame-size-aligned prefixes (the spec's fix —
+// dur_ds is 200 ms granular and truncates). Runs after every stored frame; quiet
+// unless it recovers.
+static void voice_try_parity()
+{
+    if (!g_vnote.active || g_vnote.done || !g_vnote.have_par || !g_vnote.n) return;
+    uint8_t all = (uint8_t)((1u << g_vnote.n) - 1);
+    uint8_t missing = (uint8_t)(~g_vnote.seen_mask & all);
+    if (!missing || (missing & (missing - 1))) return;          // exactly one, or bail
+    int m = __builtin_ctz(missing);
+    uint8_t csz = g_vnote.par_len ? g_vnote.par_len : voice_tx_chunk(g_vnote.codec);
+    uint8_t rec[VOICE_CHUNK_MAX];
+    memcpy(rec, g_vnote.par, csz);
+    for (int i = 0; i < g_vnote.n; i++) {
+        if (i == m) continue;
+        for (int k = 0; k < g_vnote.clen[i]; k++) rec[k] ^= g_vnote.data[i][k];
+    }
+    uint8_t rlen = 0;
+    if (m < g_vnote.n - 1) {
+        rlen = csz;                                             // non-last chunks are full
+    } else if (g_vnote.have_va) {
+        // crc32 trial: true length is k x frame-size for some k <= csz/bpf
+        int bpf = g_vnote.codec == 1 ? 4 : 6;
+        uint8_t *jb = voice_scratch();
+        if (!jb) return;
+        size_t base = 0;
+        for (int i = 0; i < g_vnote.n - 1; i++) { memcpy(jb + base, g_vnote.data[i], g_vnote.clen[i]); base += g_vnote.clen[i]; }
+        for (int k = 1; k * bpf <= csz; k++) {
+            memcpy(jb + base, rec, (size_t)k * bpf);
+            if (crc32_bytes(jb, base + (size_t)k * bpf) == g_vnote.va_crc32) { rlen = (uint8_t)(k * bpf); break; }
+        }
+        if (!rlen) { Serial.println("[voice] parity: no length candidate matched crc32"); return; }
+    } else {
+        Serial.println("[voice] parity: last chunk needs the announce - waiting");
+        return;
+    }
+    memcpy(g_vnote.data[m], rec, rlen);
+    g_vnote.clen[m] = rlen;
+    g_vnote.seen_mask |= (uint8_t)(1u << m);
+    g_vnote.unv_mask  &= (uint8_t)~(1u << m);
+    g_vnote.have++;
+    Serial.printf("[voice] parity recovered chunk %d (%uB) - no repair needed\n", m, rlen);
+    if (g_vnote.have >= g_vnote.n) voice_note_completed();
+}
+
 // One 0xC2 frame off the air. Called from lora_service BEFORE any String conversion.
 static void voice_rx_frame(const uint8_t *b, int len)
 {
@@ -3286,7 +3345,7 @@ static void voice_rx_frame(const uint8_t *b, int len)
     uint8_t  seq = b[9], n = b[10], codec = b[11];
     if (src == voice_addr(NODE_ID)) return;                // self echo via a relay
     if (dst != 0xFFFF && dst != voice_addr(NODE_ID)) return;
-    if (n < 1 || n > VOICE_MAX_CHUNKS || seq >= n || codec > 1) return;
+    if (n < 1 || n > VOICE_MAX_CHUNKS || seq > n || codec > 1) return;   // seq == n = parity (v1.14)
 
     if (!g_vnote.active || g_vnote.src != src || g_vnote.vid != vid) {
         if (g_vplay_running) return;             // decoder is READING g_vnote right now —
@@ -3297,13 +3356,23 @@ static void voice_rx_frame(const uint8_t *b, int len)
     }
     if (g_vnote.done) return;                              // idempotent late copies
     g_vnote.dst = dst; g_vnote.n = n; g_vnote.codec = codec;
-    if (!(g_vnote.seen_mask & (1 << seq))) {
+    chan_reserve(millis() + 3 * (uint32_t)(lora_radio.getTimeOnAir(len) / 1000));   // v1.15 renewal
+    if (seq == n) {                                    // v1.14 parity chunk
+        if (!g_vnote.have_par) {
+            memcpy(g_vnote.par, b + VOICE_HDR, plen);
+            g_vnote.par_len = plen;
+            g_vnote.have_par = true;
+            Serial.printf("[voice] parity held (%uB) for %s/%04X\n", plen,
+                          voice_addr_str(src).c_str(), vid);
+        }
+    } else if (!(g_vnote.seen_mask & (1 << seq))) {
         g_vnote.seen_mask |= (1 << seq);
         g_vnote.unv_mask  &= (uint8_t)~(1u << seq);   // verified copy outranks a kept one
         memcpy(g_vnote.data[seq], b + VOICE_HDR, plen);
         g_vnote.clen[seq] = plen;
         g_vnote.have++;
     }
+    voice_try_parity();                                // one missing + parity = no repair
     g_vnote.last_ms = millis();
     g_vnote.toa_ms  = (uint32_t)(lora_radio.getTimeOnAir(len) / 1000);
     g_vnote.vn_due  = 0;                                   // traffic flows; re-schedule
@@ -3442,6 +3511,10 @@ static void voice_handle_va(const String &line)
     // end-of-line would eat the caption into the number (strtoul happens to stop at
     // the tab, but the spec says stop, so stop).
     g_vnote.va_crc32 = unb36(p >= 7 ? line.substring(t[5] + 1, t[6]) : line.substring(t[5] + 1));
+    {   // v1.15: the announce reserves the channel for the stream it precedes
+        uint32_t toa = (uint32_t)(lora_radio.getTimeOnAir(215) / 1000);
+        chan_reserve(millis() + (uint32_t)g_vnote.n * toa * (10 + 13 * g_rx_env_ttl) / 10);
+    }
     g_vnote.caption[0] = 0;
     if (p >= 7) {
         String cap = line.substring(t[6] + 1);
@@ -3563,6 +3636,36 @@ static void voice_tx_frame(uint8_t seq)
     Serial.printf("[voice] TX chunk %u/%u  %dB  round %u queued\n", seq, g_vtx.n, tot, g_vtx.round);
 }
 
+// v1.14: seq = n carries the XOR of all data chunks, zero-padded to the aligned size.
+// One lost or damaged chunk then costs nothing — no !VN, no slot window, no round trip.
+static void voice_tx_parity()
+{
+    uint8_t csz = voice_tx_chunk(g_vtx.codec);
+    uint8_t f[VOICE_HDR + VOICE_CHUNK_MAX + 2];
+    uint8_t *par = f + VOICE_HDR;
+    memset(par, 0, csz);
+    for (uint8_t sq = 0; sq < g_vtx.n; sq++) {
+        uint16_t off = (uint16_t)sq * csz;
+        uint16_t rem = g_vtx.len - off;
+        uint8_t  pl  = rem > csz ? csz : (uint8_t)rem;
+        for (uint8_t k = 0; k < pl; k++) par[k] ^= g_vtx.data[off + k];
+    }
+    f[0] = VOICE_MAGIC;
+    f[1] = 0x10 | (g_vtx.round & 0x0F);
+    f[2] = g_vtx.ttl;
+    uint16_t src = voice_addr(NODE_ID);
+    f[3] = src & 0xFF;        f[4] = src >> 8;
+    f[5] = g_vtx.dst & 0xFF;  f[6] = g_vtx.dst >> 8;
+    f[7] = g_vtx.vid & 0xFF;  f[8] = g_vtx.vid >> 8;
+    f[9] = g_vtx.n; f[10] = g_vtx.n; f[11] = g_vtx.codec; f[12] = csz;
+    uint16_t c = crc16_ccitt_ttl0(f, VOICE_HDR + csz);
+    f[VOICE_HDR + csz] = c >> 8; f[VOICE_HDR + csz + 1] = c & 0xFF;
+    int tot = VOICE_HDR + csz + 2;
+    uint32_t toa = (uint32_t)(lora_radio.getTimeOnAir(tot) / 1000);
+    lora_tx_enqueue(f, (size_t)tot, (uint16_t)(toa * 13 / 10));
+    Serial.printf("[voice] TX parity seq=%u  %dB queued\n", g_vtx.n, tot);
+}
+
 static void voice_send_note(const uint8_t *data, uint16_t len, uint8_t codec,
                             uint16_t dst, uint8_t ttl, bool force = false,
                             const char *caption = NULL)
@@ -3601,6 +3704,7 @@ static void voice_send_note(const uint8_t *data, uint16_t len, uint8_t codec,
     }
     lora_tx_ttl(va + "\n", RELAY_TTL_MESH);      // the announce floods even where chunks cannot
     for (uint8_t s = 0; s < g_vtx.n; s++) voice_tx_frame(s);
+    if (g_vtx.n >= 2) voice_tx_parity();     // v1.14; n=1 would be a 100% duplicate
     // v1.13 caption repair path (E00's PR review): the caption rides ONLY the announce,
     // and the announce's whole argument is reaching nodes the audio cannot — so it must
     // not hang on a single frame. Repeat it once after the chunks (fresh envelope pktid
@@ -3917,10 +4021,17 @@ static void voice_tick()
             Serial.println("[voice] loopback skipped: a real note is assembling");
         } else {
             uint16_t src = voice_addr("E00"), dst = voice_addr(NODE_ID);
-            uint32_t crc = crc32_bytes(VOICE_TEST_CLIP, VOICE_TEST_CLIP_LEN);
+            // v1.14 parity walk: a 396 B two-chunk note (clip + 49 frames of it again),
+            // the LAST chunk deliberately never sent — reconstruction must XOR it back
+            // AND find its 196 B length by crc32 trial, the exact path the spec fix is
+            // for (196 is not a multiple of 5 frames; dur_ds would have lied).
+            static uint8_t lb[396];
+            memcpy(lb, VOICE_TEST_CLIP, 200);
+            memcpy(lb + 200, VOICE_TEST_CLIP, 196);
+            uint32_t crc = crc32_bytes(lb, sizeof(lb));
             uint16_t vid = (uint16_t)(crc & 0xFFFF);
-            Serial.printf("[voice] loopback inject: E00->%s vid=%04X 700C %uB\n",
-                          NODE_ID, vid, (unsigned)VOICE_TEST_CLIP_LEN);
+            Serial.printf("[voice] loopback inject: E00->%s vid=%04X 700C %uB 2ch, LAST CHUNK WITHHELD\n",
+                          NODE_ID, vid, (unsigned)sizeof(lb));
             // A repeat press re-injects the SAME (src, vid): on air that is a late
             // duplicate and idempotency rightly swallows it. This is a test button —
             // forget the previous note so every press plays.
@@ -3930,20 +4041,26 @@ static void voice_tick()
             // the loopback should walk the ordering nobody designs for.
             voice_handle_vt("!VT\t" + b36(src) + "\t" + b36(vid) + "\t0\t2\t지금 즉시 대피하십시오. ");
             voice_handle_vt("!VT\t" + b36(src) + "\t" + b36(vid) + "\t1\t2\t가까운 대피소로 이동하십시오.");
-            voice_handle_va("!VA\t" + b36(src) + "\t" + b36(vid) + "\t1\t1\t" +
-                            b36((VOICE_TEST_CLIP_LEN / 4) * 4 / 10) + "\t" + b36(crc) +
+            voice_handle_va("!VA\t" + b36(src) + "\t" + b36(vid) + "\t2\t1\t" +
+                            b36((sizeof(lb) / 4) * 4 / 10) + "\t" + b36(crc) +
                             "\t대피 안내 시험 방송");   // v1.13 caption, exercised end to end
-            uint8_t f[VOICE_HDR + VOICE_CHUNK_MAX + 2];
-            f[0] = VOICE_MAGIC; f[1] = 0x10; f[2] = 1;
-            f[3] = src & 0xFF; f[4] = src >> 8;
-            f[5] = dst & 0xFF; f[6] = dst >> 8;
-            f[7] = vid & 0xFF; f[8] = vid >> 8;
-            f[9] = 0; f[10] = 1; f[11] = 1; f[12] = (uint8_t)VOICE_TEST_CLIP_LEN;
-            memcpy(f + VOICE_HDR, VOICE_TEST_CLIP, VOICE_TEST_CLIP_LEN);
-            uint16_t c = crc16_ccitt_ttl0(f, VOICE_HDR + VOICE_TEST_CLIP_LEN);
-            f[VOICE_HDR + VOICE_TEST_CLIP_LEN]     = c >> 8;           // BE, per §4.2
-            f[VOICE_HDR + VOICE_TEST_CLIP_LEN + 1] = c & 0xFF;
-            voice_rx_frame(f, VOICE_HDR + VOICE_TEST_CLIP_LEN + 2);
+            auto lb_frame = [&](uint8_t seq, const uint8_t *pay, uint8_t pl) {
+                uint8_t f[VOICE_HDR + VOICE_CHUNK_MAX + 2];
+                f[0] = VOICE_MAGIC; f[1] = 0x10; f[2] = 1;
+                f[3] = src & 0xFF; f[4] = src >> 8;
+                f[5] = dst & 0xFF; f[6] = dst >> 8;
+                f[7] = vid & 0xFF; f[8] = vid >> 8;
+                f[9] = seq; f[10] = 2; f[11] = 1; f[12] = pl;
+                memcpy(f + VOICE_HDR, pay, pl);
+                uint16_t c = crc16_ccitt_ttl0(f, VOICE_HDR + pl);
+                f[VOICE_HDR + pl]     = c >> 8;                        // BE, per §4.2
+                f[VOICE_HDR + pl + 1] = c & 0xFF;
+                voice_rx_frame(f, VOICE_HDR + pl + 2);
+            };
+            lb_frame(0, lb, 200);                    // data chunk 0
+            uint8_t par[200];
+            for (int k = 0; k < 200; k++) par[k] = lb[k] ^ (k < 196 ? lb[200 + k] : 0);
+            lb_frame(2, par, 200);                   // parity (seq == n); chunk 1 never sent
             g_vrx_loopback = false;
         }
     }
@@ -4256,6 +4373,11 @@ static void lora_rx_dispatch(const String &line)
         neigh_update(src, nm, g_lora_rx_rssi, hops);
         g_rx_ok++;
         rx_snr_good(g_rx_snr_last);              // parsed = admissible baseline sample
+        // v1.15 streams-reserve/beacons-yield: grants open a reservation, chunks renew it
+        if (orig.startsWith("!GR\t") || orig.startsWith("!BR\t"))
+            chan_reserve(millis() + 15000);
+        else if (orig.startsWith("!GD\t") || orig.startsWith("!BD\t"))
+            chan_reserve(millis() + 3 * (uint32_t)(lora_radio.getTimeOnAir(g_rx_pkt_len) / 1000));
         // Envelope context for the L1 handlers: v1.11 scopes (rev, seq) per src, and
         // !RB derives the router id from here. Anything heard from the home router
         // also clears the unanswered-pull counter — it is demonstrably alive.
@@ -4371,6 +4493,10 @@ static void lora_hb_tick()
     if (!g_lora_ok || g_range_active) return;
     if (g_crexp) return;   // the CR experiment's block boundary IS 30 s of our silence —
                            // a beacon landing inside that window erases the label
+    // v1.15: yield to announced streams — but never defer past one own period. That
+    // cap is the DoS boundary: a forged stream of announces must not silence beacons.
+    if ((int32_t)(millis() - g_chan_resv) < 0 &&
+        (uint32_t)(millis() - g_hb_last) < 120000) return;
     uint32_t now = millis();
     if (now < 15000) return;                                  // let the radio settle first
     if (g_hb_last && (uint32_t)(now - g_hb_last) < 60000) return;
