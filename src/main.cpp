@@ -123,6 +123,90 @@ static uint32_t g_rx_ok = 0, g_rx_bad = 0, g_rx_corrupt = 0, g_rx_noise = 0;
 static float   g_snr_good[16];
 static uint8_t g_snr_good_n = 0, g_snr_good_i = 0;
 static int     g_rx_pkt_len = 0;   // radio-reported length of the packet being dispatched
+
+// --- SD RX logger (E00 measurement infra, 2026-08-24) -------------------------------
+// One line per event into /logs/rx-*.log: what THIS node heard (and sent), timestamped
+// and machine-readable, so an unattended T-Deck on another floor is still a measuring
+// instrument. Producers append into a PSRAM buffer from loop context only; the SD
+// write happens in rxlog_tick on a >=2 s / >=4 KB policy — an SD write blocks tens of
+// ms and must never sit between a chunk's DIO1 and its readData. Format:
+//   millis event len rssi snr detail
+// events: rx (text line, first 40 chars; CORRUPT+hex for unparseable), chunk
+// (vid seq/n round crc=ok|bad, P= marks parity), noise (SNR-gated false locks),
+// note (vid ok|parity|partial k/n), tx (our own transmissions, HB included).
+static bool     g_rxlog_on = true;          // Settings/NVS "rxlog"
+static File     g_rxlog_f;
+static bool     g_rxlog_open = false, g_rxlog_failed = false;
+static char    *g_rxlog_buf = NULL;
+static uint32_t g_rxlog_n = 0, g_rxlog_flush_ms = 0, g_rxlog_drop = 0;
+static uint8_t  g_rxlog_mirror = 0;         // first lines also to Serial: format sample
+#define RXLOG_BUF 16384
+static bool sd_init();
+
+static void rxlog_line(const char *ev, int len, int rssi, float snr, const char *detail)
+{
+    if (!g_rxlog_on || g_rxlog_failed) return;
+    if (!g_rxlog_buf) {
+        g_rxlog_buf = (char *)heap_caps_malloc(RXLOG_BUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!g_rxlog_buf) { g_rxlog_failed = true; return; }
+    }
+    char ln[176];
+    int m = snprintf(ln, sizeof(ln), "%lu %s %d %d %.1f %s\n",
+                     (unsigned long)millis(), ev, len, rssi, snr, detail);
+    if (m <= 0) return;
+    if ((uint32_t)m >= sizeof(ln)) m = sizeof(ln) - 1;
+    if ((uint32_t)m > RXLOG_BUF - g_rxlog_n) { g_rxlog_drop++; return; }   // never block
+    memcpy(g_rxlog_buf + g_rxlog_n, ln, m);
+    g_rxlog_n += (uint32_t)m;
+    if (g_rxlog_mirror < 12) { Serial.printf("[rxlog>] %s", ln); g_rxlog_mirror++; }
+}
+
+static void rxlog_open_file()
+{
+    if (g_rxlog_open || g_rxlog_failed) return;
+    if (!sd_init()) { g_rxlog_failed = true; Serial.println("[rxlog] no SD - logging off"); return; }
+    if (!SD.exists("/logs")) SD.mkdir("/logs");
+    char path[48], rtc[36] = "none";
+    struct tm ti;
+    if (getLocalTime(&ti, 10) && ti.tm_year > 120) {   // a real wall clock (NTP or GPS)
+        snprintf(path, sizeof(path), "/logs/rx-%04d%02d%02d-%02d%02d%02d.log",
+                 ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday, ti.tm_hour, ti.tm_min, ti.tm_sec);
+        strftime(rtc, sizeof(rtc), "%Y-%m-%dT%H:%M:%S+09:00", &ti);
+    } else {                                            // boot counter fallback (NVS)
+        Preferences p; p.begin("tdeckos", false);
+        uint16_t bn = (uint16_t)(p.getUShort("rxlogn", 0) + 1);
+        p.putUShort("rxlogn", bn); p.end();
+        snprintf(path, sizeof(path), "/logs/rx-boot%04u.log", bn);
+    }
+    g_rxlog_f = SD.open(path, FILE_APPEND);
+    if (!g_rxlog_f) { g_rxlog_failed = true; Serial.println("[rxlog] open failed - logging off"); return; }
+    g_rxlog_open = true;
+    char hdr[96];
+    snprintf(hdr, sizeof(hdr), "# boot millis=%lu rtc=%s node=%s\n",
+             (unsigned long)millis(), rtc, NODE_ID);
+    g_rxlog_f.print(hdr);
+    g_rxlog_f.flush();
+    Serial.printf("[rxlog] logging to %s\n", path);
+}
+
+static void rxlog_tick()
+{
+    if (!g_rxlog_on || g_rxlog_failed || !g_rxlog_n) return;
+    uint32_t now = millis();
+    if (g_rxlog_n < 4096 && (uint32_t)(now - g_rxlog_flush_ms) < 2000) return;
+    rxlog_open_file();
+    if (!g_rxlog_open) { g_rxlog_n = 0; return; }
+    g_rxlog_f.write((const uint8_t *)g_rxlog_buf, g_rxlog_n);
+    if (g_rxlog_drop) {
+        char d[48];
+        snprintf(d, sizeof(d), "# dropped %lu lines\n", (unsigned long)g_rxlog_drop);
+        g_rxlog_f.print(d);
+        g_rxlog_drop = 0;
+    }
+    g_rxlog_f.flush();                       // survive a battery pull mid-measurement
+    g_rxlog_n = 0;
+    g_rxlog_flush_ms = now;
+}
 static void rx_snr_good(float snr)
 {
     g_snr_good[g_snr_good_i] = snr;
@@ -1567,6 +1651,21 @@ static void lora_tx_pump()
         Serial.printf("[crexp] TX coding rate now 4/%u\n", g_tx_cr);
     }
     TxJob &j = g_txq[g_txq_head];
+    if (g_rxlog_on) {                        // half-duplex deaf windows, for the overlay
+        char d[48];
+        if (j.buf[0] == 0xC2 && j.len >= 13)     // VOICE_MAGIC (defined later in the file)
+            snprintf(d, sizeof(d), "C2 vid=%04X %u/%u",
+                     (unsigned)((uint16_t)j.buf[7] | (uint16_t)j.buf[8] << 8), j.buf[9], j.buf[10]);
+        else {
+            int dn = 0;
+            for (int i = 0; i < (int)j.len && dn < 24; i++) {
+                char ch = (char)j.buf[i];
+                d[dn++] = (ch == '\t') ? '|' : ((uint8_t)ch < 0x20 ? '.' : ch);
+            }
+            d[dn] = 0;
+        }
+        rxlog_line("tx", j.len, 0, 0.0f, d);
+    }
     g_tx_gap_pending = j.gap_ms;
     g_tx_inflight = true;
     int st = lora_radio.startTransmit(j.buf, j.len);
@@ -2826,6 +2925,7 @@ static String voice_addr_str(uint16_t a)      // reversible by construction
 struct VoiceNote {
     bool     active, done, partial, ranged_out;
     bool     played;                    // audio already played once (unverified early cut)
+    bool     par_used;                  // v1.14: at least one chunk came back via parity
     uint16_t src, dst, vid;
     uint8_t  n, codec;                  // n=0 until first chunk or !VA
     uint8_t  have, seen_mask;
@@ -3223,6 +3323,10 @@ static void voice_note_completed()
     }
     float secs = g_vnote.codec == 1 ? total / 4 * 0.04f : total / 6 * 0.04f;
     String who = voice_addr_str(g_vnote.src);
+    { char d[48];
+      snprintf(d, sizeof(d), "vid=%04X %s %u/%u", g_vnote.vid,
+               g_vnote.par_used ? "parity" : "ok", g_vnote.n, g_vnote.n);
+      rxlog_line("note", (int)total, g_rx_rssi_last, g_rx_snr_last, d); }
     Serial.printf("[voice] note %s/%04X complete: %u B, %.1f s, codec %u%s\n",
                   who.c_str(), g_vnote.vid, (unsigned)total, secs, g_vnote.codec,
                   verified ? "" : " (announce crc mismatch - unverified)");
@@ -3284,6 +3388,7 @@ static void voice_try_parity()
     g_vnote.seen_mask |= (uint8_t)(1u << m);
     g_vnote.unv_mask  &= (uint8_t)~(1u << m);
     g_vnote.have++;
+    g_vnote.par_used = true;
     Serial.printf("[voice] parity recovered chunk %d (%uB) - no repair needed\n", m, rlen);
     if (g_vnote.have >= g_vnote.n) voice_note_completed();
 }
@@ -3299,8 +3404,16 @@ static void voice_rx_frame(const uint8_t *b, int len)
     if (plen > VOICE_CHUNK_MAX || VOICE_HDR + plen + 2 != len) { g_rx_corrupt++; return; }
     uint16_t crc = (uint16_t)b[VOICE_HDR + plen] << 8 | b[VOICE_HDR + plen + 1];   // BE on the wire
     if (crc16_ccitt_ttl0(b, VOICE_HDR + plen) != crc) {
-        if (rx_is_noise(g_rx_snr_last)) { g_rx_noise++; return; }   // false lock, not a frame
+        if (rx_is_noise(g_rx_snr_last)) {
+            g_rx_noise++;
+            rxlog_line("noise", len, g_rx_rssi_last, g_rx_snr_last, "voice");
+            return;                                                  // false lock, not a frame
+        }
         g_rx_corrupt++;
+        { char d[56];   // header fields are CLAIMED (the failed crc covered them too)
+          snprintf(d, sizeof(d), "vid=%04X %u/%u r%u crc=bad",
+                   (unsigned)((uint16_t)b[7] | (uint16_t)b[8] << 8), b[9], b[10], b[1] & 0x0F);
+          rxlog_line("chunk", len, g_rx_rssi_last, g_rx_snr_last, d); }
         // §5.2 (E00 proposal, agreed): keep the bytes as UNVERIFIED — a failed CRC is
         // usually a short burst inside 2 s of audio, and 80 ms of artifact beats a 2 s
         // hole. The failed CRC covered the header too, so nothing here may START or
@@ -3359,6 +3472,10 @@ static void voice_rx_frame(const uint8_t *b, int len)
     if (g_vnote.done) return;                              // idempotent late copies
     g_vnote.dst = dst; g_vnote.n = n; g_vnote.codec = codec;
     chan_reserve(millis() + 3 * (uint32_t)(lora_radio.getTimeOnAir(len) / 1000));   // v1.15 renewal
+    { char d[56];
+      snprintf(d, sizeof(d), "vid=%04X %s%u/%u r%u crc=ok",
+               vid, seq == n ? "P=" : "", seq, n, b[1] & 0x0F);
+      rxlog_line("chunk", len, g_rx_rssi_last, g_rx_snr_last, d); }
     if (seq == n) {                                    // v1.14 parity chunk
         if (!g_vnote.have_par) {
             memcpy(g_vnote.par, b + VOICE_HDR, plen);
@@ -4181,6 +4298,9 @@ static void voice_tick()
             g_vnote.done = true; g_vnote.partial = true;
             Serial.printf("[voice] giving up at %u/%u (unv mask %02X) - marked partial\n",
                           g_vnote.have, g_vnote.n, g_vnote.unv_mask);
+            { char d[48];
+              snprintf(d, sizeof(d), "vid=%04X partial %u/%u", g_vnote.vid, g_vnote.have, g_vnote.n);
+              rxlog_line("note", 0, g_rx_rssi_last, g_rx_snr_last, d); }
             lora_log_print("< ", "[음성] 일부만 수신 (" + String(g_vnote.have) + "/" +
                                  String(g_vnote.n) + ")");
             {
@@ -4401,6 +4521,16 @@ static void lora_rx_dispatch(const String &line)
             chan_reserve(millis() + 15000);
         else if (orig.startsWith("!GD\t") || orig.startsWith("!BD\t"))
             chan_reserve(millis() + 3 * (uint32_t)(lora_radio.getTimeOnAir(g_rx_pkt_len) / 1000));
+        if (g_rxlog_on) {
+            char d[48];
+            int  dn = 0;
+            for (int i = 0; i < (int)orig.length() && dn < 40; i++) {
+                char ch = orig[i];
+                d[dn++] = (ch == '\t') ? '|' : ((uint8_t)ch < 0x20 ? '.' : ch);
+            }
+            d[dn] = 0;
+            rxlog_line("rx", g_rx_pkt_len, g_rx_rssi_last, g_rx_snr_last, d);
+        }
         // Envelope context for the L1 handlers: v1.11 scopes (rev, seq) per src, and
         // !RB derives the router id from here. Anything heard from the home router
         // also clears the unanswered-pull counter — it is demonstrably alive.
@@ -4416,6 +4546,7 @@ static void lora_rx_dispatch(const String &line)
     // wrapped now) → DROP, so a mangled relayed copy can't pollute/break the frame.
     if (rx_is_noise(g_rx_snr_last)) {            // a false lock is not a damaged frame
         g_rx_noise++;
+        rxlog_line("noise", g_rx_pkt_len, g_rx_rssi_last, g_rx_snr_last, "textplane");
         Serial.printf("[rx] noise (false lock) %d dBm %.1f dB, %dB\n",
                       g_rx_rssi_last, g_rx_snr_last, line.length());
         return;
@@ -4435,6 +4566,8 @@ static void lora_rx_dispatch(const String &line)
     Serial.printf("[rx] corrupt %dB (pkt %dB) %d dBm %.1f dB printable %d/%d hex %s : %.32s\n",
                   line.length(), g_rx_pkt_len, g_rx_rssi_last, g_rx_snr_last,
                   printable, n, hx, line.c_str());
+    { char d[56]; snprintf(d, sizeof(d), "CORRUPT %.32s", hx);
+      rxlog_line("rx", g_rx_pkt_len, g_rx_rssi_last, g_rx_snr_last, d); }
 }
 
 static int lora_init()
@@ -5327,6 +5460,19 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lv_label_set_text(vb8l, LV_SYMBOL_UPLOAD " 검증 버스트 x20 (8초+패리티, ~6분)");
         lv_obj_add_event_cb(vb8, [](lv_event_t *) { if (!g_vburst8) g_vburst8 = 20; }, LV_EVENT_CLICKED, NULL);
         lv_group_add_obj(g, vb8);
+
+        // Unattended-measurement logging (E00 infra): every RX/TX event to SD.
+        lv_obj_t *rlb  = lv_btn_create(parent);
+        lv_obj_t *rlbl = lv_label_create(rlb);
+        lv_obj_set_style_text_font(rlbl, &font_kr16, 0);
+        lv_label_set_text_fmt(rlbl, LV_SYMBOL_SD_CARD " SD 수신 로깅: %s", g_rxlog_on ? "켬" : "끔");
+        lv_obj_add_event_cb(rlb, [](lv_event_t *e) {
+            g_rxlog_on = !g_rxlog_on;
+            Preferences p; p.begin("tdeckos", false); p.putBool("rxlog", g_rxlog_on); p.end();
+            lv_label_set_text_fmt(lv_obj_get_child(lv_event_get_target(e), 0),
+                                  LV_SYMBOL_SD_CARD " SD 수신 로깅: %s", g_rxlog_on ? "켬" : "끔");
+        }, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, rlb);
 
         // Receive-path proof with no peer TX in existence: inject the golden 700C note
         // as if E00 sent it — assembly, playback and the decode-RTF measurement.
@@ -6252,6 +6398,7 @@ static void boot_restore()
     g_voice_vol = p.getUChar("vvol", 6);
     g_voice_codec = p.getUChar("vcodec", 1) ? 1 : 0;
     g_voice_fx    = p.getBool("vfx", true);
+    g_rxlog_on    = p.getBool("rxlog", true);
     g_beep_vol  = p.getUChar("beepvol", 7);
     g_gps_enabled = p.getBool("gpsen", true);
     g_tts_enabled = p.getBool("tts", true);
@@ -6735,6 +6882,7 @@ void loop()
     PF_RUN(3, lora_hb_tick());   // 60 s beacon, ttl 1, never on top of an arriving stream
     PF_RUN(4, news_tick());      // deferred announce (chime + speech + hijack), repair, expiry
 #undef PF_RUN
+    rxlog_tick();                // buffered SD flush, >=2 s cadence, never mid-RX-critical
     uint32_t it_us = (uint32_t)(micros() - it0);
     pf_last_end = it0 + it_us;
 
