@@ -3268,13 +3268,15 @@ static void voice_try_parity()
         if (!jb) return;
         size_t base = 0;
         for (int i = 0; i < g_vnote.n - 1; i++) { memcpy(jb + base, g_vnote.data[i], g_vnote.clen[i]); base += g_vnote.clen[i]; }
-        for (int k = 1; k * bpf <= csz; k++) {
-            memcpy(jb + base, rec, (size_t)k * bpf);
+        for (int k = csz / bpf; k >= 1; k--) {   // largest first (§4.4a): a shorter
+            memcpy(jb + base, rec, (size_t)k * bpf); // false match would truncate audio
             if (crc32_bytes(jb, base + (size_t)k * bpf) == g_vnote.va_crc32) { rlen = (uint8_t)(k * bpf); break; }
         }
         if (!rlen) { Serial.println("[voice] parity: no length candidate matched crc32"); return; }
     } else {
         Serial.println("[voice] parity: last chunk needs the announce - waiting");
+        if (g_voice_status) lv_label_set_text(g_voice_status,
+            LV_SYMBOL_WARNING " 마지막 조각 복원 불가 (공지 미수신)");
         return;
     }
     memcpy(g_vnote.data[m], rec, rlen);
@@ -3544,6 +3546,9 @@ static volatile uint8_t g_crexp = 0;         // CR experiment: notes remaining o
                                              // interleaved in ONE sitting per E00's design —
                                              // two identical bursts 6 h apart measured 13.3%
                                              // and 0.0%, so A-then-B across sessions is void)
+static volatile uint8_t g_vburst8 = 0;       // final verification burst: 20 x 8 s notes
+                                             // (4 data chunks + parity at 700C) — the
+                                             // population the 26% -> 56% prediction is about
 static volatile uint8_t g_vtx_burst = 0;     // E00's corruption experiment: N repeats,
                                              // §6 rate limit deliberately bypassed
 static uint32_t      g_vtx_last_ms = 0;      // §6: one note per src per 30 s
@@ -4095,6 +4100,24 @@ static void voice_tick()
                 Serial.println("[crexp] done - 80 notes sent, TX CR restored to 4/6");
                 if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_OK " CR실험 완료 (4/6 복원)");
             }
+        }
+    }
+    if (g_vburst8) {
+        static uint32_t b8_last = 0;
+        static uint8_t *b8_buf = NULL;
+        uint32_t b8now = millis();
+        if ((uint32_t)(b8now - b8_last) > 18000) {   // ~15 s channel per note + margin
+            b8_last = b8now;
+            if (!b8_buf) {
+                b8_buf = (uint8_t *)heap_caps_malloc(800, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (b8_buf) for (int r = 0; r < 4; r++) memcpy(b8_buf + r * 200, VOICE_TEST_CLIP, 200);
+            }
+            if (b8_buf) {
+                uint8_t left = --g_vburst8;
+                Serial.printf("[voice] 8s parity burst: sending, %u left\n", left);
+                voice_send_note(b8_buf, 800, 1, voice_addr("P10"), 1, true);
+                if (g_toast) lv_label_set_text_fmt(g_toast, "검증 버스트 %u회 남음", left);
+            } else g_vburst8 = 0;
         }
     }
     if (g_vtx_burst) {
@@ -5295,6 +5318,15 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lv_label_set_text(vcrl, LV_SYMBOL_CHARGE " CR 실험 x80 (A/B 교차, ~6분)");
         lv_obj_add_event_cb(vcr, [](lv_event_t *) { if (!g_crexp) g_crexp = 80; }, LV_EVENT_CLICKED, NULL);
         lv_group_add_obj(g, vcr);
+
+        // The parity verification burst: twenty 8 s notes (4 chunks + parity), the
+        // population the 26% -> 56% first-try prediction is actually about.
+        lv_obj_t *vb8  = lv_btn_create(parent);
+        lv_obj_t *vb8l = lv_label_create(vb8);
+        lv_obj_set_style_text_font(vb8l, &font_kr16, 0);
+        lv_label_set_text(vb8l, LV_SYMBOL_UPLOAD " 검증 버스트 x20 (8초+패리티, ~6분)");
+        lv_obj_add_event_cb(vb8, [](lv_event_t *) { if (!g_vburst8) g_vburst8 = 20; }, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, vb8);
 
         // Receive-path proof with no peer TX in existence: inject the golden 700C note
         // as if E00 sent it — assembly, playback and the decode-RTF measurement.
