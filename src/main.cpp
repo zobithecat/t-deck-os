@@ -20,7 +20,6 @@
 #include <BLEAdvertisedDevice.h>
 #include <Preferences.h>
 #include <sys/time.h>
-#include <BackgroundAudioSpeech.h>   // eSpeak-NG TTS (see tts_say)
 #include <ESP32I2SAudio.h>           // new IDF5 I2S driver — the board's single audio owner
 extern "C" {
 #include <codec2.h>                  // vendored lib/Codec2 — host-gated against c2dec (1 LSB)
@@ -28,7 +27,6 @@ extern "C" {
 #include <driver/i2s_std.h>          // second I2S port: mic RX, we are clock master
 #include <LittleFS.h>                // voice-note ring on the idle spiffs partition
 }
-#include <libespeak-ng/voice/ko.h>
 #include <esp_sleep.h>               // power save (light sleep)
 #include <esp_task_wdt.h>            // reporter-not-executioner reconfigure at boot
 #include <driver/gpio.h>
@@ -401,8 +399,6 @@ static volatile bool g_sleep_req = false;   // trackball long-press asked for po
 static String        g_ps_report;           // why the last power-save session woke up
 static volatile bool g_msg_arrived = false; // an incoming message landed, app open or not
 static int           g_reset_reason = 0;    // esp_reset_reason() at boot — survives a USB reconnect
-static void tts_say(const String &text, bool urgent = false);   // eSpeak-NG (ko); queued unless urgent
-static bool    g_tts_enabled = true;       // Settings toggle, persisted in NVS ("tts")
 // loudness lives in g_audio_vol (one master control for speech AND tones) — see audio section
 static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g);
 static void kbtest_log_key(uint32_t key);
@@ -1400,45 +1396,24 @@ static void browser_go(lv_event_t *e)
 // can never be loud while speech is quiet. It defaults to 2 (~20%): a fresh NVS
 // must come up quiet.
 //
-// ONE sample rate for the whole device, and it is eSpeak-NG's, measured on
-// hardware (espeak_Initialize returns 22050). Tones are synthesised at that rate
-// too. Re-clocking a *running* i2s_std channel means
-// disable -> reconfig -> enable, and on IDF 5.5 the channel does not come back:
+// ONE sample rate for the whole device. 22050 was eSpeak-NG's synthesis rate; the
+// engine is gone (2026-09-07 — the voice plane and E00's rendered clips replaced it)
+// but the clock stays: re-clocking a *running* i2s_std channel means
+// disable -> reconfig -> enable, and on IDF 5.5 the channel does not come back —
 // every later i2s_channel_write() returns "The channel is not enabled" and the
-// speaker goes dead. Keeping one rate means BackgroundAudioSpeech::begin()'s own
-// setFrequency() call sees _sampleRate == freq and skips the whole dance.
-#define AUDIO_RATE      22050     // eSpeak-NG's synthesis rate; the device runs at it
+// speaker goes dead. Tones and the voice upsampler are all built for this rate.
+#define AUDIO_RATE      22050     // the device's one I2S clock
 #define AUDIO_AMP_MAX   30000     // int16 full scale, with a little headroom
 
 // ESP32I2SAudio::begin() is NOT re-entrant: on a second call it returns false at the
 // first line, skipping the DMA setup, the pump task and i2s_channel_enable(). So the
-// board has exactly ONE begin(), and it is the speech engine's, because only
-// BackgroundAudioSpeech knows eSpeak's rate and frame size.
-//
-// It also picks the DMA geometry. The WIDTH must be left alone -- it asks for buffers
-// one eSpeak frame wide so every DMA boundary lands on a frame boundary, and forcing a
-// different width (we tried 1023 words) makes each buffer end mid-frame, which is
-// audible as ticking. The COUNT is ours to choose: 5 frames is ~26 KB of DMA-capable
-// INTERNAL RAM, and internal RAM is the scarcest thing on this board -- Wi-Fi takes
-// ~49 KB and Bluedroid ~73 KB after us, which left barely 2 KB free and the board
-// reset as soon as light sleep tried to save its state. 3 frames is ~16 KB, still two
-// frames of headroom for the pump, and hands ~10 KB back.
-class TDeckI2S : public ESP32I2SAudio {
-public:
-    using ESP32I2SAudio::ESP32I2SAudio;
-    bool setBuffers(size_t, size_t bufferWords, int32_t silenceSample = 0) override {
-        return ESP32I2SAudio::setBuffers(3, bufferWords, silenceSample);   // keep the width
-    }
-};
-static TDeckI2S              g_i2s(BOARD_I2S_BCK, BOARD_I2S_WS, BOARD_I2S_DOUT);
-static BackgroundAudioSpeech g_tts(g_i2s);   // the single owner: it performs the one begin()
-static bool                  g_tts_ready = false;
-static void                  audio_apply_volume();
-// Speech FIFO: messages are read one after another instead of cutting each other off.
-#define TTS_Q_N 6
-static String                g_tts_q[TTS_Q_N];
-static uint8_t               g_tts_qh = 0, g_tts_qn = 0;
-static uint32_t              g_tts_spoke_ms = 0;
+// board has exactly ONE begin(), in audio_init(). We own it now that the speech engine
+// is gone, which also lets us pick the DMA geometry ourselves: 3 x 512 words = 6 KB of
+// DMA-capable INTERNAL RAM, against the ~16 KB the eSpeak frame-width forced — and
+// internal RAM is the scarcest thing on this board. Every writer (tones, the voice
+// upsampler) feeds 512 B blocks and polls availableForWrite, so 6 KB is plenty.
+#define AUDIO_DMA_WORDS 512
+static ESP32I2SAudio         g_i2s(BOARD_I2S_BCK, BOARD_I2S_WS, BOARD_I2S_DOUT);
 
 // Tone amplitude at the current master volume (0..AUDIO_AMP_MAX).
 static int audio_tone_amp() { return (AUDIO_AMP_MAX / 10) * g_audio_vol; }
@@ -1449,10 +1424,9 @@ static void audio_init()
 {
     if (g_audio_inited) return;
     g_audio_inited = true;               // set first: begin() is slow, don't re-enter
-    g_tts.setVoice(voice_ko);
-    g_tts_ready = g_tts.begin();         // creates the channel, the pump task, enables it
-    if (!g_tts_ready) Serial.println("[audio] speech engine failed to start");
-    audio_apply_volume();                // begin() leaves gain at 1.0 — never full scale
+    g_i2s.setFrequency(AUDIO_RATE);      // BEFORE begin(): it clocks the channel from this
+    g_i2s.setBuffers(3, AUDIO_DMA_WORDS);
+    if (!g_i2s.begin()) Serial.println("[audio] i2s begin failed");   // channel + service task
 }
 
 static void play_tone(int freq, int ms, int amp = -1)   // amp < 0 = the master volume
@@ -1504,55 +1478,9 @@ static void speaker_play_cb(lv_event_t *e)
 
 // Short rising two-tone "ding-dong" for an incoming LoRa message. 0 = mute.
 // Blocks ~210 ms (called from the main loop on message RX) — fine for infrequent msgs.
-// --- Text-to-speech (eSpeak-NG, Korean) --------------------------------------
-// Audio can never cross a ~1 kbps mesh, but text can: a 60-byte !AL line becomes a
-// spoken sentence locally. That is why alerts are text on the wire and speech here.
-//
-// Needs BackgroundAudio, which requires the IDF 5.x I2S API (pioarduino core). The
-// __has_include guard is not a fallback for a missing feature — it keeps the protocol
-// work buildable on either core while the platform migration is verified separately.
-
-// One master volume for everything the device can blurt out. Tones read
-// audio_tone_amp() per call; the speech engine keeps its own gain, so push it.
-static void audio_apply_volume()
-{
-    if (g_tts_ready) g_tts.setGain(g_audio_vol / 10.0f);
-}
-
-static void tts_say(const String &text, bool urgent)   // default lives on the declaration
-{
-    if (!g_tts_enabled || !text.length()) return;
-    audio_init();                        // brings the engine up on first use
-    if (!g_tts_ready) return;
-
-    if (urgent) {                        // an evacuation line does not wait behind a headline
-        g_tts_qn = 0;                    // whatever was queued is now stale
-        g_tts.flush();                   // and cut off what is being read
-        g_tts.speak(text.c_str());
-        g_tts_spoke_ms = millis();
-        Serial.printf("[TTS!] %s\n", text.c_str());
-        return;
-    }
-    if (g_tts_qn >= TTS_Q_N) { Serial.println("[TTS] queue full, dropped"); return; }
-    g_tts_q[(g_tts_qh + g_tts_qn) % TTS_Q_N] = text;   // tts_pump() speaks it when the line is free
-    g_tts_qn++;
-}
-
-// Speak the next queued line once the current one has finished. Without this, a burst
-// of messages each flush()ed the one before it and you heard fragments.
-static void tts_pump()
-{
-    if (!g_tts_ready || !g_tts_qn) return;
-    if ((uint32_t)(millis() - g_tts_spoke_ms) < 250) return;   // let speak() get going first
-    if (!g_tts.done()) return;                                 // still talking
-    String s = g_tts_q[g_tts_qh];
-    g_tts_qh = (g_tts_qh + 1) % TTS_Q_N;
-    g_tts_qn--;
-    g_tts.speak(s.c_str());
-    g_tts_spoke_ms = millis();
-    Serial.printf("[TTS] %s\n", s.c_str());
-}
-
+// (The eSpeak-NG text-to-speech that used to live here is gone: alerts and headlines
+// still chime and take the screen; spoken guidance now arrives as rendered clips over
+// the voice plane, and the ~40 KB of internal RAM the engine held goes to BLE.)
 static void beep_notify()
 {
     if (g_beep_vol == 0) return;
@@ -2294,7 +2222,6 @@ static void news_show_article(const char *art_id, const char *title)
     lv_obj_t *rd = lv_btn_create(row);                       // read the body aloud
     lv_label_set_text(lv_label_create(rd), LV_SYMBOL_AUDIO " Read");
     lv_obj_add_event_cb(rd, [](lv_event_t *) {
-        if (g_art_body) tts_say(lv_label_get_text(g_art_body));
     }, LV_EVENT_CLICKED, NULL);
     lv_group_add_obj(g, rd);
     lv_group_focus_obj(lst);
@@ -5509,20 +5436,8 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         }, LV_EVENT_VALUE_CHANGED, NULL);
         lv_group_add_obj(g, gsw);
 
-        lv_obj_t *tlbl2 = lv_label_create(parent);
-        lv_label_set_text(tlbl2, "Speech   (read alerts + headlines aloud)");
-        lv_obj_set_style_text_color(tlbl2, lv_color_white(), 0);
-        lv_obj_t *tsw = lv_switch_create(parent);
-        if (g_tts_enabled) lv_obj_add_state(tsw, LV_STATE_CHECKED);
-        lv_obj_add_event_cb(tsw, [](lv_event_t *e) {
-            g_tts_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
-            Preferences pr; pr.begin("tdeckos", false); pr.putBool("tts", g_tts_enabled); pr.end();
-            if (g_tts_enabled) tts_say("음성 안내");
-        }, LV_EVENT_VALUE_CHANGED, NULL);
-        lv_group_add_obj(g, tsw);
-
         lv_obj_t *vlbl = lv_label_create(parent);
-        lv_label_set_text(vlbl, "Volume   (speech + chime, 0 = mute)");
+        lv_label_set_text(vlbl, "Volume   (chime + tones, 0 = mute)");
         lv_obj_set_style_text_color(vlbl, lv_color_white(), 0);
         lv_obj_t *vslider = lv_slider_create(parent);
         lv_obj_set_width(vslider, 260);
@@ -5531,11 +5446,9 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lv_obj_add_event_cb(vslider, [](lv_event_t *e) {       // save on each step
             g_audio_vol = (uint8_t)lv_slider_get_value(lv_event_get_target(e));
             Preferences p; p.begin("tdeckos", false); p.putUChar("ttsvol", g_audio_vol); p.end();
-            audio_apply_volume();
         }, LV_EVENT_VALUE_CHANGED, NULL);
         lv_obj_add_event_cb(vslider, [](lv_event_t *e) {       // preview the new level
-            if (g_tts_enabled) tts_say("음성 안내", true);      // preview now, not after the queue
-            else               play_tone(1000, 120);           // speech off: a tick still lands
+            play_tone(1000, 120);
         }, LV_EVENT_RELEASED, NULL);
         lv_group_add_obj(g, vslider);
     } else if (strcmp(name, "Wi-Fi") == 0) {
@@ -6203,7 +6116,6 @@ static void alert_list_render()
 static void news_tick()
 {
     uint32_t now = millis();
-    tts_pump();                     // keep the speech queue moving, one line at a time
     book_tick();                    // page repair, on the quiet-gap + slot schedule
     router_tick();                  // home-loss watchdog (§5: 3 silent beacons / 2 dead pulls)
     voice_tick();                   // note repair + "out of voice range" surfacing
@@ -6238,7 +6150,6 @@ static void news_tick()
         if (!g_alert_list) { if (g_app_view) go_home(); open_app("Alert"); }
         if (now >= 15000) {                  // the quiet start applies here too
             beep_alert(g_alert_sev);
-            tts_say(g_alert_say, true);
         }
     }
     if (g_alert_show_req) {         // built here, never from the RX path
@@ -6253,7 +6164,6 @@ static void news_tick()
         g_alert_clear_req = false;
         alert_close();
         beep_clear();
-        tts_say("상황 해제", true);
     }
 
     // !GA says how many headlines the revision has, and a flood without acknowledgement
@@ -6288,7 +6198,7 @@ static void news_tick()
     if (now < 15000) { if (g_news_list) news_show_list(); g_news_speak = ""; return; }
 
     beep_notify();                               // headlines only; alerts have their own path
-    if (g_news_speak.length()) { tts_say(g_news_speak); g_news_speak = ""; }
+    g_news_speak = "";                    // spoken headlines retired with eSpeak
 
     bool in_news = g_app_view && g_title && !strcmp(lv_label_get_text(g_title), "News");
     if (!in_news) {                       // pull the user in from wherever they are
@@ -6401,7 +6311,6 @@ static void boot_restore()
     g_rxlog_on    = p.getBool("rxlog", true);
     g_beep_vol  = p.getUChar("beepvol", 7);
     g_gps_enabled = p.getBool("gpsen", true);
-    g_tts_enabled = p.getBool("tts", true);
     book_load();
     g_audio_vol   = p.getUChar("ttsvol", 2);   // fresh NVS must come up QUIET, not full scale
     if (g_audio_vol > 10) g_audio_vol = 10;
@@ -6582,7 +6491,6 @@ void setup()
 }
 
 #ifdef TDECK_SELFTEST
-extern "C" int samplerate;   // eSpeak-NG's synthesis rate (libespeak-ng/synthesize.h)
 // TEMPORARY hardware self-test console (build with -DTDECK_SELFTEST). Not for main.
 static void selftest_console()
 {
@@ -6605,8 +6513,8 @@ static void selftest_console()
                       (int)lv_obj_get_child_cnt(lv_scr_act()),
                       (unsigned long)ESP.getFreeHeap(),
                       (unsigned long)ESP.getFreePsram());
-        Serial.printf("[ST] tts_enabled=%d tts_ready=%d audio_inited=%d\n",
-                      (int)g_tts_enabled, (int)g_tts_ready, (int)g_audio_inited);
+        Serial.printf("[ST] audio_inited=%d
+", (int)g_audio_inited);
         break;
     }
     case 'r':   // force a full repaint through the real LVGL -> TFT path
@@ -6632,18 +6540,6 @@ static void selftest_console()
         Serial.println("[ST] tone 1 kHz 250 ms (quiet)");
         play_tone(1000, 250, 2500);   // bench volume - the user is sitting next to it
         Serial.println("[ST] tone done");
-        break;
-    case 's': {
-        Serial.println("[ST] speak ko");
-        st_heap("before speak");
-        tts_say("안녕하세요. 티덱 오에스 한국어 음성 시험입니다.");
-        st_heap("after speak");
-        Serial.printf("[ST] espeak samplerate=%d\n", samplerate);
-        break;
-    }
-    case 'S':
-        Serial.println("[ST] speak ko (settings phrase)");
-        tts_say("음성 안내를 켰습니다");
         break;
     case 'p':   // dump the power-save log (RAM copy + the card)
         Serial.printf("[PS] last reset reason=%d (4=panic 5=INT_WDT 6=TASK_WDT 9=brownout 11=USB)\n", g_reset_reason);
@@ -6691,12 +6587,8 @@ static void selftest_console()
         break;
     }
     case 'a':
-        // NB g_tts.frames() is dead in the library (declared, never incremented);
         // g_i2s.frames() counts DMA blocks actually clocked out to the amp.
-        Serial.printf("[ST] tts playing=%d done=%d shifts=%lu avail=%u under=%lu err=%lu | i2s frames=%lu afw=%d under=%lu\n",
-                      (int)g_tts.playing(), (int)g_tts.done(),
-                      (unsigned long)g_tts.shifts(), (unsigned)g_tts.available(),
-                      (unsigned long)g_tts.underflows(), (unsigned long)g_tts.errors(),
+        Serial.printf("[ST] i2s frames=%lu afw=%d under=%lu\n",
                       (unsigned long)g_i2s.frames(), (int)g_i2s.availableForWrite(),
                       (unsigned long)g_i2s.underflows());
         Serial.printf("[ST] i2s irqs=%lu running=%d\n",

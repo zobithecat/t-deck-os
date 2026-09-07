@@ -18,3 +18,6 @@
 .omc/
 
 # NOTE: boards/ and lib/ are intentionally committed (vendored deps needed to build).
+
+# pioarduino component-manager backup, regenerated every build
+src/idf_component.yml.orig
