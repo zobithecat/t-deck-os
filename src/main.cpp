@@ -18,6 +18,9 @@
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include <BLEServer.h>               // BLE gateway: T-Deck as GATT peripheral (docs/BLE_GATEWAY.md)
+#include <BLEUtils.h>
+#include <BLESecurity.h>
 #include <Preferences.h>
 #include <sys/time.h>
 #include <ESP32I2SAudio.h>           // new IDF5 I2S driver — the board's single audio owner
@@ -140,6 +143,8 @@ static uint32_t g_rxlog_n = 0, g_rxlog_flush_ms = 0, g_rxlog_drop = 0;
 static uint8_t  g_rxlog_mirror = 0;         // first lines also to Serial: format sample
 #define RXLOG_BUF 16384
 static bool sd_init();
+static void gw_push_rx(const String &line);   // BLE gateway hooks (defined with the module)
+static void gw_push_note();
 
 static void rxlog_line(const char *ev, int len, int rssi, float snr, const char *detail)
 {
@@ -3254,6 +3259,7 @@ static void voice_note_completed()
       snprintf(d, sizeof(d), "vid=%04X %s %u/%u", g_vnote.vid,
                g_vnote.par_used ? "parity" : "ok", g_vnote.n, g_vnote.n);
       rxlog_line("note", (int)total, g_rx_rssi_last, g_rx_snr_last, d); }
+    gw_push_note();                        // assembled here, decoded on the phone
     Serial.printf("[voice] note %s/%04X complete: %u B, %.1f s, codec %u%s\n",
                   who.c_str(), g_vnote.vid, (unsigned)total, secs, g_vnote.codec,
                   verified ? "" : " (announce crc mismatch - unverified)");
@@ -3977,6 +3983,218 @@ static void ptt_task(void *)
     vTaskSuspend(NULL);                         // parked; the loop deletes a SUSPENDED task
 }
 
+
+// --- BLE gateway: the phone is a UI tethered to this node (docs/BLE_GATEWAY.md) ----------
+// T-Deck = GATT peripheral, iPhone app = central. The LoRa protocol does not change: the
+// phone speaks with THIS node's identity and through THIS node's policies. Text lines pass
+// through verbatim (one line = one notification); voice notes are pushed only once the
+// node has assembled, repaired and parity-recovered them.
+//
+// Threading: NimBLE callbacks run on the host task. They touch nothing but volatile flags
+// and a one-slot inbox; the loop tick does every LVGL call and every radio send (the TX
+// queue stays single-producer). Trust boundary: bonding with a displayed passkey is
+// FORCED on every connection; the phone may write chat text only — system lines ('!')
+// and envelopes ('R|') are refused, the 60 B budget is cut on a character boundary.
+#define GW_UUID(n) "7e4c000" n "-0000-4c6f-5261-54446b4f5300"
+static bool              g_gw_on = false;     // Settings/NVS "blegw"
+static bool              g_gw_up = false;
+static volatile bool     g_gw_conn = false, g_gw_show_pk = false, g_gw_hide_pk = false;
+static volatile uint16_t g_gw_mtu = 23;
+static BLEServer        *g_gw_srv = NULL;
+static BLECharacteristic *g_gw_rx = NULL, *g_gw_tx = NULL, *g_gw_st = NULL, *g_gw_note = NULL, *g_gw_ctl = NULL;
+static volatile uint8_t  g_gw_in_len = 0;     // inbox: host task writes bytes then len; loop clears len
+static char              g_gw_in[128];
+struct GwMsg { uint8_t kind, len; uint8_t b[200]; };   // kind 1 = rx line, 2 = note chunk
+#define GW_Q_N 32
+static GwMsg            *g_gw_q = NULL;       // PSRAM ring, loop-only
+static uint8_t           g_gw_qh = 0, g_gw_qn = 0;
+static uint32_t          g_gw_last_tx_ms = 0, g_gw_st_ms = 0, g_gw_pk_ms = 0;
+static lv_obj_t         *g_gw_pk_scr = NULL;
+
+static void gw_enqueue(uint8_t kind, const uint8_t *b, uint8_t len)
+{
+    if (!g_gw_up || !g_gw_conn) return;         // nobody listening: drop, never buffer forever
+    if (!g_gw_q) {
+        g_gw_q = (GwMsg *)heap_caps_malloc(sizeof(GwMsg) * GW_Q_N, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!g_gw_q) return;
+    }
+    if (g_gw_qn >= GW_Q_N) return;              // never block the radio path
+    GwMsg &m = g_gw_q[(g_gw_qh + g_gw_qn) % GW_Q_N];
+    m.kind = kind; m.len = len; memcpy(m.b, b, len);
+    g_gw_qn++;
+}
+static void gw_push_rx(const String &line)
+{
+    if (!g_gw_conn) return;
+    size_t n = line.length(); if (n > 200) n = 200;
+    gw_enqueue(1, (const uint8_t *)line.c_str(), (uint8_t)n);
+}
+// A finished note as the phone should see it: one meta line, then the codec2 bytes in
+// MTU-sized pieces, each with a 2-byte [seq,total] head so the app can reassemble.
+static void gw_push_note()
+{
+    if (!g_gw_conn) return;
+    uint8_t *pay = voice_scratch(); size_t off = 0;
+    if (!pay) return;
+    uint8_t mask = g_vnote.seen_mask | g_vnote.unv_mask;
+    for (int i = 0; i < g_vnote.n && (mask & (1 << i)); i++) { memcpy(pay + off, g_vnote.data[i], g_vnote.clen[i]); off += g_vnote.clen[i]; }
+    if (!off) return;
+    char meta[200];
+    int ml = snprintf(meta, sizeof(meta), "N %s %04X c%u %uB %s%s%s", voice_addr_str(g_vnote.src).c_str(),
+                      g_vnote.vid, g_vnote.codec, (unsigned)off,
+                      g_vnote.par_used ? "parity " : "", g_vnote.partial ? "partial " : "",
+                      g_vnote.caption[0] ? g_vnote.caption : "");
+    if (ml > 199) ml = 199;
+    gw_enqueue(1, (const uint8_t *)meta, (uint8_t)ml);
+    const uint8_t piece = 160;
+    uint8_t total = (uint8_t)((off + piece - 1) / piece);
+    for (uint8_t sq = 0; sq < total; sq++) {
+        uint8_t buf[2 + 160];
+        size_t o = (size_t)sq * piece, l = off - o > piece ? piece : off - o;
+        buf[0] = sq; buf[1] = total; memcpy(buf + 2, pay + o, l);
+        gw_enqueue(2, buf, (uint8_t)(2 + l));
+    }
+}
+
+class GwServerCB : public BLEServerCallbacks {
+    void onConnect(BLEServer *, ble_gap_conn_desc *) override {
+        g_gw_conn = true; g_gw_show_pk = true;      // loop draws the passkey panel
+    }
+    void onDisconnect(BLEServer *srv, ble_gap_conn_desc *) override {
+        g_gw_conn = false; g_gw_hide_pk = true; g_gw_mtu = 23;
+        srv->startAdvertising();                    // be findable again immediately
+    }
+    void onMtuChanged(BLEServer *, ble_gap_conn_desc *, uint16_t mtu) override { g_gw_mtu = mtu; }
+};
+class GwTxCB : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *c) override {   // host task: copy, flag, nothing else
+        if (g_gw_in_len) return;                    // loop has not consumed the last one
+        String v = c->getValue();
+        size_t n = v.length(); if (n > sizeof(g_gw_in) - 1) n = sizeof(g_gw_in) - 1;
+        memcpy(g_gw_in, v.c_str(), n); g_gw_in[n] = 0;
+        g_gw_in_len = (uint8_t)n;                   // written last: publishes the bytes
+    }
+};
+
+static void gw_start()
+{
+    if (g_gw_up) return;
+    // Step-0 measurement, in the log every start: internal heap before and after.
+    uint32_t h0 = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    // Gateway mode owns the 2.4 GHz radio: Wi-Fi off returns its ~40 KB of internal RAM
+    // and removes the Wi-Fi/BLE coexistence hit on the link the phone actually uses.
+    if (g_wifi_autoconn_timer) { lv_timer_del(g_wifi_autoconn_timer); g_wifi_autoconn_timer = NULL; }
+    WiFi.disconnect(true); WiFi.mode(WIFI_OFF); g_wifi_on = false;
+    if (!g_ble_inited) { BLEDevice::init("T-Deck OS"); g_ble_inited = true; }
+    g_bt_on = true;
+    BLEDevice::setMTU(247);
+    // Bonding with a displayed passkey, forced on every connection: the phone types the
+    // number on our screen (MITM-resistant), and an unbonded link never reaches a
+    // characteristic. iOS uses random addresses, so the bond IS the identity.
+    BLESecurity::setAuthenticationMode(true, true, true);
+    BLESecurity::setCapability(ESP_IO_CAP_OUT);
+    BLESecurity::setKeySize(16);
+    BLESecurity::regenPassKeyOnConnect(true);
+    BLESecurity::setForceAuthentication(true);
+    g_gw_srv = BLEDevice::createServer();
+    g_gw_srv->setCallbacks(new GwServerCB());
+    BLEService *svc = g_gw_srv->createService(GW_UUID("1"));
+    g_gw_rx   = svc->createCharacteristic(GW_UUID("2"), BLECharacteristic::PROPERTY_NOTIFY);
+    g_gw_tx   = svc->createCharacteristic(GW_UUID("3"), BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_AUTHEN);
+    g_gw_st   = svc->createCharacteristic(GW_UUID("4"), BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_READ_AUTHEN | BLECharacteristic::PROPERTY_NOTIFY);
+    g_gw_note = svc->createCharacteristic(GW_UUID("5"), BLECharacteristic::PROPERTY_NOTIFY);
+    g_gw_ctl  = svc->createCharacteristic(GW_UUID("6"), BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_AUTHEN);
+    g_gw_tx->setCallbacks(new GwTxCB());
+    g_gw_st->setValue((const uint8_t *)"idle", 4);
+    svc->start();
+    BLEAdvertising *adv = BLEDevice::getAdvertising();
+    adv->addServiceUUID(GW_UUID("1"));
+    adv->setScanResponse(true);
+    adv->start();
+    g_gw_up = true;
+    uint32_t h1 = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    Serial.printf("[gw] BLE gateway up: heap int %lu -> %lu (largest %u)\n",
+                  (unsigned long)h0, (unsigned long)h1,
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+}
+
+// Passkey takeover, alert-style: the number the phone must type. Built and torn down
+// on the loop from flags the host task raised.
+static void gw_passkey_panel(bool show)
+{
+    if (!show) { if (g_gw_pk_scr) { lv_obj_del(g_gw_pk_scr); g_gw_pk_scr = NULL; } return; }
+    if (g_gw_pk_scr) return;
+    g_gw_pk_scr = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(g_gw_pk_scr, 320, 240);
+    lv_obj_center(g_gw_pk_scr);
+    lv_obj_set_style_bg_color(g_gw_pk_scr, lv_color_hex(0x1E3A8A), 0);
+    lv_obj_set_style_border_width(g_gw_pk_scr, 0, 0);
+    lv_obj_set_flex_flow(g_gw_pk_scr, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(g_gw_pk_scr, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *h = lv_label_create(g_gw_pk_scr);
+    lv_obj_set_style_text_font(h, &font_kr16, 0);
+    lv_obj_set_style_text_color(h, lv_color_white(), 0);
+    lv_label_set_text(h, LV_SYMBOL_BLUETOOTH " 폰 페어링 - 이 번호를 입력");
+    lv_obj_t *k = lv_label_create(g_gw_pk_scr);
+    lv_obj_set_style_text_font(k, &lv_font_montserrat_16, 0);   // digits: any font
+    lv_obj_set_style_text_color(k, lv_color_hex(0xFDE68A), 0);
+    lv_label_set_text_fmt(k, "%06lu", (unsigned long)BLESecurity::getPassKey());
+    lv_obj_t *f = lv_label_create(g_gw_pk_scr);
+    lv_obj_set_style_text_font(f, &font_kr16, 0);
+    lv_obj_set_style_text_color(f, lv_color_hex(0x93C5FD), 0);
+    lv_label_set_text(f, "이미 페어링된 폰이면 잠시 후 사라집니다");
+    lv_refr_now(NULL);
+    g_gw_pk_ms = millis();
+}
+
+static void gw_tick()
+{
+    if (!g_gw_up) return;
+    if (g_gw_show_pk) { g_gw_show_pk = false; gw_passkey_panel(true); }
+    if (g_gw_hide_pk) { g_gw_hide_pk = false; gw_passkey_panel(false); }
+    if (g_gw_pk_scr && (uint32_t)(millis() - g_gw_pk_ms) > 45000) gw_passkey_panel(false);
+    // Phone -> mesh. Policy lives here, on the loop, in the same place every other TX is
+    // decided: chat text only, one line, 60 B on a character boundary.
+    if (g_gw_in_len) {
+        String t = g_gw_in;
+        g_gw_in_len = 0;
+        t.trim();
+        if (!t.length() || t[0] == '!' || t.startsWith("R|") || t.startsWith("[")) {
+            Serial.printf("[gw] refused: %.24s\n", t.c_str());
+        } else {
+            while (t.length() > 60) {
+                int cut = t.length() - 1;
+                while (cut > 0 && ((uint8_t)t[cut] & 0xC0) == 0x80) cut--;
+                t = t.substring(0, cut);
+            }
+            lora_tx_line(t + "\n");
+            lora_log_print("> ", "[폰] " + t);
+            Serial.printf("[gw] tx: %s\n", t.c_str());
+        }
+    }
+    if (!g_gw_conn) return;
+    // Mesh -> phone, paced to the connection interval; the lib skips unsubscribed chars.
+    if (g_gw_qn && (uint32_t)(millis() - g_gw_last_tx_ms) >= 20) {
+        GwMsg &m = g_gw_q[g_gw_qh];
+        BLECharacteristic *c = m.kind == 2 ? g_gw_note : g_gw_rx;
+        uint16_t lim = g_gw_mtu > 3 ? g_gw_mtu - 3 : 20;
+        c->setValue(m.b, m.len > lim ? lim : m.len);
+        c->notify();
+        g_gw_qh = (g_gw_qh + 1) % GW_Q_N; g_gw_qn--;
+        g_gw_last_tx_ms = millis();
+    }
+    if ((uint32_t)(millis() - g_gw_st_ms) > 2000) {   // status, human-readable on purpose
+        g_gw_st_ms = millis();
+        char st[120];
+        snprintf(st, sizeof(st), "rssi=%d snr=%.1f home=%s txq=%u ok=%lu bad=%lu noise=%lu mtu=%u",
+                 g_rx_rssi_last, g_rx_snr_last, g_home >= 0 ? g_routers[g_home].id : "-",
+                 (unsigned)g_txq_n, (unsigned long)g_rx_ok, (unsigned long)g_rx_corrupt,
+                 (unsigned long)g_rx_noise, (unsigned)g_gw_mtu);
+        g_gw_st->setValue((const uint8_t *)st, strlen(st));
+        g_gw_st->notify();
+    }
+}
+
 // §4.4 repair discipline. Never immediate: hold 4×ToA + jitter (unicast), or the §8
 // deferred slot (broadcast). Two rounds, then the note is marked partial and kept —
 // a playable prefix is still playable (40 ms alignment).
@@ -4458,6 +4676,7 @@ static void lora_rx_dispatch(const String &line)
             d[dn] = 0;
             rxlog_line("rx", g_rx_pkt_len, g_rx_rssi_last, g_rx_snr_last, d);
         }
+        gw_push_rx(line);                        // the phone sees the envelope line verbatim
         // Envelope context for the L1 handlers: v1.11 scopes (rev, seq) per src, and
         // !RB derives the router id from here. Anything heard from the home router
         // also clears the unanswered-pull counter — it is demonstrably alive.
@@ -5401,6 +5620,20 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         }, LV_EVENT_CLICKED, NULL);
         lv_group_add_obj(g, rlb);
 
+        // BLE gateway (docs/BLE_GATEWAY.md): the phone as this node's UI. Starting it
+        // turns Wi-Fi off; stopping takes a reboot (the BLE lib has no clean teardown).
+        lv_obj_t *gwb  = lv_btn_create(parent);
+        lv_obj_t *gwbl = lv_label_create(gwb);
+        lv_obj_set_style_text_font(gwbl, &font_kr16, 0);
+        lv_label_set_text_fmt(gwbl, LV_SYMBOL_BLUETOOTH " 폰 게이트웨이(BLE): %s", g_gw_on ? "켬" : "끔");
+        lv_obj_add_event_cb(gwb, [](lv_event_t *e) {
+            g_gw_on = !g_gw_on;
+            Preferences p; p.begin("tdeckos", false); p.putBool("blegw", g_gw_on); p.end();
+            lv_label_set_text_fmt(lv_obj_get_child(lv_event_get_target(e), 0),
+                                  LV_SYMBOL_BLUETOOTH " 폰 게이트웨이(BLE): %s", g_gw_on ? "켬 (재부팅 후 적용)" : "끔 (재부팅 후 적용)");
+        }, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, gwb);
+
         // Receive-path proof with no peer TX in existence: inject the golden 700C note
         // as if E00 sent it — assembly, playback and the decode-RTF measurement.
         lv_obj_t *vlb  = lv_btn_create(parent);
@@ -6289,7 +6522,7 @@ static void status_update_cb(lv_timer_t *t)
     snprintf(line, sizeof(line), "%s%s%s%s %d%% %s",
              nbuf,
              g_wifi_on ? LV_SYMBOL_WIFI " "      : "",
-             g_bt_on   ? LV_SYMBOL_BLUETOOTH " " : "",
+             g_gw_conn ? LV_SYMBOL_CALL " " : (g_bt_on ? LV_SYMBOL_BLUETOOTH " " : ""),
              bat, pct, tbuf);
     lv_label_set_text(g_status, line);
     lv_obj_align(g_status, LV_ALIGN_RIGHT_MID, 0, 0);
@@ -6309,6 +6542,7 @@ static void boot_restore()
     g_voice_codec = p.getUChar("vcodec", 1) ? 1 : 0;
     g_voice_fx    = p.getBool("vfx", true);
     g_rxlog_on    = p.getBool("rxlog", true);
+    g_gw_on       = p.getBool("blegw", false);
     g_beep_vol  = p.getUChar("beepvol", 7);
     g_gps_enabled = p.getBool("gpsen", true);
     book_load();
@@ -6477,6 +6711,7 @@ void setup()
     Serial.println("[boot] restore");
     boot_restore();   // auto-reconnect saved Wi-Fi + restore BT state
     st_heap("after boot_restore");
+    if (g_gw_on) gw_start();     // gateway mode: after BLE is up, and it turns Wi-Fi off itself
 
     Serial.println("T-Deck OS ready.");
     voice_selftest();               // the 0xC2 frame layer must round-trip before it airs
@@ -6775,6 +7010,7 @@ void loop()
     PF_RUN(4, news_tick());      // deferred announce (chime + speech + hijack), repair, expiry
 #undef PF_RUN
     rxlog_tick();                // buffered SD flush, >=2 s cadence, never mid-RX-critical
+    gw_tick();                   // BLE gateway: passkey panel, phone inbox, notify pacing
     uint32_t it_us = (uint32_t)(micros() - it0);
     pf_last_end = it0 + it_us;
 
