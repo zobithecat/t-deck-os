@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0b1220">
+<title>T-Deck LoRa Console</title>
+<style>
+  :root { color-scheme: dark; --bg:#0b1220; --panel:#111a2e; --line:#1e2a44; --fg:#dbe4f3; --dim:#7d8ba6;
+          --ok:#34d399; --warn:#fbbf24; --bad:#f87171; --acc:#60a5fa; --me:#a78bfa; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+              font:14px/1.4 -apple-system,"SF Mono",Menlo,monospace; }
+  body { display:flex; flex-direction:column; padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+  header { display:flex; gap:8px; align-items:center; padding:10px 12px; background:var(--panel); border-bottom:1px solid var(--line); }
+  header b { font-size:15px; }
+  #st { color:var(--dim); font-size:12px; flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  button { background:var(--acc); color:#04101f; border:0; border-radius:8px; padding:8px 14px; font:inherit; font-weight:600; }
+  button.off { background:#374151; color:var(--fg); }
+  button:disabled { opacity:.5; }
+  #alert { display:none; background:#7f1d1d; color:#fee2e2; padding:10px 12px; font-weight:700; border-bottom:1px solid #b91c1c; }
+  #log { flex:1; overflow-y:auto; padding:8px 12px; }
+  .l { padding:3px 0; border-bottom:1px solid #0f1730; word-break:break-all; }
+  .l .t { color:var(--dim); font-size:11px; margin-right:6px; }
+  .l .s { color:var(--acc); font-weight:600; margin-right:6px; }
+  .l.sys { color:var(--dim); font-size:12px; }
+  .l.beacon { color:#4b5563; font-size:11px; }
+  .l.me { color:var(--me); }
+  .l.al { color:var(--bad); font-weight:700; }
+  .l.note { color:var(--ok); }
+  .l.err { color:var(--warn); }
+  footer { display:flex; gap:8px; padding:8px 12px; background:var(--panel); border-top:1px solid var(--line); }
+  input { flex:1; background:#0b1220; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:10px; font:inherit; }
+  #cnt { color:var(--dim); font-size:12px; align-self:center; min-width:52px; text-align:right; }
+  #cnt.over { color:var(--bad); }
+  #opts { display:flex; gap:12px; padding:4px 12px 8px; background:var(--panel); font-size:12px; color:var(--dim); }
+  label { display:flex; gap:4px; align-items:center; }
+</style>
+</head>
+<body>
+<header>
+  <b>T-Deck</b>
+  <span id="st">연결 안 됨</span>
+  <button id="btn">연결</button>
+</header>
+<div id="alert"></div>
+<div id="log"></div>
+<footer>
+  <input id="in" placeholder="메시에 보낼 한 줄 (60 B)" autocomplete="off" enterkeyhint="send" disabled>
+  <span id="cnt">0/60</span>
+  <button id="send" disabled>전송</button>
+</footer>
+<div id="opts">
+  <label><input type="checkbox" id="showb"> 비콘(!RS/!HB) 보이기</label>
+  <label><input type="checkbox" id="raw"> 원문 그대로</label>
+  <span id="notes"></span>
+</div>
+
+<script>
+// T-Deck BLE gateway console — docs/BLE_GATEWAY.md is the contract.
+// One page, no build, no framework: Mac/Android Chrome natively, iPhone through Bluefy.
+const U = n => `7e4c000${n}-0000-4c6f-5261-54446b4f5300`;
+const SVC = U(1), RX = U(2), TX = U(3), STATUS = U(4), NOTE = U(5);
+const enc = new TextEncoder(), dec = new TextDecoder();
+const $ = id => document.getElementById(id);
+const log = $('log'), st = $('st'), btn = $('btn'), inp = $('in'), sendB = $('send'), cnt = $('cnt');
+let dev = null, txc = null, notes = [], noteBuf = null;
+
+function line(cls, html) {
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  const d = document.createElement('div');
+  d.className = 'l ' + cls;
+  d.innerHTML = `<span class="t">${new Date().toTimeString().slice(0,8)}</span>` + html;
+  log.appendChild(d);
+  if (log.children.length > 600) log.removeChild(log.firstChild);
+  if (atBottom) log.scrollTop = log.scrollHeight;
+}
+const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+// R|src|pktid|ttl|payload — the phone sees the envelope verbatim; render it, don't hide it.
+function onRx(text) {
+  if ($('raw').checked) return line('', esc(text));
+  const m = text.match(/^R\|([^|]*)\|([^|]*)\|([^|]*)\|([\s\S]*)$/);
+  const src = m ? m[1] : '', pay = m ? m[4] : text;
+  if (/^!(RS|HB)\b/.test(pay)) { if ($('showb').checked) line('beacon', esc(text)); return; }
+  if (/^!AL\b/.test(pay)) {
+    line('al', `<span class="s">${esc(src)}</span>${esc(pay)}`);
+    const a = $('alert'); a.textContent = '경보 ' + (src ? src + ': ' : '') + pay; a.style.display = 'block';
+    if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+    setTimeout(() => a.style.display = 'none', 30000);
+    return;
+  }
+  if (/^N /.test(text)) { line('note', '🎙 ' + esc(text)); noteBuf = { meta: text, parts: [], total: 0 }; return; }
+  if (pay.startsWith('!')) return line('sys', `<span class="s">${esc(src)}</span>${esc(pay)}`);
+  line('', `<span class="s">${esc(src) || '?'}</span>${esc(pay)}`);
+}
+
+// Note blob pieces: [seq,total] + codec2 bytes. Kept in memory for v2 (in-browser decode).
+function onNote(buf) {
+  const b = new Uint8Array(buf);
+  if (b.length < 2 || !noteBuf) return;
+  const seq = b[0], total = b[1];
+  noteBuf.total = total; noteBuf.parts[seq] = b.slice(2);
+  if (noteBuf.parts.filter(Boolean).length === total) {
+    const size = noteBuf.parts.reduce((n, p) => n + p.length, 0);
+    notes.push({ meta: noteBuf.meta, bytes: new Blob(noteBuf.parts) });
+    $('notes').textContent = `음성 노트 ${notes.length}개 (${size} B 마지막)`;
+    line('note', `🎙 노트 수신 완료 ${size} B — 폰 디코드는 v2`);
+    noteBuf = null;
+  }
+}
+
+async function connect() {
+  if (dev?.gatt?.connected) { dev.gatt.disconnect(); return; }
+  if (!navigator.bluetooth) {
+    line('err', 'Web Bluetooth 없음. 아이폰은 Bluefy, Mac/안드로이드는 Chrome에서 여세요.'); return;
+  }
+  try {
+    btn.disabled = true; st.textContent = '검색 중…';
+    dev = await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }, { namePrefix: 'T-Deck' }], optionalServices: [SVC] });
+    dev.addEventListener('gattserverdisconnected', () => {
+      st.textContent = '끊김'; btn.textContent = '연결'; btn.className = ''; btn.disabled = false;
+      inp.disabled = sendB.disabled = true; txc = null; line('sys', '연결 끊김');
+    });
+    st.textContent = '연결 중… (T-Deck 화면의 6자리를 폰에 입력)';
+    const gatt = await dev.gatt.connect();
+    const svc = await gatt.getPrimaryService(SVC);
+    const rx = await svc.getCharacteristic(RX);
+    rx.addEventListener('characteristicvaluechanged', e => onRx(dec.decode(e.target.value)));
+    await rx.startNotifications();
+    try {
+      const note = await svc.getCharacteristic(NOTE);
+      note.addEventListener('characteristicvaluechanged', e => onNote(e.target.value.buffer));
+      await note.startNotifications();
+    } catch (e) { line('err', 'note 특성 없음: ' + e.message); }
+    // Status is READ_AUTHEN: this read is what forces the bond on a fresh phone.
+    const sc = await svc.getCharacteristic(STATUS);
+    const showSt = v => { st.textContent = dec.decode(v); };
+    sc.addEventListener('characteristicvaluechanged', e => showSt(e.target.value));
+    try { showSt(await sc.readValue()); await sc.startNotifications(); } catch (e) { line('err', '상태 읽기 실패(본딩 취소?): ' + e.message); }
+    txc = await svc.getCharacteristic(TX);
+    btn.textContent = '끊기'; btn.className = 'off'; btn.disabled = false;
+    inp.disabled = sendB.disabled = false;
+    line('sys', `연결됨: ${dev.name || dev.id}`);
+  } catch (e) {
+    line('err', '연결 실패: ' + e.message); st.textContent = '연결 안 됨'; btn.disabled = false;
+  }
+}
+
+async function send() {
+  let t = inp.value.trim();
+  if (!t || !txc) return;
+  if (t.startsWith('!')) return line('err', "'!' 시스템 라인은 T-Deck이 거부합니다");
+  while (enc.encode(t).length > 60) t = t.slice(0, -1);   // cut on a character, like the firmware
+  try {
+    await txc.writeValueWithResponse(enc.encode(t));
+    line('me', `<span class="s">나</span>${esc(t)}`);
+    inp.value = ''; count();
+  } catch (e) { line('err', '전송 실패: ' + e.message); }
+}
+function count() {
+  const n = enc.encode(inp.value).length;
+  cnt.textContent = `${n}/60`; cnt.className = n > 60 ? 'over' : '';
+}
+btn.onclick = connect; sendB.onclick = send;
+inp.oninput = count;
+inp.onkeydown = e => { if (e.key === 'Enter') send(); };
+line('sys', '연결 → T-Deck 화면의 6자리 패스키 입력 → 라인이 여기 뜹니다. 채팅 한 줄 60 B, 공중 ~0.3 s.');
+</script>
+</body>
+</html>
