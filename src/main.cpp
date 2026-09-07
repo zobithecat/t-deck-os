@@ -1467,6 +1467,24 @@ static void play_tone(int freq, int ms, int amp = -1)   // amp < 0 = the master 
     g_i2s.write((const uint8_t *)z, sizeof(z));
 }
 
+// The DMA ring never stops: on underflow the IDF replays the LAST buffer forever
+// (auto_clear is off in the library's channel config). The speech engine used to keep
+// the ring fed with silence from its own task; with it gone, whoever plays last must
+// leave a full ring of zeros behind, or a 90 ms chime becomes "삐비비비…" until reboot.
+// ~70 ms at 22050 Hz, once per sound SEQUENCE (not per note — melodies stay tight).
+static void audio_settle()
+{
+    if (!g_audio_inited) return;
+    static const int16_t z[256] = {0};    // 128 stereo frames
+    size_t left = (size_t)3 * AUDIO_DMA_WORDS * 4 + sizeof(z);   // the whole ring, plus one
+    while (left) {
+        size_t n = left < sizeof(z) ? left : sizeof(z);
+        size_t w = g_i2s.write((const uint8_t *)z, n);
+        if (!w) { delay(1); continue; }
+        left -= w;
+    }
+}
+
 static void speaker_play_cb(lv_event_t *e)
 {
     int id = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
@@ -1478,7 +1496,7 @@ static void speaker_play_cb(lv_event_t *e)
         const int notes[] = { 523, 587, 659, 698, 784, 880 };
         for (int i = 0; i < 6; i++) play_tone(notes[i], 160);
     }
-    // play_tone() already writes trailing silence, so nothing lingers on the amp
+    audio_settle();                       // leave the DMA ring silent, see audio_settle()
 }
 
 // Short rising two-tone "ding-dong" for an incoming LoRa message. 0 = mute.
@@ -1493,6 +1511,7 @@ static void beep_notify()
     int amp = (audio_tone_amp() / 10) * g_beep_vol;   // beep level, capped by the master volume
     play_tone(1568, 90,  amp);           // G6
     play_tone(2093, 120, amp);           // C7
+    audio_settle();
 }
 
 // --- LoRa (SX1262) — pager-lora-qwerty interop -------------------------------
@@ -3122,6 +3141,7 @@ static void voice_play_note_body()
         for (int zn = 0; zn < (rep < g_vplay_reps - 1 ? 172 : 1); zn++)
             g_i2s.write((const uint8_t *)z, sizeof(z));
     }
+    audio_settle();                            // else the last DMA buffer of voice loops forever
     if (dec_frames)                            // RTF on real silicon, per codec — for E00
         Serial.printf("[voice] decode %lums for %d frames (%.2fs audio x3, RTF %.2f)\n",
                       (unsigned long)(dec_us / 1000), dec_frames, dec_frames * 0.04f,
@@ -5681,7 +5701,7 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
             Preferences p; p.begin("tdeckos", false); p.putUChar("ttsvol", g_audio_vol); p.end();
         }, LV_EVENT_VALUE_CHANGED, NULL);
         lv_obj_add_event_cb(vslider, [](lv_event_t *e) {       // preview the new level
-            play_tone(1000, 120);
+            play_tone(1000, 120); audio_settle();
         }, LV_EVENT_RELEASED, NULL);
         lv_group_add_obj(g, vslider);
     } else if (strcmp(name, "Wi-Fi") == 0) {
@@ -6202,6 +6222,7 @@ static void beep_clear()
     play_tone(1175, 180, amp);
     play_tone(880,  180, amp);
     play_tone(660,  260, amp);
+    audio_settle();
 }
 
 static void beep_alert(int sev)
@@ -6212,6 +6233,7 @@ static void beep_alert(int sev)
         play_tone(1760, 170, amp);        // A6
         play_tone(1175, 170, amp);        // D6
     }
+    audio_settle();
 }
 
 static void alert_close()
@@ -6774,6 +6796,7 @@ static void selftest_console()
     case 't':
         Serial.println("[ST] tone 1 kHz 250 ms (quiet)");
         play_tone(1000, 250, 2500);   // bench volume - the user is sitting next to it
+        audio_settle();
         Serial.println("[ST] tone done");
         break;
     case 'p':   // dump the power-save log (RAM copy + the card)
