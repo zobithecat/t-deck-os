@@ -139,11 +139,13 @@ static bool     g_rxlog_on = true;          // Settings/NVS "rxlog"
 static File     g_rxlog_f;
 static bool     g_rxlog_open = false, g_rxlog_failed = false;
 static char     g_rxlog_path[48] = "";
+static uint32_t g_rxlog_retry_ms = 0;
 static char    *g_rxlog_buf = NULL;
 static uint32_t g_rxlog_n = 0, g_rxlog_flush_ms = 0, g_rxlog_drop = 0;
 static uint8_t  g_rxlog_mirror = 0;         // first lines also to Serial: format sample
 #define RXLOG_BUF 16384
 static bool sd_init();
+static bool          g_sd_ok;      // declared here: the log console probes the card
 static void gw_push_rx(const String &line);   // BLE gateway hooks (defined with the module)
 static void gw_push_note();
 static void lora_send(const char *text);      // the one chat sender: [SOF]/[TFF] …/[EOF]
@@ -169,7 +171,15 @@ static void rxlog_line(const char *ev, int len, int rssi, float snr, const char 
 static void rxlog_open_file()
 {
     if (g_rxlog_open || g_rxlog_failed) return;
-    if (!sd_init()) { g_rxlog_failed = true; Serial.println("[rxlog] no SD - logging off"); return; }
+    // Do NOT latch the failure: a card seated after boot, or a one-off bus conflict
+    // with the display, used to disable logging for the whole session. Retry slowly.
+    if (!sd_init()) {
+        if ((uint32_t)(millis() - g_rxlog_retry_ms) > 30000) {
+            g_rxlog_retry_ms = millis();
+            Serial.println("[rxlog] no SD yet - retrying every 30 s");
+        }
+        return;
+    }
     if (!SD.exists("/logs")) SD.mkdir("/logs");
     char path[48], rtc[36] = "none";
     struct tm ti;
@@ -226,8 +236,15 @@ static void rxlog_console()
                       g_rxlog_path, (unsigned long)g_dump_f.size());
     } else if (c == 'x' || c == 'X') {
         if (g_dump_on) { g_dump_f.close(); g_dump_on = false; Serial.println("[log] dump stopped"); }
+    } else if (c == 's' || c == 'S') {           // probe the card and say what it is
+        g_sd_ok = false;
+        if (sd_init())
+            Serial.printf("[sd] ok - %s %llu MB, /logs %s\n",
+                          SD.cardType() == CARD_SDHC ? "SDHC" : "SD",
+                          SD.cardSize() / (1024ULL * 1024ULL),
+                          SD.exists("/logs") ? "present" : "will be created");
     } else if (c == '?') {
-        Serial.println("[log] l=list  d=dump current log  x=stop dump");
+        Serial.println("[log] l=list  d=dump current log  x=stop dump  s=probe SD");
     }
 }
 
@@ -252,7 +269,11 @@ static void rxlog_tick()
     uint32_t now = millis();
     if (g_rxlog_n < 4096 && (uint32_t)(now - g_rxlog_flush_ms) < 2000) return;
     rxlog_open_file();
-    if (!g_rxlog_open) { g_rxlog_n = 0; return; }
+    if (!g_rxlog_open) {                 // hold what fits; the card may still arrive
+        if (g_rxlog_n > RXLOG_BUF - 2048) { g_rxlog_drop++; g_rxlog_n = 0; }
+        g_rxlog_flush_ms = now;
+        return;
+    }
     g_rxlog_f.write((const uint8_t *)g_rxlog_buf, g_rxlog_n);
     if (g_rxlog_drop) {
         char d[48];
@@ -410,7 +431,6 @@ static String        g_lora_compose;    // committed Korean text (preview append
 static lv_obj_t     *g_kr_btn;          // Kor/Eng toggle button
 static lv_obj_t     *g_sd_list;
 static lv_obj_t     *g_sd_status;
-static bool          g_sd_ok;
 static lv_obj_t     *g_rng_rssi, *g_rng_stats, *g_rng_log;   // LoRa range test
 static lv_timer_t   *g_rng_poll, *g_rng_tx;
 static uint32_t      g_rng_seq;
@@ -4727,6 +4747,20 @@ static void discovery_poll_cb(lv_timer_t *)
 // echoes (src==NODE_ID) and duplicates (a packet that arrived both directly and
 // relayed), then hand the original line to lora_process_line. Untagged (legacy)
 // lines pass straight through.
+// Hops from the envelope. The naive MESH-ttl is wrong for every line that is SENT at
+// ttl 1 by protocol — HB and the router beacons !RB / !RS — because it reads their
+// arrival ttl of 1 as "two relays consumed it". That is why E01, whose only directly
+// heard frames are its ttl-1 beacons, showed up as 2 hops in Discovery while being a
+// direct neighbour. A ttl-1-by-design line received at ttl 1 is direct, full stop.
+static int relay_hops(const String &orig, uint8_t ttl)
+{
+    bool local_by_design = orig == "HB" || orig.startsWith("HB\t") ||
+                           orig.startsWith("!RB\t") || orig.startsWith("!RS\t");
+    if (local_by_design) return ttl == RELAY_TTL_LOCAL ? 0 : -1;   // -1 = impossible, flag it
+    int h = (int)RELAY_TTL_MESH - (int)ttl;
+    return h < 0 ? 0 : h;
+}
+
 static void lora_rx_dispatch(const String &line)
 {
     String src, orig; uint32_t pktid; uint8_t ttl;
@@ -4735,9 +4769,8 @@ static void lora_rx_dispatch(const String &line)
         if (relay_seen(g_relay_seen, src, pktid)) return;
         // device discovery: this first (shortest-path) copy proves src is alive.
         // HB is ttl=1 (never relayed) → always direct; other traffic hops = MESH−ttl.
-        bool is_hb = (orig == "HB" || orig.startsWith("HB\t"));
-        int  hops  = is_hb ? 0 : ((int)RELAY_TTL_MESH - (int)ttl);
-        if (hops < 0) hops = 0;
+        int hops = relay_hops(orig, ttl);
+        if (hops < 0) hops = 0;              // a relayed beacon: not ours to trust anyway
         String nm;
         if (orig.startsWith("HB\t")) {                 // HB carries a friendly display name
             int p1 = orig.indexOf('\t'), p2 = orig.indexOf('\t', p1 + 1);
@@ -4758,7 +4791,7 @@ static void lora_rx_dispatch(const String &line)
             // apart. hops = MESH-ttl, the same number the Discovery app shows.
             char d[64];
             int  dn = snprintf(d, sizeof(d), "%s h%d ", src.c_str(),
-                               (int)RELAY_TTL_MESH - (int)ttl);
+                               relay_hops(orig, ttl));
             if (dn < 0) dn = 0;
             for (int i = 0; i < (int)orig.length() && dn < 56; i++) {
                 char ch = orig[i];
@@ -5014,10 +5047,30 @@ static void kr_toggle_cb(lv_event_t *e)
 }
 
 // --- SD card file browser ----------------------------------------------------
+// The SD shares one SPI bus with the display and the radio, and SD.begin() does two
+// separate things — bring the card up, then mount a FAT volume. Reporting only
+// "no SD" for both hides the common case: a card that initialises fine but carries
+// exFAT (every 64 GB card ships that way) and cannot be mounted by this library.
+// So park the other chip-selects, try twice, and say WHICH half failed.
 static bool sd_init()
 {
     if (g_sd_ok) return true;
-    g_sd_ok = SD.begin(BOARD_SDCARD_CS, SPI, 800000U);   // shared SPI, 800 kHz
+    digitalWrite(RADIO_CS_PIN, HIGH);            // nobody else may hold the bus
+    digitalWrite(BOARD_TFT_CS, HIGH);
+    for (int attempt = 0; attempt < 2 && !g_sd_ok; attempt++)
+        g_sd_ok = SD.begin(BOARD_SDCARD_CS, SPI, attempt ? 400000U : 800000U);
+    if (!g_sd_ok) {
+        uint8_t ct = SD.cardType();
+        const char *n = ct == CARD_NONE ? "none" : ct == CARD_MMC ? "MMC"
+                      : ct == CARD_SD ? "SDSC" : ct == CARD_SDHC ? "SDHC" : "unknown";
+        Serial.printf("[sd] mount failed - card=%s\n", n);
+        if (ct != CARD_NONE)
+            Serial.println("[sd] the card answers but the volume will not mount: "
+                           "reformat it FAT32 (exFAT is not supported)");
+        else
+            Serial.println("[sd] no card answered on the bus: reseat it, "
+                           "or another SPI device held the bus during init");
+    }
     return g_sd_ok;
 }
 
