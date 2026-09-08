@@ -4790,10 +4790,14 @@ static void lora_rx_dispatch(const String &line)
             // neighbour's traffic are different facts, and only the hop tells them
             // apart. hops = MESH-ttl, the same number the Discovery app shows.
             char d[64];
-            int  dn = snprintf(d, sizeof(d), "%s h%d ", src.c_str(),
-                               relay_hops(orig, ttl));
+            // Log the RAW ttl beside the derived hop count. relay_hops() has to know
+            // which line types are sent at ttl 1, and that list is protocol knowledge
+            // that can go stale (router replies to addressed pulls already look like
+            // 2 hops here). The ttl is the measurement; the hop is an interpretation.
+            int  dn = snprintf(d, sizeof(d), "%s h%d t%u ", src.c_str(),
+                               relay_hops(orig, ttl), (unsigned)ttl);
             if (dn < 0) dn = 0;
-            for (int i = 0; i < (int)orig.length() && dn < 56; i++) {
+            for (int i = 0; i < (int)orig.length() && dn < 58; i++) {
                 char ch = orig[i];
                 d[dn++] = (ch == '\t') ? '|' : ((uint8_t)ch < 0x20 ? '.' : ch);
             }
