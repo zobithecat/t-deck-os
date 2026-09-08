@@ -1522,8 +1522,9 @@ static void beep_notify()
 #define LORA_MAX_CHUNK  60
 #define LORA_SENDER_ID  NODE_ID    // unified: display prefix + HB/PING id = relay id
 
-static String g_lora_rx_msg;
-static bool   g_lora_in_frame = false;
+static String   g_lora_rx_msg;
+static bool     g_lora_in_frame = false;
+static uint32_t g_lora_frame_ms = 0;   // when the open frame last took a line
 
 static void IRAM_ATTR lora_set_rx_flag() { g_lora_rx_flag = true; }
 
@@ -1641,14 +1642,15 @@ static void lora_tx_service()                     // the TX-done edge
     g_tx_gap_until = millis() + g_tx_gap_pending;
 }
 
-static bool lora_tx_enqueue(const uint8_t *b, size_t len, uint16_t gap_ms)
+static bool lora_tx_enqueue(const uint8_t *b, size_t len, uint16_t gap_ms,
+                            uint32_t wait_ms = 8000)
 {
     if (!len || len > TXQ_MAX) return false;
     // Loop-context callers with a long burst (chat) may wait briefly for a slot; the
     // wait services TX-done edges, so it drains at air speed. UI callbacks only ever
     // queue one frame and never reach the wait.
     uint32_t t0 = millis();
-    while (g_txq_n >= TXQ_N && (uint32_t)(millis() - t0) < 8000) {
+    while (g_txq_n >= TXQ_N && (uint32_t)(millis() - t0) < wait_ms) {
         lora_tx_service(); lora_tx_pump(); delay(2);
     }
     uint32_t waited = millis() - t0;
@@ -1662,6 +1664,14 @@ static bool lora_tx_enqueue(const uint8_t *b, size_t len, uint16_t gap_ms)
     g_txq_n++;
     lora_tx_pump();
     return true;
+}
+
+static bool lora_tx_ttl_w(const String &payload, uint8_t ttl, uint32_t wait_ms)
+{
+    String w = relay_wrap(payload, ttl);
+    uint32_t toa = (uint32_t)(lora_radio.getTimeOnAir(w.length()) / 1000);
+    uint16_t gap = (ttl > RELAY_TTL_LOCAL) ? (uint16_t)(2 * toa + 50) : 0;
+    return lora_tx_enqueue((const uint8_t *)w.c_str(), w.length(), gap, wait_ms);
 }
 
 static void lora_tx_ttl(const String &payload, uint8_t ttl)
@@ -4557,6 +4567,7 @@ static void lora_process_line(const String &line)
         if (g_lora_in_frame && g_lora_rx_msg.length()) lora_emit_msg(g_lora_rx_msg);  // prev EOF lost
         g_lora_rx_msg = "";
         g_lora_in_frame = true;
+        g_lora_frame_ms = millis();
         return;
     }
     if (line == "[EOF]") {
@@ -4579,7 +4590,7 @@ static void lora_process_line(const String &line)
     // Inside an open frame everything below is user text (PROTOCOL.md §5, v1.8):
     // the L0 and grandfather prefixes are matched only OUTSIDE a frame, otherwise a
     // chunk that happens to start with "PING\t" or "SYS " is silently eaten mid-message.
-    if (g_lora_in_frame) { g_lora_rx_msg += line; return; }
+    if (g_lora_in_frame) { g_lora_rx_msg += line; g_lora_frame_ms = millis(); return; }
     // L0 range ping/pong: consumed by the Range app; never a chat bubble here.
     if (line.startsWith("PING\t") || line.startsWith("PONG\t")) return;
     // Grandfather (transition, §5 migration): bare pre-v1.3 system lines → consume so
@@ -4855,10 +4866,19 @@ static void lora_send(const char *text)
         if (end == i) end = i + 1;
         String chunk = body.substring(i, end);
         if (chunk.length() && chunk[0] == '!') chunk = "!" + chunk;  // L2 escape (§5): user '!' → '!!'
-        lora_tx_line(chunk + "\n");
+        if (!lora_tx_ttl_w(chunk + "\n", RELAY_TTL_MESH, 8000)) {
+            Serial.println("[tx] chat chunk dropped - truncating, [EOF] still owed");
+            break;                       // stop feeding a message we cannot finish
+        }
         i = end;
     }
-    lora_tx_line("[EOF]\n");
+    // The [EOF] closes a frame the receiver has already opened. Losing it is worse than
+    // losing the message: an open frame swallows every later non-'!' line as chat text
+    // until some node happens to send [SOF] again. So it gets its own, much longer wait
+    // — a full TXQ of 220 B frames needs ~16 s of air to drain, and the old 8 s cap
+    // could expire mid-drain. Blocking the loop here is the cheap side of that trade.
+    if (!lora_tx_ttl_w("[EOF]\n", RELAY_TTL_MESH, 30000))
+        Serial.println("[tx] FRAME LEFT OPEN - [EOF] could not be queued");
 }
 
 static void lora_send_cb(lv_event_t *e)
@@ -7033,6 +7053,17 @@ void loop()
     PF_RUN(3, lora_hb_tick());   // 60 s beacon, ttl 1, never on top of an arriving stream
     PF_RUN(4, news_tick());      // deferred announce (chime + speech + hijack), repair, expiry
 #undef PF_RUN
+    // An open frame with no [EOF] is a channel-wide hazard: frame state is one global,
+    // so it absorbs later non-'!' lines from ANY sender (P10's bare "CS ifft=..."
+    // telemetry is exactly that shape). The sender-side fix belongs to the sender; this
+    // is the receiver refusing to stay open forever. 20 s is ~30x a chunk's air gap.
+    if (g_lora_in_frame && (uint32_t)(millis() - g_lora_frame_ms) > 20000) {
+        Serial.printf("[rx] frame timeout, closing (%u B held)\n",
+                      (unsigned)g_lora_rx_msg.length());
+        g_lora_in_frame = false;
+        if (g_lora_rx_msg.length()) lora_emit_msg(g_lora_rx_msg);
+        g_lora_rx_msg = "";
+    }
     rxlog_tick();                // buffered SD flush, >=2 s cadence, never mid-RX-critical
     gw_tick();                   // BLE gateway: passkey panel, phone inbox, notify pacing
     uint32_t it_us = (uint32_t)(micros() - it0);
