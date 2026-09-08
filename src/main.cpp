@@ -145,6 +145,7 @@ static uint8_t  g_rxlog_mirror = 0;         // first lines also to Serial: forma
 static bool sd_init();
 static void gw_push_rx(const String &line);   // BLE gateway hooks (defined with the module)
 static void gw_push_note();
+static void lora_send(const char *text);      // the one chat sender: [SOF]/[TFF] …/[EOF]
 
 static void rxlog_line(const char *ev, int len, int rssi, float snr, const char *detail)
 {
@@ -4182,13 +4183,13 @@ static void gw_tick()
         if (!t.length() || t[0] == '!' || t.startsWith("R|") || t.startsWith("[")) {
             Serial.printf("[gw] refused: %.24s\n", t.c_str());
         } else {
-            while (t.length() > 60) {
-                int cut = t.length() - 1;
-                while (cut > 0 && ((uint8_t)t[cut] & 0xC0) == 0x80) cut--;
-                t = t.substring(0, cut);
-            }
-            lora_tx_line(t + "\n");
-            lora_log_print("> ", "[폰] " + t);
+            // Hand it to the SAME sender the on-device chat app uses. A bare
+            // lora_tx_line() here looked like it worked (P10's frame log showed the
+            // text) while being invisible as chat: no [SOF]/[EOF] envelope, no
+            // "[TFF] " sender prefix, so a router that parses chat by framing — E01 —
+            // dropped every phone line. lora_send() also owns the UTF-8 60 B split
+            // and the '!' escape, so the phone gets one policy, not a second copy.
+            lora_send(t.c_str());
             Serial.printf("[gw] tx: %s\n", t.c_str());
         }
     }
