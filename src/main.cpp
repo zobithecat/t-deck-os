@@ -138,6 +138,7 @@ static int     g_rx_pkt_len = 0;   // radio-reported length of the packet being 
 static bool     g_rxlog_on = true;          // Settings/NVS "rxlog"
 static File     g_rxlog_f;
 static bool     g_rxlog_open = false, g_rxlog_failed = false;
+static char     g_rxlog_path[48] = "";
 static char    *g_rxlog_buf = NULL;
 static uint32_t g_rxlog_n = 0, g_rxlog_flush_ms = 0, g_rxlog_drop = 0;
 static uint8_t  g_rxlog_mirror = 0;         // first lines also to Serial: format sample
@@ -185,12 +186,64 @@ static void rxlog_open_file()
     g_rxlog_f = SD.open(path, FILE_APPEND);
     if (!g_rxlog_f) { g_rxlog_failed = true; Serial.println("[rxlog] open failed - logging off"); return; }
     g_rxlog_open = true;
+    strncpy(g_rxlog_path, path, sizeof(g_rxlog_path) - 1);
     char hdr[96];
     snprintf(hdr, sizeof(hdr), "# boot millis=%lu rtc=%s node=%s\n",
              (unsigned long)millis(), rtc, NODE_ID);
     g_rxlog_f.print(hdr);
     g_rxlog_f.flush();
     Serial.printf("[rxlog] logging to %s\n", path);
+}
+
+// Reading the card without pulling it. This firmware is not a USB mass-storage
+// device, so the log comes out over the same serial line you are already watching.
+// The dump is spread across loop passes (~2 KB each) because a 100 KB file pushed
+// in one go at 115200 would stall LVGL for ten seconds and trip the watchdog.
+static File g_dump_f;
+static bool g_dump_on = false;
+
+static void rxlog_console()
+{
+    if (!Serial.available()) return;
+    int c = Serial.read();
+    if (c == 'l' || c == 'L') {                    // what is on the card
+        if (!sd_init()) { Serial.println("[log] no SD"); return; }
+        File dir = SD.open("/logs");
+        if (!dir) { Serial.println("[log] no /logs"); return; }
+        Serial.println("[log] --- /logs ---");
+        for (File f = dir.openNextFile(); f; f = dir.openNextFile())
+            Serial.printf("[log] %-28s %lu B\n", f.name(), (unsigned long)f.size());
+        Serial.printf("[log] --- current: %s ---\n", g_rxlog_path[0] ? g_rxlog_path : "(none)");
+        dir.close();
+    } else if (c == 'd' || c == 'D') {             // dump the file being written now
+        if (g_dump_on) { g_dump_f.close(); g_dump_on = false; Serial.println("[log] dump aborted"); }
+        if (!g_rxlog_path[0]) { Serial.println("[log] nothing logged yet"); return; }
+        if (g_rxlog_open) { g_rxlog_f.flush(); }    // the tail is still in PSRAM otherwise
+        g_dump_f = SD.open(g_rxlog_path, FILE_READ);
+        if (!g_dump_f) { Serial.println("[log] open failed"); return; }
+        g_dump_on = true;
+        Serial.printf("[log] ===== BEGIN %s (%lu B) =====\n",
+                      g_rxlog_path, (unsigned long)g_dump_f.size());
+    } else if (c == 'x' || c == 'X') {
+        if (g_dump_on) { g_dump_f.close(); g_dump_on = false; Serial.println("[log] dump stopped"); }
+    } else if (c == '?') {
+        Serial.println("[log] l=list  d=dump current log  x=stop dump");
+    }
+}
+
+static void rxlog_dump_tick()
+{
+    if (!g_dump_on) return;
+    uint8_t b[512];
+    for (int pass = 0; pass < 4 && g_dump_f.available(); pass++) {
+        int n = g_dump_f.read(b, sizeof(b));
+        if (n <= 0) break;
+        Serial.write(b, n);
+    }
+    if (!g_dump_f.available()) {
+        g_dump_f.close(); g_dump_on = false;
+        Serial.println("\n[log] ===== END =====");
+    }
 }
 
 static void rxlog_tick()
@@ -4699,9 +4752,15 @@ static void lora_rx_dispatch(const String &line)
         else if (orig.startsWith("!GD\t") || orig.startsWith("!BD\t"))
             chan_reserve(millis() + 3 * (uint32_t)(lora_radio.getTimeOnAir(g_rx_pkt_len) / 1000));
         if (g_rxlog_on) {
-            char d[48];
-            int  dn = 0;
-            for (int i = 0; i < (int)orig.length() && dn < 40; i++) {
+            // src and hop count belong on every rx row. Without them an RSSI is
+            // unreadable: -44 from a neighbour and -44 from a relay carrying that
+            // neighbour's traffic are different facts, and only the hop tells them
+            // apart. hops = MESH-ttl, the same number the Discovery app shows.
+            char d[64];
+            int  dn = snprintf(d, sizeof(d), "%s h%d ", src.c_str(),
+                               (int)RELAY_TTL_MESH - (int)ttl);
+            if (dn < 0) dn = 0;
+            for (int i = 0; i < (int)orig.length() && dn < 56; i++) {
                 char ch = orig[i];
                 d[dn++] = (ch == '\t') ? '|' : ((uint8_t)ch < 0x20 ? '.' : ch);
             }
@@ -7064,6 +7123,8 @@ void loop()
         if (g_lora_rx_msg.length()) lora_emit_msg(g_lora_rx_msg);
         g_lora_rx_msg = "";
     }
+    rxlog_console();             // 'l' list, 'd' dump the SD log over USB, 'x' stop
+    rxlog_dump_tick();           // ~2 KB per pass so LVGL and the watchdog stay happy
     rxlog_tick();                // buffered SD flush, >=2 s cadence, never mid-RX-critical
     gw_tick();                   // BLE gateway: passkey panel, phone inbox, notify pacing
     uint32_t it_us = (uint32_t)(micros() - it0);
