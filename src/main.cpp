@@ -1595,9 +1595,6 @@ static void beep_notify()
 #define LORA_MAX_CHUNK  60
 #define LORA_SENDER_ID  NODE_ID    // unified: display prefix + HB/PING id = relay id
 
-static String   g_lora_rx_msg;
-static bool     g_lora_in_frame = false;
-static uint32_t g_lora_frame_ms = 0;   // when the open frame last took a line
 
 static void IRAM_ATTR lora_set_rx_flag() { g_lora_rx_flag = true; }
 
@@ -1626,6 +1623,57 @@ static void lora_emit_msg(String msg)
 {
     msg.replace("[NL]", "\n");
     if (msg.length()) lora_log_print("< ", msg);
+}
+
+// v1.19 (PROTOCOL.md §5, MUST): one open [SOF] frame PER SENDER, keyed on the
+// envelope src. A single file-scope buffer spliced B's bare line into A's open
+// message with neither node misbehaving — interleaved senders are the normal state
+// of a shared channel. Legacy untagged lines share the "" slot. Each frame expires
+// on its own idle timer (chunks refresh it; L1 lines deliberately do not), and a
+// frame closed by anything but its [EOF] is delivered MARKED, not dropped: the
+// bytes arrived, and on this link a visibly cut-off message beats a vanished one.
+#define RXFRAME_N   4
+#define RXFRAME_IDLE_MS 20000
+struct RxFrame { char src[8]; String msg; bool open; uint32_t ms; };
+static RxFrame g_rxf[RXFRAME_N];
+
+static void rxframe_close(RxFrame &f, const char *why)   // why = NULL: clean [EOF]
+{
+    if (why) {
+        Serial.printf("[rx] frame %s: %s (%u B, src %s)\n", why, "delivered marked",
+                      (unsigned)f.msg.length(), f.src[0] ? f.src : "-");
+        if (f.msg.length()) f.msg += " […끊김]";
+    }
+    lora_emit_msg(f.msg);
+    f.msg = ""; f.open = false;
+}
+static RxFrame *rxframe_find(const char *src)
+{
+    for (int i = 0; i < RXFRAME_N; i++)
+        if (g_rxf[i].open && !strcmp(g_rxf[i].src, src)) return &g_rxf[i];
+    return NULL;
+}
+static RxFrame &rxframe_open(const char *src)
+{
+    RxFrame *f = rxframe_find(src);
+    if (f) { rxframe_close(*f, "reopened"); }        // its [EOF] was lost; deliver
+    int pick = -1;
+    for (int i = 0; i < RXFRAME_N && pick < 0; i++) if (!g_rxf[i].open) pick = i;
+    if (pick < 0) {                                  // table full: evict the stalest
+        pick = 0;
+        for (int i = 1; i < RXFRAME_N; i++) if (g_rxf[i].ms < g_rxf[pick].ms) pick = i;
+        rxframe_close(g_rxf[pick], "evicted");
+    }
+    RxFrame &n = g_rxf[pick];
+    strncpy(n.src, src, sizeof(n.src) - 1); n.src[sizeof(n.src) - 1] = 0;
+    n.msg = ""; n.open = true; n.ms = millis();
+    return n;
+}
+static void rxframe_tick()
+{
+    for (int i = 0; i < RXFRAME_N; i++)
+        if (g_rxf[i].open && (uint32_t)(millis() - g_rxf[i].ms) > RXFRAME_IDLE_MS)
+            rxframe_close(g_rxf[i], "timeout");
 }
 
 // --- message class layer (gopher-over-lora lora/PROTOCOL.md §5, v1.3) --------
@@ -1807,20 +1855,50 @@ static RouterInfo *router_get(const char *src, bool create)
     return &g_routers[i];
 }
 
-static bool router_src_is_home(const char *src)
+// v1.19 (PROTOCOL.md §5): a pull is addressed PER PLANE, by `caps`, not to home.
+// Home stays an RSSI-only association whose real job is alerts; a pull sent to a
+// router that does not serve that plane is simply lost. So for plane 'N' or 'B':
+// the strongest alive router whose caps carry the letter. `rev` corroborates caps —
+// a beacon claiming N with news_rev "-" is self-contradictory and sorts AFTER every
+// corroborated candidate, but is never excluded: a capable router that has not
+// fetched yet would otherwise be exiled forever. Ordering, not a dB penalty — a
+// penalty small enough to be safe is too small to matter against a 21 dB spread.
+// Nobody claims the letter -> -1 (pull goes '*', the v1.10 safety net). Everybody
+// contradictory -> the strongest of them, not '*': a broadcast would only add a
+// second answerer to a claim that is still the best information we have.
+static int router_for_plane(char plane)
 {
-    // No home yet = follow anyone: a device that has never heard a beacon must keep
-    // working against a v1.10 single-router mesh exactly as before.
-    if (g_home < 0) return true;
-    return !strcmp(g_routers[g_home].id, src);
+    uint32_t now = millis();
+    int best = -1; bool best_ok = false;
+    for (int i = 0; i < g_routers_n; i++) {
+        RouterInfo &r = g_routers[i];
+        if (!r.last_ms || (uint32_t)(now - r.last_ms) > 180000) continue;   // not alive
+        if (!strchr(r.caps, plane)) continue;
+        const char *rev = (plane == 'N') ? r.news_rev : r.book_rev;
+        bool ok = rev[0] && strcmp(rev, "-");
+        if (best < 0 || (ok && !best_ok) || (ok == best_ok && r.ewma > g_routers[best].ewma)) {
+            best = i; best_ok = ok;
+        }
+    }
+    return best;
 }
 
-// The optional trailing <router> field on every pull. Absent = '*' = any router
-// answers (v1.10 behavior), which is exactly right while no home is known.
-static String router_pull_suffix()
+// The optional trailing <router> field on a pull. Absent = '*' = any router answers.
+static String router_pull_suffix(char plane)
 {
-    if (g_home < 0) return String();
-    return String("\t") + g_routers[g_home].id;
+    int i = router_for_plane(plane);
+    if (i < 0) return String();
+    return String("\t") + g_routers[i].id;
+}
+
+// The shelf-keeper for a plane is the router we address that plane's pulls to. Its
+// announces move our shelf; anyone else's are noted for seq and otherwise ignored.
+// Nobody addressable = follow anyone, exactly the v1.10 single-router behaviour.
+static bool router_src_serves(const char *src, char plane)
+{
+    int i = router_for_plane(plane);
+    if (i < 0) return true;
+    return !strcmp(g_routers[i].id, src);
 }
 
 // Adopt a (new) home's advertised shelf state: if its revisions differ from what we
@@ -2030,7 +2108,7 @@ static void news_send_gn()
     // we already had while the ones we were missing never came again. An article that
     // lost even one chunk could not finish, which is exactly what it looked like from
     // the outside: the first article fine, and from then on no body at all.
-    lora_tx_line("!GN\t" + String(g_art_id) + "\t" + b36(bits) + router_pull_suffix() + "\n");
+    lora_tx_line("!GN\t" + String(g_art_id) + "\t" + b36(bits) + router_pull_suffix('N') + "\n");
     Serial.printf("[news] GN %s have=%s (%d/%d)\n", g_art_id, b36(bits).c_str(),
                   g_art_have, g_art_total);
 }
@@ -2151,12 +2229,12 @@ static void news_handle(bool is_ga, const String &line)
         if (seq >= 0 && rt && rt->ga_seq >= 0 && seq <= rt->ga_seq) return;  // this src repeating itself
         if (seq >= 0 && rt) rt->ga_seq = seq;
         if (!rev.equals(g_news_rev)) {
-            if (!router_src_is_home(g_rx_src3)) return;   // a non-home shelf is not ours
+            if (!router_src_serves(g_rx_src3, 'N')) return;   // not the N shelf-keeper
             strncpy(g_news_rev, rev.c_str(), sizeof(g_news_rev) - 1);
             g_news_rev[sizeof(g_news_rev) - 1] = 0;
             g_news_n = 0; g_news_count = -1; structural = true;
             if (news_flush_hold()) news_mark_new(g_news_n ? g_news[0].title : "");
-        } else if (!router_src_is_home(g_rx_src3)) {
+        } else if (!router_src_serves(g_rx_src3, 'N')) {
             return;   // same rev from elsewhere: counted its seq, but the home speaks for us
         }
         if (seq >= 0) g_news_seq = seq;
@@ -2201,7 +2279,7 @@ static void news_send_gl()
     if (g_news_gl_ms && (uint32_t)(now - g_news_gl_ms) < 30000) return;   // too soon
     g_news_gl_ms = now;
     bool complete = g_news_rev[0] && g_news_count >= 0 && g_news_n >= g_news_count;
-    lora_tx_line(String("!GL\t") + (complete ? g_news_rev : "-") + router_pull_suffix() + "\n");
+    lora_tx_line(String("!GL\t") + (complete ? g_news_rev : "-") + router_pull_suffix('N') + "\n");
     if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_REFRESH " requesting headlines...");
 }
 
@@ -2229,8 +2307,8 @@ static void news_send_gq()
     g_news_gq_ms = now;
     g_art_gn_ms = 0;
     g_gq_answered = false; g_gq_sent_ms = now;
-    lora_tx_line("!GQ\t" + String(g_art_id) + router_pull_suffix() + "\n");   // ttl=3
-    Serial.printf("[news] GQ %s%s\n", g_art_id, router_pull_suffix().c_str());
+    lora_tx_line("!GQ\t" + String(g_art_id) + router_pull_suffix('N') + "\n");   // ttl=3
+    Serial.printf("[news] GQ %s%s\n", g_art_id, router_pull_suffix('N').c_str());
 }
 
 // LIST view: header + a tappable button per headline.
@@ -2478,7 +2556,7 @@ static void book_handle_bc(const String &line)
     RouterInfo *rt = router_get(g_rx_src3, true);
     if (rt && rt->bc_seq && seq <= rt->bc_seq) return;       // this src repeating itself
     if (rt) rt->bc_seq = seq;
-    if (!router_src_is_home(g_rx_src3)) return;              // not our shelf-keeper
+    if (!router_src_serves(g_rx_src3, 'B')) return;          // not the B shelf-keeper
     if (g_book_rev[0] && seq <= g_book_seq) return;          // stale vs adopted state
     bool newrev = !rev.equals(g_book_rev);
     strncpy(g_book_rev, rev.c_str(), sizeof(g_book_rev) - 1);
@@ -2586,7 +2664,7 @@ static void book_send_bl()
     if (!g_lora_ok) return;
     if (g_book_bl_ms && (uint32_t)(millis() - g_book_bl_ms) < 8000) return;
     g_book_bl_ms = millis();
-    lora_tx_line(String("!BL\t") + (g_book_rev[0] ? g_book_rev : "-") + router_pull_suffix() + "\n");
+    lora_tx_line(String("!BL\t") + (g_book_rev[0] ? g_book_rev : "-") + router_pull_suffix('B') + "\n");
 }
 
 static void book_send_bq(const char *id, int page)
@@ -2613,7 +2691,7 @@ static void book_send_bq(const char *id, int page)
     // blank. The flag holds it at the top until there is something to read.
     g_rd_land_top = !g_rd_land_bottom;
     if (g_rd_land_top && g_rd_scroll) lv_obj_scroll_to_y(g_rd_scroll, 0, LV_ANIM_OFF);
-    lora_tx_line("!BQ\t" + String(id) + "\t" + b36((uint32_t)page) + router_pull_suffix() + "\n");
+    lora_tx_line("!BQ\t" + String(id) + "\t" + b36((uint32_t)page) + router_pull_suffix('B') + "\n");
     Serial.printf("[book] BQ %s p%d\n", id, page);
     book_render_page();
 }
@@ -2625,7 +2703,7 @@ static void book_send_bn()
     if (!g_lora_ok || !g_rd_id[0] || !g_rd_n) return;
     uint32_t have = 0;
     for (int i = 0; i < g_rd_n && i < 32; i++) if (g_rd_seen[i]) have |= (1u << i);
-    lora_tx_line("!BN\t" + String(g_rd_id) + "\t" + b36((uint32_t)g_rd_page) + "\t" + b36(have) + router_pull_suffix() + "\n");
+    lora_tx_line("!BN\t" + String(g_rd_id) + "\t" + b36((uint32_t)g_rd_page) + "\t" + b36(have) + router_pull_suffix('B') + "\n");
     Serial.printf("[book] BN %s p%d have=%s (%d/%d)\n", g_rd_id, g_rd_page,
                   b36(have).c_str(), g_rd_have, g_rd_n);
 }
@@ -4636,34 +4714,24 @@ static void lora_l1_dispatch(const String &line)
 
 static void lora_process_line(const String &line)
 {
-    if (line == "[SOF]") {
-        if (g_lora_in_frame && g_lora_rx_msg.length()) lora_emit_msg(g_lora_rx_msg);  // prev EOF lost
-        g_lora_rx_msg = "";
-        g_lora_in_frame = true;
-        g_lora_frame_ms = millis();
-        return;
-    }
-    if (line == "[EOF]") {
-        g_lora_in_frame = false;
-        lora_emit_msg(g_lora_rx_msg);
-        g_lora_rx_msg = "";
-        return;
-    }
+    RxFrame *fr = rxframe_find(g_rx_src3);           // this sender's open frame, if any
+    if (line == "[SOF]") { rxframe_open(g_rx_src3); return; }
+    if (line == "[EOF]") { if (fr) rxframe_close(*fr, NULL); return; }   // stray EOF: ignore
     if (line == "HB" || line.startsWith("HB\t")) return;  // L0 beacon → Discovery app (neigh table), never chat
     // --- message class layer (lora/PROTOCOL.md §5) — MUST precede frame accumulation ---
     // L1 ('!'): out-of-band system line, never chat. Inside an open frame a chunk
     // beginning '!!' is L2 user text (strip one '!'); a single '!' is always L1.
     if (line.length() && line[0] == '!') {
-        if (g_lora_in_frame && line.length() >= 2 && line[1] == '!')
-            g_lora_rx_msg += line.substring(1);           // L2 escape
-        else
+        if (fr && line.length() >= 2 && line[1] == '!') {
+            fr->msg += line.substring(1); fr->ms = millis();   // L2 escape: a chunk, so it refreshes
+        } else
             lora_l1_dispatch(line);                       // L1 system → out-of-band
         return;
     }
     // Inside an open frame everything below is user text (PROTOCOL.md §5, v1.8):
     // the L0 and grandfather prefixes are matched only OUTSIDE a frame, otherwise a
     // chunk that happens to start with "PING\t" or "SYS " is silently eaten mid-message.
-    if (g_lora_in_frame) { g_lora_rx_msg += line; g_lora_frame_ms = millis(); return; }
+    if (fr) { fr->msg += line; fr->ms = millis(); return; }
     // L0 range ping/pong: consumed by the Range app; never a chat bubble here.
     if (line.startsWith("PING\t") || line.startsWith("PONG\t")) return;
     // Grandfather (transition, §5 migration): bare pre-v1.3 system lines → consume so
@@ -7173,13 +7241,7 @@ void loop()
     // so it absorbs later non-'!' lines from ANY sender (P10's bare "CS ifft=..."
     // telemetry is exactly that shape). The sender-side fix belongs to the sender; this
     // is the receiver refusing to stay open forever. 20 s is ~30x a chunk's air gap.
-    if (g_lora_in_frame && (uint32_t)(millis() - g_lora_frame_ms) > 20000) {
-        Serial.printf("[rx] frame timeout, closing (%u B held)\n",
-                      (unsigned)g_lora_rx_msg.length());
-        g_lora_in_frame = false;
-        if (g_lora_rx_msg.length()) lora_emit_msg(g_lora_rx_msg);
-        g_lora_rx_msg = "";
-    }
+    rxframe_tick();              // v1.19: per-sender frames expire on their own idle timers
     rxlog_console();             // 'l' list, 'd' dump the SD log over USB, 'x' stop
     rxlog_dump_tick();           // ~2 KB per pass so LVGL and the watchdog stay happy
     rxlog_tick();                // buffered SD flush, >=2 s cadence, never mid-RX-critical
