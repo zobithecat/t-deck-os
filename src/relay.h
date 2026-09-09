@@ -30,7 +30,36 @@
                                // as new. PROTOCOL.md §7 requires >=256 on forwarders.
 
 // ── dedup ring buffer ───────────────────────────────────────────────────────
-struct RelaySeen { uint32_t key[RELAY_SEEN_N]; uint16_t head; bool full; };
+// The ring also carries its own sizing evidence. A full ring is NOT a small ring:
+// held == size becomes true on every node that runs long enough. The question that
+// matters is whether a key was evicted while a duplicate of it was still in flight,
+// and no counter of hits or misses can answer it.
+//
+// So evicted keys fall into a ghost ring of the same size, and a miss that the ghost
+// recognises is counted as `late` — "a packet a ring twice this size would have
+// caught". The ghost is measurement only: a ghost hit is still treated as new, so
+// behaviour is unchanged and only the counter moves.
+//
+// `late` alone is not enough, though, and E01's 21-hour run shows why: late 0 over a
+// 113-minute horizon rules out duplicates older than 113 minutes and says nothing
+// about the window the ring actually covers. Everything inside it is just a hit.
+// `widest_hit_s` closes that: when a duplicate arrives, how old was the original?
+// If the widest gap ever observed sits far below the horizon, the ring is amply
+// sized — that is the number that argues for KEEPING RELAY_SEEN_N at 256, which
+// matters because this file is byte-identical across the T-Deck and pager repos and
+// changing it means rebuilding both.
+//
+// Ages come from the caller's clock: this header stays I/O-agnostic and never reads
+// a timer itself.
+struct RelaySeen {
+    uint32_t key[RELAY_SEEN_N];
+    uint32_t ghost[RELAY_SEEN_N];      // keys this ring has already forgotten
+    uint32_t at[RELAY_SEEN_N];         // caller-clock stamp of each key
+    uint16_t head, ghost_head;
+    bool     full, ghost_full;
+    uint32_t hits, misses, late;       // late = miss the ghost recognised
+    uint32_t widest_hit, oldest_at;    // widest duplicate gap; stamp of the eldest key
+};
 
 static inline uint32_t relay_hash(const String &s) {
     uint32_t h = 2166136261u;                              // FNV-1a
@@ -41,14 +70,38 @@ static inline uint32_t relay_key(const String &src, uint32_t pktid) {
     return relay_hash(src) * 2654435761u + pktid;
 }
 // true  = already seen (caller should drop);  false = new (now recorded)
-static inline bool relay_seen(RelaySeen &rs, const String &src, uint32_t pktid) {
+// now_ms: the caller's monotonic clock, only ever used as a difference.
+static inline bool relay_seen(RelaySeen &rs, const String &src, uint32_t pktid,
+                              uint32_t now_ms) {
     uint32_t k = relay_key(src, pktid);
     int n = rs.full ? RELAY_SEEN_N : rs.head;
-    for (int i = 0; i < n; i++) if (rs.key[i] == k) return true;
+    for (int i = 0; i < n; i++) if (rs.key[i] == k) {
+        rs.hits++;
+        uint32_t age = now_ms - rs.at[i];           // how stale the original already was
+        if (age > rs.widest_hit) rs.widest_hit = age;
+        return true;
+    }
+    if (rs.full) {                                  // the key about to be overwritten
+        int g = rs.ghost_full ? RELAY_SEEN_N : rs.ghost_head;
+        for (int i = 0; i < g; i++) if (rs.ghost[i] == k) { rs.late++; break; }
+        rs.ghost[rs.ghost_head] = rs.key[rs.head];  // remember what we forget
+        rs.ghost_head = (rs.ghost_head + 1) % RELAY_SEEN_N;
+        if (rs.ghost_head == 0) rs.ghost_full = true;
+        rs.oldest_at = rs.at[rs.head];              // the eldest survivor, after this write
+    }
+    rs.misses++;
     rs.key[rs.head] = k;
+    rs.at[rs.head]  = now_ms;
     rs.head = (rs.head + 1) % RELAY_SEEN_N;
     if (rs.head == 0) rs.full = true;
     return false;
+}
+
+// How far back the ring currently remembers, in the caller's clock units. Compare
+// widest_hit against this: widest_hit << horizon means the size has margin.
+static inline uint32_t relay_horizon(const RelaySeen &rs, uint32_t now_ms) {
+    if (!rs.full) return rs.misses ? now_ms - rs.at[0] : 0;
+    return now_ms - rs.oldest_at;
 }
 
 // ── pktid counter (seed randomly so a reboot doesn't reuse recent ids) ───────

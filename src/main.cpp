@@ -4766,7 +4766,7 @@ static void lora_rx_dispatch(const String &line)
     String src, orig; uint32_t pktid; uint8_t ttl;
     if (relay_parse(line, src, pktid, ttl, orig)) {
         if (src == NODE_ID) return;
-        if (relay_seen(g_relay_seen, src, pktid)) return;
+        if (relay_seen(g_relay_seen, src, pktid, millis())) return;
         // device discovery: this first (shortest-path) copy proves src is alive.
         // HB is ttl=1 (never relayed) → always direct; other traffic hops = MESH−ttl.
         int hops = relay_hops(orig, ttl);
@@ -7242,6 +7242,17 @@ void loop()
                           (unsigned long)(100 * (g_rx_corrupt + g_rx_bad) /
                                           ((g_rx_ok + g_rx_corrupt + g_rx_bad) ? (g_rx_ok + g_rx_corrupt + g_rx_bad) : 1)),
                           g_rx_rssi_last, g_rx_snr_last);
+            // Dedup sizing evidence, printed where the rx counters already are.
+            // widest_hit far below horizon is the argument for keeping the ring at
+            // RELAY_SEEN_N; late > 0 is the argument for raising it (both repos).
+            Serial.printf("[dedup] n=%d held=%u hits=%lu miss=%lu late=%lu "
+                          "widest_hit=%.1fs horizon=%.0fs\n",
+                          RELAY_SEEN_N,
+                          (unsigned)(g_relay_seen.full ? RELAY_SEEN_N : g_relay_seen.head),
+                          (unsigned long)g_relay_seen.hits, (unsigned long)g_relay_seen.misses,
+                          (unsigned long)g_relay_seen.late,
+                          g_relay_seen.widest_hit / 1000.0f,
+                          relay_horizon(g_relay_seen, millis()) / 1000.0f);
             rx_seen = tot;
         }
         rx_ms = now;
