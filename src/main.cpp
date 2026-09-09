@@ -1727,13 +1727,16 @@ static void lora_tx_pump()
     }
     TxJob &j = g_txq[g_txq_head];
     if (g_rxlog_on) {                        // half-duplex deaf windows, for the overlay
-        char d[48];
+        // Same width as the rx rows. 24 chars cut "R|TFF|<pktid>|3|!GL|-" exactly at
+        // the byte where the v1.19 per-plane <router> field begins, so every addressed
+        // pull read as a '*' broadcast in the log while the frame length said otherwise.
+        char d[64];
         if (j.buf[0] == 0xC2 && j.len >= 13)     // VOICE_MAGIC (defined later in the file)
             snprintf(d, sizeof(d), "C2 vid=%04X %u/%u",
                      (unsigned)((uint16_t)j.buf[7] | (uint16_t)j.buf[8] << 8), j.buf[9], j.buf[10]);
         else {
             int dn = 0;
-            for (int i = 0; i < (int)j.len && dn < 24; i++) {
+            for (int i = 0; i < (int)j.len && dn < 56; i++) {
                 char ch = (char)j.buf[i];
                 d[dn++] = (ch == '\t') ? '|' : ((uint8_t)ch < 0x20 ? '.' : ch);
             }
