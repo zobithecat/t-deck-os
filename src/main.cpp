@@ -5497,13 +5497,14 @@ static void range_sweep()
 // copy per responder per seq — exactly the unit the stats want.
 static void range_on_pong(const String &src, const String &orig, int hops)
 {
-    int p2 = orig.indexOf('\t', 5), p3 = p2 > 0 ? orig.indexOf('\t', p2 + 1) : -1;
+    // PONG\t<seq>\t<id> (§5 L0 table): the third field is the RESPONDER's display id
+    // (FAN1, E01, P10), not the pinger's. It names nobody's test, so it cannot be used
+    // to filter; the seq is the only handle. A PONG for a seq we never sent, or one
+    // older than the last 16, is another node's Range test and is ignored.
+    int p2 = orig.indexOf('\t', 5);
     long seq = (p2 > 0 ? orig.substring(5, p2) : orig.substring(5)).toInt();
-    if (p2 > 0) {                                   // PONG\tseq\t<pinger>: not our test → ignore
-        String who = p3 > 0 ? orig.substring(p2 + 1, p3) : orig.substring(p2 + 1);
-        if (who.length() && !who.equals(LORA_SENDER_ID)) return;
-    }
     if (!g_rng_seq || seq < 0 || (uint32_t)seq >= g_rng_seq) return;
+    if ((uint32_t)seq + 16 < g_rng_seq) return;
     range_sweep();
     bool late = true;
     for (int i = 0; i < g_rng_pend_n; i++)
