@@ -107,10 +107,15 @@ def main():
     pings = [r for r in rows if r["ev"] == "tx" and "PING|" in r["d"]]
     pongs = [r for r in rows if r["ev"] == "pong"]
     misses = [r for r in rows if r["ev"] == "miss"]
-    ping_by_seq = {}
+    # seq restarts at 0 every time the Range app is reopened, so one file can hold the
+    # same seq several times: a reply belongs to the LAST PING of that seq before it.
+    ping_seqs = collections.defaultdict(list)
     for r in pings:
         m = re.search(r"PING\|(\d+)\|", r["d"])
-        if m: ping_by_seq[int(m[1])] = r
+        if m: ping_seqs[int(m[1])].append(r)
+    def ping_for(seq, before_ms):
+        c = [p for p in ping_seqs.get(seq, []) if p["ms"] <= before_ms]
+        return c[-1] if c else None
     if pings:
         print(f"\nRange: PING {len(pings)}  PONG {len(pongs)}  miss {len(misses)}")
         by = collections.defaultdict(list)
@@ -125,13 +130,18 @@ def main():
         cls = collections.Counter()
         for r in misses:
             m = re.search(r"seq (\d+)", r["d"]); seq = int(m[1]) if m else -1
-            p = ping_by_seq.get(seq)
+            p = ping_for(seq, r["ms"])
             if not p: cls["unknown"] += 1; continue
             w0, w1 = p["ms"] + 1000, p["ms"] + 4000
             own = any(s < w1 and e > w0 for s, e, rr in tx if rr is not p)
             other = any(s < w1 and e > w0 for s, e, rr in rx)
             cls["self-inflicted" if own else ("channel-busy" if other else "silent")] += 1
         print(f"  misses: {dict(cls)}")
+        # A damaged frame landing 1.0..2.0 s after a PING is where a fixed-hold PONG
+        # arrives; two responders on the same hold collide exactly there.
+        dmg = [r["ms"] for r in rows if r["ev"] == "noise" or (r["ev"] == "rx" and r["d"].startswith("CORRUPT"))]
+        coll = sum(1 for p in pings if any(1000 <= t - p["ms"] <= 2000 for t in dmg))
+        print(f"  PINGs with a damaged frame at +1.0..2.0 s (same-slot PONG collision signature): {coll}/{len(pings)}")
 
         # per-minute walk table
         print("\n  min  wall      dist   " + "  ".join(f"{k:>10}" for k in sorted(by)) + "   miss")
