@@ -149,6 +149,7 @@ static bool          g_sd_ok;      // declared here: the log console probes the 
 static void gw_push_rx(const String &line);   // BLE gateway hooks (defined with the module)
 static void gw_push_note();
 static void lora_send(const char *text);      // the one chat sender: [SOF]/[TFF] …/[EOF]
+static void range_on_pong(const String &src, const String &orig, int hops);   // Range rides the normal RX path
 
 static void rxlog_line(const char *ev, int len, int rssi, float snr, const char *detail)
 {
@@ -325,7 +326,6 @@ static lv_obj_t     *g_lora_log;
 static lv_obj_t     *g_lora_input;
 static String        g_lora_history;          // persistent RX/TX log (survives app close)
 static volatile int  g_lora_unread = 0;       // messages received while LoRa app was closed
-static volatile bool g_range_active = false;  // Range app owns the radio when true
 static HangulIME     g_ime;             // 두벌식 한글 입력기
 static bool          g_kr_mode = false; // LoRa input: Korean vs English
 static bool          g_shift_lock = false;  // one-handed CAPS/shift lock (via the $ leader key)
@@ -433,12 +433,8 @@ static lv_obj_t     *g_sd_list;
 static lv_obj_t     *g_sd_status;
 static lv_obj_t     *g_rng_rssi, *g_rng_stats, *g_rng_log;   // LoRa range test
 static lv_timer_t   *g_rng_poll, *g_rng_tx;
-static uint32_t      g_rng_seq;
-static int           g_rng_rx, g_rng_miss, g_rng_rmin, g_rng_rmax, g_rng_rcount;
-static int           g_rng_h0, g_rng_h1, g_rng_h2;   // reply hop histogram: direct / 1-hop / 2-hop
-static long          g_rng_rsum, g_rng_last_seq;     // g_rng_last_seq = last counted seq (dedup relay copies)
-static bool          g_rng_acked;   // 직전에 보낸 PING이 PONG으로 응답받았나 (loss 판정용)
-static String        g_rng_file;            // per-session range CSV path (set on Range app open)
+static uint32_t      g_rng_seq;                              // PINGs sent this session
+static int           g_rng_ok, g_rng_miss, g_rng_late;       // seqs answered in time / not at all / after the deadline
 static lv_obj_t     *g_rng_dist;            // walk-test: big distance-from-base readout
 static double        g_rng_anchor_lat, g_rng_anchor_lon;   // "base" position set on-site
 static bool          g_rng_has_anchor;
@@ -1718,7 +1714,7 @@ static void chan_reserve(uint32_t until_ms)
 
 static void lora_tx_pump()
 {
-    if (!g_lora_ok || g_range_active || g_tx_inflight || !g_txq_n) return;
+    if (!g_lora_ok || g_tx_inflight || !g_txq_n) return;
     if (g_tx_gap_until && (int32_t)(millis() - g_tx_gap_until) < 0) return;
     if (g_tx_cr != g_tx_cr_applied) {
         lora_radio.setCodingRate(g_tx_cr);
@@ -1832,6 +1828,8 @@ struct RouterInfo {
     char     floor[8], room[24];       // indoor-position seed, for the diagnostics UI
     float    ewma;                     // beacon RSSI, alpha = 0.3 (normative)
     uint32_t last_ms;                  // last beacon heard
+    uint32_t first_ms;                 // first beacon heard: beacons/expected = passive loss
+    uint16_t beacons;                  // beacons heard since first_ms
     uint8_t  streak;                   // consecutive beacons above home + 6 dB
     long     ga_seq;                   // last !GA seq accepted FROM THIS SRC (-1 = none)
     uint32_t bc_seq;                   // last !BC seq from this src
@@ -1940,6 +1938,8 @@ static void router_handle_rb(const String &line)
     strncpy(r->floor,    f[6].c_str(), sizeof(r->floor) - 1);
     strncpy(r->room,     f[7].c_str(), sizeof(r->room) - 1);
     r->ewma    = r->last_ms ? 0.3f * g_rx_rssi_last + 0.7f * r->ewma : (float)g_rx_rssi_last;
+    if (!r->last_ms) r->first_ms = millis();
+    if (r->beacons < 0xFFFF) r->beacons++;
     r->last_ms = millis();
 
     int idx = (int)(r - g_routers);
@@ -4695,6 +4695,41 @@ static void voice_selftest()
                   ok ? "ok" : "FAILED", voice_addr("TFF"));
 }
 
+// !RS\t<id>\t<up_s>\t<heard>\t<fwd>\t<drop> — a relay's own health, ttl 1. Kept for the
+// Range passive panel: how busy the forwarder is and how much it drops is link quality
+// that costs no PING.
+struct RelayStat { char id[8]; uint32_t up_s, heard, fwd, drop, last_ms; int16_t rssi; };
+static RelayStat g_relays[4];
+static int       g_relays_n = 0;
+static void relay_handle_rs(const String &line)
+{
+    int t[6], n = 0, at = line.indexOf('\t');
+    while (n < 6 && at >= 0) { t[n++] = at; at = line.indexOf('\t', at + 1); }
+    if (n < 5) return;
+    String id = line.substring(t[0] + 1, t[1]);
+    int i = 0;
+    for (; i < g_relays_n; i++) if (id.equals(g_relays[i].id)) break;
+    if (i == g_relays_n) {
+        if (g_relays_n < 4) g_relays_n++;
+        else { i = 0; for (int k = 1; k < 4; k++) if (g_relays[k].last_ms < g_relays[i].last_ms) i = k; }
+        memset(&g_relays[i], 0, sizeof(RelayStat));
+        strncpy(g_relays[i].id, id.c_str(), sizeof(g_relays[i].id) - 1);
+    }
+    RelayStat &r = g_relays[i];
+    r.up_s  = (uint32_t)line.substring(t[1] + 1, t[2]).toInt();
+    r.heard = (uint32_t)line.substring(t[2] + 1, t[3]).toInt();
+    r.fwd   = (uint32_t)line.substring(t[3] + 1, t[4]).toInt();
+    r.drop  = (uint32_t)(n > 5 ? line.substring(t[4] + 1, t[5]) : line.substring(t[4] + 1)).toInt();
+    r.rssi  = (int16_t)g_rx_rssi_last;
+    r.last_ms = millis();
+}
+
+// "CS ifft=0.63m ps=0.60m rtt=12.4m" — the P10 anchor's channel-sounding distance
+// estimate, still a bare (pre-v1.3) line on air. The last one heard is shown on the
+// Range passive panel; nothing else consumes it.
+struct CsLast { char src[4]; float ifft, ps, rtt; uint32_t ms; };
+static CsLast g_cs;
+
 static void lora_l1_dispatch(const String &line)
 {
     int t1 = line.indexOf('\t');
@@ -4704,6 +4739,7 @@ static void lora_l1_dispatch(const String &line)
     if (type == "GR") { g_gq_answered = true; news_head_handle(line); return; }   // v1.8 reply header
     if (type == "GD") { g_gq_answered = true; news_data_handle(line); return; }   // v1.5 body chunk
     if (type == "RB") { router_handle_rb(line);   return; }   // v1.11 router beacon
+    if (type == "RS") { relay_handle_rs(line);    return; }   // relay health beacon → Range panel
     if (type == "VA") { voice_handle_va(line);    return; }   // v1.12 voice announce
     if (type == "VN") { voice_handle_vn(line);    return; }   // v1.12 voice repair req
     if (type == "VT") { voice_handle_vt(line);    return; }   // v1.13 voice full text
@@ -4741,6 +4777,11 @@ static void lora_process_line(const String &line)
     // today's CS-anchor firmware stops polluting chat. Delete once none remain on air.
     if (line.startsWith("CS ifft=") || line.startsWith("SYS ")) {
         Serial.printf("[L1-legacy] %s\n", line.c_str());
+        float a, b, c;
+        if (sscanf(line.c_str(), "CS ifft=%fm ps=%fm rtt=%fm", &a, &b, &c) == 3) {
+            g_cs.ifft = a; g_cs.ps = b; g_cs.rtt = c; g_cs.ms = millis();
+            strncpy(g_cs.src, g_rx_src3, sizeof(g_cs.src) - 1);
+        }
         return;
     }
     if (line == "AT" || line == "OK" || line.startsWith("AT+") ||   // AT artifacts
@@ -4875,6 +4916,7 @@ static void lora_rx_dispatch(const String &line)
             d[dn] = 0;
             rxlog_line("rx", g_rx_pkt_len, g_rx_rssi_last, g_rx_snr_last, d);
         }
+        if (orig.startsWith("PONG\t")) range_on_pong(src, orig, relay_hops(orig, ttl));
         gw_push_rx(line);                        // the phone sees the envelope line verbatim
         // Envelope context for the L1 handlers: v1.11 scopes (rev, seq) per src, and
         // !RB derives the router id from here. Anything heard from the home router
@@ -4931,7 +4973,7 @@ static int lora_init()
 
 static void lora_service()            // always-on background RX (called from loop())
 {
-    if (!g_lora_ok || g_range_active) return;   // radio down, or Range app owns the radio
+    if (!g_lora_ok) return;
     lora_tx_service();                          // a TX-done edge is not a packet
     lora_tx_pump();                             // ...and a freed channel may start the next
     int guard = 0;
@@ -4991,7 +5033,7 @@ static void lora_service()            // always-on background RX (called from lo
 static uint32_t g_hb_last = 0;
 static void lora_hb_tick()
 {
-    if (!g_lora_ok || g_range_active) return;
+    if (!g_lora_ok) return;
     if (g_crexp) return;   // the CR experiment's block boundary IS 30 s of our silence —
                            // a beacon landing inside that window erases the label
     // v1.15: yield to announced streams — but never defer past one own period. That
@@ -5323,13 +5365,6 @@ static String gps_loc_csv()
     return ",";
 }
 
-static void range_log_sd(const String &line)
-{
-    if (!sd_init() || g_rng_file.length() == 0) return;
-    File f = SD.open(g_rng_file.c_str(), FILE_APPEND);
-    if (f) { f.println(line); f.close(); }
-}
-
 // KbTest app: record one raw keyboard byte to the on-screen readout, serial, and SD
 // (/kbtest.log, appended). Lets the keyboard be mapped thoroughly + untethered.
 static void kbtest_log_key(uint32_t key)
@@ -5350,26 +5385,171 @@ static void kbtest_log_key(uint32_t key)
     }
 }
 
+// ---- Range, v1.19 ---------------------------------------------------------------
+// Range no longer owns the radio. PINGs go out through the ordinary TX queue and PONGs
+// come in through lora_rx_dispatch like every other line, so the router plane, the
+// beacons and the phone gateway keep running during a test, and the SD rxlog is the one
+// log: a PING is its 'tx' row, a PONG a 'pong' row, a dead seq a 'miss' row.
+//
+// Three things the old app got wrong once v1.19 landed:
+//  - it never said WHO answered. E01, P10, the pager and the relays can all PONG now,
+//    so "loss 15 %" was nobody's number. Every responder gets its own line.
+//  - loss was judged at the next PING. Frame exclusivity (§5 v1.19) parks a reply for
+//    up to one frame (~5 s), longer than the walk cadence, so a parked PONG read as
+//    loss. Each seq now carries its own deadline: 4×ToA (the §8 hold) + one frame +
+//    slack. A PONG after that is counted 'late', never thrown away.
+//  - it was blind while listening. Router beacons carry RSSI every 60 s and relay
+//    beacons carry heard/fwd/drop — link quality for free, zero airtime. The passive
+//    panel shows that whether or not a single PING has been sent.
+#define RNG_PEND_N  8
+#define RNG_RESP_N  8
+#define RNG_PARK_MS 5000            // one chat frame at SF9: the v1.19 reply-parking bound
+struct RngPend { uint32_t seq, sent_ms, due_ms; bool answered; };
+struct RngResp { char id[4]; uint16_t rx, h[3]; long rsum; int rmin, rmax, last_rssi; float snr_sum; uint32_t last_ms; };
+static RngPend g_rng_pend[RNG_PEND_N]; static int g_rng_pend_n = 0;
+static RngResp g_rng_resp[RNG_RESP_N]; static int g_rng_resp_n = 0;
+
+static void range_log_ui(const char *ln)
+{
+    if (!g_rng_log) return;
+    lv_textarea_add_text(g_rng_log, ln);
+    lv_textarea_set_cursor_pos(g_rng_log, LV_TEXTAREA_CURSOR_LAST);
+}
+
+// The passive half: what the beacons already say. Expected beacons = elapsed / 60 s.
+static String range_passive_text()
+{
+    uint32_t now = millis();
+    String t;
+    for (int i = 0; i < g_routers_n; i++) {
+        RouterInfo &r = g_routers[i];
+        uint32_t age = (now - r.last_ms) / 1000;
+        uint32_t exp = (now - r.first_ms) / 60000 + 1;
+        int loss = exp > r.beacons ? (int)(100 * (exp - r.beacons) / exp) : 0;
+        char ln[72];
+        snprintf(ln, sizeof(ln), "%s%s %.0fdBm %lus  bcn %u/%lu %d%%\n",
+                 i == g_home ? LV_SYMBOL_HOME : " ", r.id, r.ewma, (unsigned long)age,
+                 (unsigned)r.beacons, (unsigned long)exp, loss);
+        t += ln;
+    }
+    for (int i = 0; i < g_relays_n; i++) {
+        RelayStat &r = g_relays[i];
+        char ln[80];
+        snprintf(ln, sizeof(ln), LV_SYMBOL_SHUFFLE "%s %ddBm  fwd %lu/%lu drop %lu  %lus\n",
+                 r.id, (int)r.rssi, (unsigned long)r.fwd, (unsigned long)r.heard,
+                 (unsigned long)r.drop, (unsigned long)((now - r.last_ms) / 1000));
+        t += ln;
+    }
+    if (g_cs.ms && (now - g_cs.ms) < 600000) {
+        char ln[64];
+        snprintf(ln, sizeof(ln), LV_SYMBOL_GPS "%s CS %.2fm/%.2fm rtt %.1f  %lus\n", g_cs.src,
+                 g_cs.ifft, g_cs.ps, g_cs.rtt, (unsigned long)((now - g_cs.ms) / 1000));
+        t += ln;
+    }
+    if (!t.length()) t = "(no beacons yet)\n";
+    return t;
+}
+
 static void range_update_stats()
 {
-    // loss는 "보낸 PING 중 PONG 못 받은 비율". 받은 패킷 갭이 아니라 송신 기준이라
-    // pager가 아예 응답 안 해도 loss가 제대로 올라간다.
+    if (!g_rng_stats) return;
     int sent = (int)g_rng_seq;
     int loss = sent ? (g_rng_miss * 100 / sent) : 0;
-    int avg  = g_rng_rcount ? (int)(g_rng_rsum / g_rng_rcount) : 0;
-    if (g_rng_stats)
-        lv_label_set_text_fmt(g_rng_stats,
-                              "tx %d  rx %d  miss %d  loss %d%%\nrssi  %d / %d / %d  (min/avg/max)\nhops  direct %d  1-hop %d  2-hop %d",
-                              sent, g_rng_rx, g_rng_miss, loss,
-                              g_rng_rcount ? g_rng_rmin : 0, avg, g_rng_rcount ? g_rng_rmax : 0,
-                              g_rng_h0, g_rng_h1, g_rng_h2);
+    String t;
+    char ln[96];
+    snprintf(ln, sizeof(ln), "tx %d  ok %d  miss %d  late %d  loss %d%%\n",
+             sent, g_rng_ok, g_rng_miss, g_rng_late, loss);
+    t += ln;
+    for (int i = 0; i < g_rng_resp_n; i++) {
+        RngResp &r = g_rng_resp[i];
+        snprintf(ln, sizeof(ln), " %s rx %u  h0/1/2 %u/%u/%u  %d/%ld/%d dBm  snr %.1f\n",
+                 r.id, (unsigned)r.rx, (unsigned)r.h[0], (unsigned)r.h[1], (unsigned)r.h[2],
+                 r.rmin, r.rx ? r.rsum / r.rx : 0L, r.rmax, r.rx ? r.snr_sum / r.rx : 0.0f);
+        t += ln;
+    }
+    t += "--- passive ---\n";
+    t += range_passive_text();
+    lv_label_set_text(g_rng_stats, t.c_str());
+}
+
+// Deadlines. A seq nobody answered by its due time is one miss; the entry then leaves
+// the table, and anything that still arrives for it is 'late' (counted, logged, never
+// undoing the miss — the number has to be honest about the cadence it was taken at).
+static void range_sweep()
+{
+    uint32_t now = millis();
+    for (int i = 0; i < g_rng_pend_n; ) {
+        RngPend &pd = g_rng_pend[i];
+        if ((int32_t)(now - pd.due_ms) < 0) { i++; continue; }
+        if (!pd.answered) {
+            g_rng_miss++;
+            char d[24]; snprintf(d, sizeof(d), "seq %lu", (unsigned long)pd.seq);
+            rxlog_line("miss", 0, 0, 0.0f, d);
+            char ln[32]; snprintf(ln, sizeof(ln), "#%lu  miss\n", (unsigned long)pd.seq);
+            range_log_ui(ln);
+        }
+        g_rng_pend[i] = g_rng_pend[--g_rng_pend_n];
+    }
+}
+
+// Called from lora_rx_dispatch for every PONG line, app open or not. Envelope dedup has
+// already dropped relayed copies of the same (src, pktid), so what arrives here is one
+// copy per responder per seq — exactly the unit the stats want.
+static void range_on_pong(const String &src, const String &orig, int hops)
+{
+    int p2 = orig.indexOf('\t', 5), p3 = p2 > 0 ? orig.indexOf('\t', p2 + 1) : -1;
+    long seq = (p2 > 0 ? orig.substring(5, p2) : orig.substring(5)).toInt();
+    if (p2 > 0) {                                   // PONG\tseq\t<pinger>: not our test → ignore
+        String who = p3 > 0 ? orig.substring(p2 + 1, p3) : orig.substring(p2 + 1);
+        if (who.length() && !who.equals(LORA_SENDER_ID)) return;
+    }
+    if (!g_rng_seq || seq < 0 || (uint32_t)seq >= g_rng_seq) return;
+    range_sweep();
+    bool late = true;
+    for (int i = 0; i < g_rng_pend_n; i++)
+        if (g_rng_pend[i].seq == (uint32_t)seq) {
+            late = false;
+            if (!g_rng_pend[i].answered) { g_rng_pend[i].answered = true; g_rng_ok++; }
+            break;
+        }
+    if (late) g_rng_late++;
+    if (hops < 0) hops = 0; if (hops > 2) hops = 2;
+    int rssi = g_rx_rssi_last; float snr = g_rx_snr_last;
+
+    int i = 0;
+    for (; i < g_rng_resp_n; i++) if (src.equals(g_rng_resp[i].id)) break;
+    if (i == g_rng_resp_n) {
+        if (g_rng_resp_n < RNG_RESP_N) g_rng_resp_n++;
+        else { i = 0; for (int k = 1; k < RNG_RESP_N; k++) if (g_rng_resp[k].last_ms < g_rng_resp[i].last_ms) i = k; }
+        memset(&g_rng_resp[i], 0, sizeof(RngResp));
+        strncpy(g_rng_resp[i].id, src.c_str(), sizeof(g_rng_resp[i].id) - 1);
+        g_rng_resp[i].rmin = g_rng_resp[i].rmax = rssi;
+    }
+    RngResp &r = g_rng_resp[i];
+    if (r.rx < 0xFFFF) { r.rx++; r.h[hops]++; }
+    r.rsum += rssi; r.snr_sum += snr; r.last_rssi = rssi; r.last_ms = millis();
+    if (rssi < r.rmin) r.rmin = rssi;
+    if (rssi > r.rmax) r.rmax = rssi;
+
+    const char *hoptxt = hops == 0 ? "direct" : (hops == 1 ? "1 hop" : "2 hop");
+    Serial.printf("[range] PONG #%ld %s %s %d dBm %.1f dB%s\n", seq, src.c_str(), hoptxt, rssi, snr,
+                  late ? "  LATE" : "");
+    char d[96];
+    snprintf(d, sizeof(d), "%s h%d seq %ld%s %s", src.c_str(), hops, seq, late ? " late" : "",
+             gps_loc_csv().c_str());
+    rxlog_line("pong", g_rx_pkt_len, rssi, snr, d);
+    if (g_rng_rssi) lv_label_set_text_fmt(g_rng_rssi, "%d dBm  %s %s", rssi, src.c_str(), hoptxt);
+    char ln[64];
+    snprintf(ln, sizeof(ln), "#%ld %s %ddBm %.1f %s%s\n", seq, src.c_str(), rssi, snr, hoptxt, late ? " late" : "");
+    range_log_ui(ln);
+    range_update_stats();
 }
 
 static void range_poll_cb(lv_timer_t *t)
 {
     // walk-test: refresh the big distance-from-base readout every ~500 ms (runs even with
     // no RX, since GPS updates independently of PONGs).
-    static uint32_t last_dist = 0;
+    static uint32_t last_dist = 0, last_stats = 0;
     if (g_rng_dist && (uint32_t)(millis() - last_dist) > 500) {
         last_dist = millis();
         if (!g_rng_has_anchor)
@@ -5382,86 +5562,27 @@ static void range_poll_cb(lv_timer_t *t)
         } else
             lv_label_set_text(g_rng_dist, "GPS --");
     }
-
-    if (!g_lora_rx_flag) return;
-    g_lora_rx_flag = false;
-    String pkt;
-    if (lora_radio.readData(pkt) != RADIOLIB_ERR_NONE || !pkt.length()) { lora_radio.startReceive(); return; }
-    int   rssi = (int)lora_radio.getRSSI();
-    float snr  = lora_radio.getSNR();
-    lora_radio.startReceive();
-
-    String first = pkt;
-    int nl = pkt.indexOf('\n'); if (nl >= 0) first = pkt.substring(0, nl);
-    first.trim();
-    // Range is relay-aware: a PONG counts whether it came direct or via relays, so the pager
-    // staying reachable through a relay is NOT scored as loss. Dropped only when the line can't
-    // be our reply:  non-R| = RF corruption;  src==us = our own PING echoed back;
-    //   non-PONG = HB / text / PING.
-    String src, orig; uint32_t pid; uint8_t ttl;
-    if (!relay_parse(first, src, pid, ttl, orig)) return;
-    if (src == NODE_ID)             return;
-    if (!orig.startsWith("PONG\t")) return;
-
-    int  p2  = orig.indexOf('\t', 5);
-    long seq = (p2 > 0 ? orig.substring(5, p2) : orig.substring(5)).toInt();
-
-    // Hop count is carried by the reply's ttl: the pager sends every PONG at RELAY_TTL_MESH and
-    // each relay decrements it, so hops = RELAY_TTL_MESH - ttl (0 = direct, 1, 2 ...).
-    int hops = (int)RELAY_TTL_MESH - (int)ttl;
-    if (hops < 0) hops = 0;
-
-    if (seq == (long)g_rng_seq - 1) g_rng_acked = true;   // our latest PING was answered (any path) → not a loss
-
-    // The same PONG reaches us several times (direct + one copy per relay). Count each seq once:
-    // the FIRST copy — the direct one when the direct link is up (shortest path arrives first),
-    // else the best relayed copy. Ignore the later duplicates of that seq.
-    if (seq == g_rng_last_seq) return;
-    g_rng_last_seq = seq;
-
-    if      (hops <= 0) g_rng_h0++;
-    else if (hops == 1) g_rng_h1++;
-    else                g_rng_h2++;
-
-    if (g_rng_rcount == 0) { g_rng_rmin = g_rng_rmax = rssi; }
-    else { if (rssi < g_rng_rmin) g_rng_rmin = rssi; if (rssi > g_rng_rmax) g_rng_rmax = rssi; }
-    g_rng_rsum += rssi; g_rng_rcount++; g_rng_rx++;
-
-    const char *hoptxt = hops <= 0 ? "direct" : (hops == 1 ? "1 hop" : "2 hop");
-    if (g_rng_rssi) lv_label_set_text_fmt(g_rng_rssi, "%d dBm  %s", rssi, hoptxt);   // big; SNR stays in log+CSV
-    if (g_rng_log) {
-        char ln[64]; snprintf(ln, sizeof(ln), "#%ld  %ddBm  %.1f  %s\n", seq, rssi, snr, hoptxt);
-        lv_textarea_add_text(g_rng_log, ln);
-        lv_textarea_set_cursor_pos(g_rng_log, LV_TEXTAREA_CURSOR_LAST);
-    }
-    range_update_stats();
-
-    char csv[112];
-    snprintf(csv, sizeof(csv), "%ld,PONG,%ld,%d,%d,%.1f,%s", (long)time(NULL),
-             seq, hops, rssi, snr, gps_loc_csv().c_str());
-    range_log_sd(String(csv));
+    range_sweep();
+    if ((uint32_t)(millis() - last_stats) > 1000) { last_stats = millis(); range_update_stats(); }
 }
 
 static void range_tx_cb(lv_timer_t *t)
 {
-    // 새 PING 보내기 전에 직전 PING을 판정: PONG으로 응답 못 받았으면 loss.
-    // (이게 핵심 — pager가 아예 응답 안 하면 range_poll_cb가 안 돌아서, 여기서
-    //  TX 시점에 세지 않으면 loss가 영영 안 올라간다.)
-    if (g_rng_seq > 0 && !g_rng_acked) {
+    uint32_t now = millis();
+    range_sweep();
+    if (g_rng_pend_n >= RNG_PEND_N) {              // table full: the eldest is a miss, by definition
         g_rng_miss++;
-        range_update_stats();
+        g_rng_pend[0] = g_rng_pend[--g_rng_pend_n];
     }
-    g_rng_acked = false;                                    // 새 PING은 아직 미응답
-
     char buf[40];
     snprintf(buf, sizeof(buf), "PING\t%lu\t%s\n", (unsigned long)g_rng_seq, LORA_SENDER_ID);
-    lora_radio.transmit(relay_wrap(buf, RELAY_TTL_MESH).c_str());   // blocking ~0.5 s at SF9
-    lora_radio.startReceive();
-    if (g_rng_log) {
-        char ln[32]; snprintf(ln, sizeof(ln), "TX #%lu\n", (unsigned long)g_rng_seq);
-        lv_textarea_add_text(g_rng_log, ln);
-        lv_textarea_set_cursor_pos(g_rng_log, LV_TEXTAREA_CURSOR_LAST);
-    }
+    uint32_t toa = (uint32_t)(lora_radio.getTimeOnAir(48) / 1000);   // the wrapped PING, ~48 B
+    RngPend &pd = g_rng_pend[g_rng_pend_n++];
+    pd.seq = g_rng_seq; pd.sent_ms = now; pd.answered = false;
+    pd.due_ms = now + 4 * toa + RNG_PARK_MS + 500;   // §8 hold + one parked frame + slack
+    lora_tx_line(buf);                              // ordinary queue: its 'tx' rxlog row is the PING record
+    char ln[32]; snprintf(ln, sizeof(ln), "TX #%lu\n", (unsigned long)g_rng_seq);
+    range_log_ui(ln);
     g_rng_seq++;
 }
 
@@ -6082,24 +6203,10 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lv_group_focus_obj(g_lora_input);
         lv_label_set_text(g_toast, LV_SYMBOL_KEYBOARD " type+Enter to send  -  Kor/Eng btn");
     } else if (strcmp(name, "Range") == 0) {
-        lora_init();
-        g_range_active = true;             // Range owns the radio; background RX yields to range_poll_cb
-        g_rng_rx = g_rng_miss = g_rng_rcount = 0;
-        g_rng_h0 = g_rng_h1 = g_rng_h2 = 0;
-        g_rng_rsum = 0; g_rng_last_seq = -1; g_rng_seq = 0;
-        g_rng_acked = false;
+        lora_init();                       // no radio ownership: PING/PONG ride the normal stack
+        g_rng_ok = g_rng_miss = g_rng_late = 0; g_rng_seq = 0;
+        g_rng_pend_n = 0; g_rng_resp_n = 0;
         g_rng_has_anchor = false; g_rng_period = 0;
-
-        // new per-session CSV named by start time (wall clock if synced, else uptime)
-        { time_t t = time(NULL); char fn[48];
-          if (t > 1700000000) { struct tm tmv; localtime_r(&t, &tmv);
-              snprintf(fn, sizeof(fn), "/range_%04d%02d%02d_%02d%02d%02d.csv",
-                       tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-                       tmv.tm_hour, tmv.tm_min, tmv.tm_sec); }
-          else snprintf(fn, sizeof(fn), "/range_up%lu.csv", (unsigned long)(millis() / 1000));
-          g_rng_file = fn;
-          if (sd_init()) { File hf = SD.open(g_rng_file.c_str(), FILE_WRITE);
-                           if (hf) { hf.println("time,dir,seq,hops,rssi,snr,lat,lon"); hf.close(); } } }
 
         g_rng_rssi = lv_label_create(parent);
         lv_obj_set_style_text_font(g_rng_rssi, &lv_font_montserrat_28, 0);    // big, glanceable outdoors
@@ -6111,15 +6218,18 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lv_obj_set_style_text_color(g_rng_dist, lv_color_hex(0x38BDF8), 0);
         lv_label_set_text(g_rng_dist, "set base");
 
-        g_rng_stats = lv_label_create(parent);
+        g_rng_stats = lv_label_create(parent);                               // active stats + passive panel
+        lv_obj_set_width(g_rng_stats, lv_pct(100));
+        lv_obj_set_style_text_font(g_rng_stats, &font_kr16, 0);
         lv_obj_set_style_text_color(g_rng_stats, lv_color_white(), 0);
-        lv_label_set_text(g_rng_stats, "tx 0  rx 0  miss 0  loss 0%");
+        lv_label_set_long_mode(g_rng_stats, LV_LABEL_LONG_WRAP);
+        range_update_stats();                                                // the beacons are already warm
 
         g_rng_log = lv_textarea_create(parent);
         lv_obj_set_width(g_rng_log, lv_pct(100));
         lv_obj_set_flex_grow(g_rng_log, 1);
         lv_obj_set_style_text_font(g_rng_log, &font_kr16, 0);
-        lv_textarea_set_text(g_rng_log, (String("log: ") + g_rng_file + "\n").c_str());
+        lv_textarea_set_text(g_rng_log, "log: SD rxlog (pong/miss rows)\n");
 
         // Set base + TX beacon side by side (keeps vertical room for the two big readouts)
         lv_obj_t *brow = lv_obj_create(parent);
@@ -6142,8 +6252,8 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lv_obj_add_event_cb(txb, range_tx_toggle_cb, LV_EVENT_CLICKED, NULL);
         lv_group_add_obj(g, txb);
 
-        if (!g_rng_poll) g_rng_poll = lv_timer_create(range_poll_cb, 50, NULL);
-        lv_label_set_text(g_toast, LV_SYMBOL_UP " RSSI / loss test  -  log to SD");
+        if (!g_rng_poll) g_rng_poll = lv_timer_create(range_poll_cb, 250, NULL);
+        lv_label_set_text(g_toast, LV_SYMBOL_UP " passive: beacons  -  TX: PING/PONG per responder");
     } else if (strcmp(name, "Discovery") == 0) {
         lora_init();                          // background RX feeds g_neigh; no radio ownership
         lv_obj_t *hdr = lv_label_create(parent);
@@ -6336,11 +6446,11 @@ static void go_home()
     if (g_wifi_conn_timer) { lv_timer_del(g_wifi_conn_timer); g_wifi_conn_timer = NULL; }
     if (g_bt_scan_timer)   { lv_timer_del(g_bt_scan_timer);   g_bt_scan_timer = NULL; }
     if (g_browser_timer)   { lv_timer_del(g_browser_timer);   g_browser_timer = NULL; }
-    g_range_active = false;     // leaving any app → background LoRa RX resumes
     g_kbtest_active = false; g_kbtest_log = NULL;
     if (g_rng_poll)        { lv_timer_del(g_rng_poll);        g_rng_poll = NULL; }
     if (g_rng_tx)          { lv_timer_del(g_rng_tx);          g_rng_tx = NULL; }
     g_rng_dist = NULL;     // objects belong to the app view being torn down
+    g_rng_rssi = NULL; g_rng_stats = NULL; g_rng_log = NULL;   // range_on_pong runs app-open or not
     if (g_gps_ui)          { lv_timer_del(g_gps_ui);          g_gps_ui = NULL; }
     if (g_disc_timer)      { lv_timer_del(g_disc_timer);      g_disc_timer = NULL; }
     g_disc_lbl = NULL;
