@@ -226,15 +226,26 @@ static void rxlog_console()
             Serial.printf("[log] %-28s %lu B\n", f.name(), (unsigned long)f.size());
         Serial.printf("[log] --- current: %s ---\n", g_rxlog_path[0] ? g_rxlog_path : "(none)");
         dir.close();
-    } else if (c == 'd' || c == 'D') {             // dump the file being written now
+    } else if (c == 'd' || c == 'D') {             // 'd' = current file, 'd14' = rx-boot0014.log
         if (g_dump_on) { g_dump_f.close(); g_dump_on = false; Serial.println("[log] dump aborted"); }
-        if (!g_rxlog_path[0]) { Serial.println("[log] nothing logged yet"); return; }
+        char path[48] = "";
+        uint32_t t0 = millis(); int num = -1;       // optional boot number follows within 300 ms
+        while ((uint32_t)(millis() - t0) < 300) {
+            if (!Serial.available()) { delay(5); continue; }
+            int k = Serial.peek();
+            if (k < '0' || k > '9') break;
+            Serial.read(); num = (num < 0 ? 0 : num * 10) + (k - '0'); t0 = millis();
+        }
+        if (num >= 0) snprintf(path, sizeof(path), "/logs/rx-boot%04d.log", num);
+        else if (g_rxlog_path[0]) strncpy(path, g_rxlog_path, sizeof(path) - 1);
+        if (!path[0]) { Serial.println("[log] nothing logged yet (try d<bootnum>)"); return; }
         if (g_rxlog_open) { g_rxlog_f.flush(); }    // the tail is still in PSRAM otherwise
-        g_dump_f = SD.open(g_rxlog_path, FILE_READ);
-        if (!g_dump_f) { Serial.println("[log] open failed"); return; }
+        if (!sd_init()) { Serial.println("[log] no SD"); return; }
+        g_dump_f = SD.open(path, FILE_READ);
+        if (!g_dump_f) { Serial.printf("[log] open failed: %s\n", path); return; }
         g_dump_on = true;
         Serial.printf("[log] ===== BEGIN %s (%lu B) =====\n",
-                      g_rxlog_path, (unsigned long)g_dump_f.size());
+                      path, (unsigned long)g_dump_f.size());
     } else if (c == 'x' || c == 'X') {
         if (g_dump_on) { g_dump_f.close(); g_dump_on = false; Serial.println("[log] dump stopped"); }
     } else if (c == 's' || c == 'S') {           // probe the card and say what it is
@@ -245,7 +256,7 @@ static void rxlog_console()
                           SD.cardSize() / (1024ULL * 1024ULL),
                           SD.exists("/logs") ? "present" : "will be created");
     } else if (c == '?') {
-        Serial.println("[log] l=list  d=dump current log  x=stop dump  s=probe SD");
+        Serial.println("[log] l=list  d=dump current  d<n>=dump rx-boot<n>  x=stop  s=probe SD");
     }
 }
 
