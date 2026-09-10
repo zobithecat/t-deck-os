@@ -61,7 +61,7 @@
 // T-Deck BLE gateway console — docs/BLE_GATEWAY.md is the contract.
 // One page, no build, no framework: Mac/Android Chrome natively, iPhone through Bluefy.
 const U = n => `7e4c000${n}-0000-4c6f-5261-54446b4f5300`;
-const SVC = U(1), RX = U(2), TX = U(3), STATUS = U(4), NOTE = U(5);
+const SVC = U(1), RX = U(2), TX = U(3), STATUS = U(4), NOTE = U(5), CTL = U(6);
 const enc = new TextEncoder(), dec = new TextDecoder();
 const $ = id => document.getElementById(id);
 const log = $('log'), st = $('st'), btn = $('btn'), inp = $('in'), sendB = $('send'), cnt = $('cnt');
@@ -140,6 +140,14 @@ async function connect() {
     sc.addEventListener('characteristicvaluechanged', e => showSt(e.target.value));
     try { showSt(await sc.readValue()); await sc.startNotifications(); } catch (e) { line('err', '상태 읽기 실패(본딩 취소?): ' + e.message); }
     txc = await svc.getCharacteristic(TX);
+    // The phone is the T-Deck's clock. In gateway mode Wi-Fi is off (no NTP) and GPS may
+    // never fix indoors; without this a Range walk logs millis only. 'T<epoch>' on the
+    // Control characteristic; the firmware writes an 'rtc' row into the SD log.
+    try {
+      const ctl = await svc.getCharacteristic(CTL);
+      await ctl.writeValueWithResponse(enc.encode('T' + Math.floor(Date.now() / 1000)));
+      line('sys', '시계 전송: ' + new Date().toLocaleTimeString());
+    } catch (e) { line('err', '시계 전송 실패: ' + e.message); }
     btn.textContent = '끊기'; btn.className = 'off'; btn.disabled = false;
     inp.disabled = sendB.disabled = false;
     line('sys', `연결됨: ${dev.name || dev.id}`);

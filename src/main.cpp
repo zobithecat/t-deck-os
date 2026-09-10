@@ -150,6 +150,7 @@ static void gw_push_rx(const String &line);   // BLE gateway hooks (defined with
 static void gw_push_note();
 static void lora_send(const char *text);      // the one chat sender: [SOF]/[TFF] …/[EOF]
 static void range_on_pong(const String &src, const String &orig, int hops);   // Range rides the normal RX path
+static void rxlog_gps_tick();                 // position rows for the SD log (defined with Range)
 
 static void rxlog_line(const char *ev, int len, int rssi, float snr, const char *detail)
 {
@@ -168,6 +169,18 @@ static void rxlog_line(const char *ev, int len, int rssi, float snr, const char 
     g_rxlog_n += (uint32_t)m;
     if (g_rxlog_mirror < 12) { Serial.printf("[rxlog>] %s", ln); g_rxlog_mirror++; }
 }
+
+// A wall-clock fix is an EVENT in the log, not a header field: the clock usually
+// arrives minutes after boot (GPS cold start, or the phone connecting), and an offline
+// reader needs the millis<->epoch pair from the moment it happened.
+static void rxlog_rtc_mark(const char *src)
+{
+    char d[48];
+    snprintf(d, sizeof(d), "epoch=%ld src=%s", (long)time(NULL), src);
+    rxlog_line("rtc", 0, 0, 0.0f, d);
+    Serial.printf("[rxlog] rtc %s\n", d);
+}
+
 
 static void rxlog_open_file()
 {
@@ -202,6 +215,10 @@ static void rxlog_open_file()
     snprintf(hdr, sizeof(hdr), "# boot millis=%lu rtc=%s node=%s\n",
              (unsigned long)millis(), rtc, NODE_ID);
     g_rxlog_f.print(hdr);
+    // Column key. The two numeric slots are overloaded per event so the row shape never
+    // changes: rx/pong = rssi snr, tx = toa_ms 0, gps = sats hdop, rtc = 0 0.
+    g_rxlog_f.print("# fmt ms ev len rssi|toa_ms|sats snr|hdop detail\n");
+    g_rxlog_f.print("# rtc rows: 'rtc 0 0 0.0 epoch=<s> src=<gps|ble>' map ms -> wall clock\n");
     g_rxlog_f.flush();
     Serial.printf("[rxlog] logging to %s\n", path);
 }
@@ -1749,7 +1766,7 @@ static void lora_tx_pump()
             }
             d[dn] = 0;
         }
-        rxlog_line("tx", j.len, 0, 0.0f, d);
+        rxlog_line("tx", j.len, (int)(lora_radio.getTimeOnAir(j.len) / 1000), 0.0f, d);   // rssi slot = ToA ms
     }
     g_tx_gap_pending = j.gap_ms;
     g_tx_inflight = true;
@@ -4200,6 +4217,8 @@ static BLEServer        *g_gw_srv = NULL;
 static BLECharacteristic *g_gw_rx = NULL, *g_gw_tx = NULL, *g_gw_st = NULL, *g_gw_note = NULL, *g_gw_ctl = NULL;
 static volatile uint8_t  g_gw_in_len = 0;     // inbox: host task writes bytes then len; loop clears len
 static char              g_gw_in[128];
+static volatile uint8_t  g_gw_ctl_len = 0;    // control inbox, same discipline
+static char              g_gw_ctl_in[64];
 struct GwMsg { uint8_t kind, len; uint8_t b[200]; };   // kind 1 = rx line, 2 = note chunk
 #define GW_Q_N 32
 static GwMsg            *g_gw_q = NULL;       // PSRAM ring, loop-only
@@ -4262,6 +4281,15 @@ class GwServerCB : public BLEServerCallbacks {
     }
     void onMtuChanged(BLEServer *, ble_gap_conn_desc *, uint16_t mtu) override { g_gw_mtu = mtu; }
 };
+class GwCtlCB : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *c) override {
+        if (g_gw_ctl_len) return;
+        String v = c->getValue();
+        size_t n = v.length(); if (n > sizeof(g_gw_ctl_in) - 1) n = sizeof(g_gw_ctl_in) - 1;
+        memcpy(g_gw_ctl_in, v.c_str(), n); g_gw_ctl_in[n] = 0;
+        g_gw_ctl_len = (uint8_t)n;
+    }
+};
 class GwTxCB : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *c) override {   // host task: copy, flag, nothing else
         if (g_gw_in_len) return;                    // loop has not consumed the last one
@@ -4301,6 +4329,7 @@ static void gw_start()
     g_gw_note = svc->createCharacteristic(GW_UUID("5"), BLECharacteristic::PROPERTY_NOTIFY);
     g_gw_ctl  = svc->createCharacteristic(GW_UUID("6"), BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_AUTHEN);
     g_gw_tx->setCallbacks(new GwTxCB());
+    g_gw_ctl->setCallbacks(new GwCtlCB());
     g_gw_st->setValue((const uint8_t *)"idle", 4);
     svc->start();
     BLEAdvertising *adv = BLEDevice::getAdvertising();
@@ -4351,6 +4380,27 @@ static void gw_tick()
     if (g_gw_pk_scr && (uint32_t)(millis() - g_gw_pk_ms) > 45000) gw_passkey_panel(false);
     // Phone -> mesh. Policy lives here, on the loop, in the same place every other TX is
     // decided: chat text only, one line, 60 B on a character boundary.
+    // Control: 'T<epoch>' sets the wall clock from the phone. In gateway mode Wi-Fi is
+    // off (no NTP) and GPS may never fix indoors, so this is how a Range walk gets
+    // real timestamps: the phone in the pocket is the clock. Accepted when we have no
+    // clock yet or disagree by more than 5 s; every acceptance is an rtc row.
+    if (g_gw_ctl_len) {
+        String c = g_gw_ctl_in;
+        g_gw_ctl_len = 0;
+        c.trim();
+        if (c.length() > 1 && c[0] == 'T') {
+            long e = c.substring(1).toInt();
+            if (e > 1700000000L) {
+                long diff = e - (long)time(NULL);
+                if (!g_time_synced || diff > 5 || diff < -5) {
+                    struct timeval tv; tv.tv_sec = e; tv.tv_usec = 0;
+                    settimeofday(&tv, NULL);
+                    g_time_synced = true;
+                    rxlog_rtc_mark("ble");
+                } else Serial.printf("[gw] clock already within %lds\n", diff);
+            }
+        } else Serial.printf("[gw] ctl ignored: %.24s\n", c.c_str());
+    }
     if (g_gw_in_len) {
         String t = g_gw_in;
         g_gw_in_len = 0;
@@ -5557,6 +5607,27 @@ static void range_on_pong(const String &src, const String &orig, int hops)
     range_update_stats();
 }
 
+// Position as its own row, so distance exists even for a PING nobody answered, and a
+// walk with no fix says so instead of silently logging nothing. 5 s while the Range
+// app is open, 60 s otherwise. sats/hdop ride the two numeric slots.
+static uint32_t g_rxlog_gps_ms = 0;
+static void rxlog_gps_tick()
+{
+    if (!g_rxlog_on) return;
+    uint32_t per = g_rng_poll ? 5000 : 60000;
+    if ((uint32_t)(millis() - g_rxlog_gps_ms) < per) return;
+    g_rxlog_gps_ms = millis();
+    int   sats = g_gps.satellites.isValid() ? (int)g_gps.satellites.value() : 0;
+    float hdop = g_gps.hdop.isValid() ? (float)g_gps.hdop.hdop() : 0.0f;
+    char d[64];
+    if (g_gps.location.isValid() && g_gps.location.age() < 5000)
+        snprintf(d, sizeof(d), "%.6f,%.6f alt=%.0f age=%lu", g_gps.location.lat(), g_gps.location.lng(),
+                 g_gps.altitude.isValid() ? g_gps.altitude.meters() : 0.0, (unsigned long)g_gps.location.age());
+    else
+        snprintf(d, sizeof(d), "nofix chars=%lu", (unsigned long)g_gps.charsProcessed());
+    rxlog_line("gps", 0, sats, hdop, d);
+}
+
 static void range_poll_cb(lv_timer_t *t)
 {
     // walk-test: refresh the big distance-from-base readout every ~500 ms (runs even with
@@ -5695,6 +5766,7 @@ static void gps_time_sync()
     struct timeval tv; tv.tv_sec = utc_to_epoch(&tmv); tv.tv_usec = 0;  // GPS is UTC
     settimeofday(&tv, NULL);
     g_time_synced = true;
+    rxlog_rtc_mark("gps");
     Serial.printf("GPS time sync %04d-%02d-%02d %02d:%02d:%02d UTC\n",
                   g_gps.date.year(), g_gps.date.month(), g_gps.date.day(),
                   g_gps.time.hour(), g_gps.time.minute(), g_gps.time.second());
@@ -7367,6 +7439,7 @@ void loop()
     // telemetry is exactly that shape). The sender-side fix belongs to the sender; this
     // is the receiver refusing to stay open forever. 20 s is ~30x a chunk's air gap.
     rxframe_tick();              // v1.19: per-sender frames expire on their own idle timers
+    rxlog_gps_tick();            // position rows: 5 s in Range, 60 s otherwise, 'nofix' when searching
     rxlog_console();             // 'l' list, 'd' dump the SD log over USB, 'x' stop
     rxlog_dump_tick();           // ~2 KB per pass so LVGL and the watchdog stay happy
     rxlog_tick();                // buffered SD flush, >=2 s cadence, never mid-RX-critical
