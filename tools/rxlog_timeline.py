@@ -142,6 +142,26 @@ def main():
         dmg = [r["ms"] for r in rows if r["ev"] == "noise" or (r["ev"] == "rx" and r["d"].startswith("CORRUPT"))]
         coll = sum(1 for p in pings if any(1000 <= t - p["ms"] <= 2000 for t in dmg))
         print(f"  PINGs with a damaged frame at +1.0..2.0 s (same-slot PONG collision signature): {coll}/{len(pings)}")
+        bins = collections.Counter(round((t - p["ms"]) / 1000, 1) for p in pings for t in dmg if 500 <= t - p["ms"] <= 7500)
+        print(f"  damaged-frame arrival after PING (s): {dict(sorted(bins.items()))}")
+        # who answered together: a responder that only survives when another is silent
+        # is being trampled by that one (or by its relay forward). Every pair, per PING.
+        who = {p["ms"]: set() for p in pings}
+        for r in pongs:
+            m = re.match(r"(\w+) h\d seq (\d+)", r["d"])
+            if m:
+                p = ping_for(int(m[2]), r["ms"])
+                if p: who[p["ms"]].add(m[1])
+        names = sorted(by)
+        print("  co-response per PING (rows: A answered / A silent; cols: B answered / B silent):")
+        for i, A in enumerate(names):
+            for B in names[i + 1:]:
+                c = collections.Counter((A in v, B in v) for v in who.values())
+                print(f"    {A}×{B}: both {c[(True,True)]:3}  {A}-only {c[(True,False)]:3}  {B}-only {c[(False,True)]:3}  neither {c[(False,False)]:3}")
+        # arrival delay per responder, PING tx start -> PONG rx end
+        for k in names:
+            d = sorted((x[0]["ms"] - (ping_for(x[2], x[0]["ms"]) or x[0])["ms"]) / 1000 for x in by[k])
+            print(f"  {k} delay: med {d[len(d)//2]:.2f}s  range {d[0]:.2f}-{d[-1]:.2f}")
 
         # per-minute walk table
         print("\n  min  wall      dist   " + "  ".join(f"{k:>10}" for k in sorted(by)) + "   miss")

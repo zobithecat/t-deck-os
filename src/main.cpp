@@ -5659,15 +5659,18 @@ static void range_tx_cb(lv_timer_t *t)
     }
     char buf[40];
     snprintf(buf, sizeof(buf), "PING\t%lu\t%s\n", (unsigned long)g_rng_seq, LORA_SENDER_ID);
-    uint32_t toa = (uint32_t)(lora_radio.getTimeOnAir(48) / 1000);   // the wrapped PING, ~48 B
+    // ToA from the frame we actually put on air (30 B wrapped, not a guessed 48): the
+    // responders compute their hold from the received length, so a deadline that uses
+    // any other length is wrong by the same factor as the grid it is trying to cover.
+    String   w   = relay_wrap(buf, RELAY_TTL_MESH);
+    uint32_t toa = (uint32_t)(lora_radio.getTimeOnAir(w.length()) / 1000);
     RngPend &pd = g_rng_pend[g_rng_pend_n++];
     pd.seq = g_rng_seq; pd.sent_ms = now; pd.answered = false;
-    // Deadline = the whole §8 reply grid, not just its first slot. A responder holds
-    // 4×ToA, then its slot at 2×ToA spacing (slot = hash mod 8, so up to 14×ToA more),
-    // then its own PONG air time; the last slot lands ~19×ToA ≈ 6.6 s after a 48 B
-    // PING. On top of that one parked chat frame (§5 v1.19) and slack. ~12 s total,
+    // Deadline = the whole §8 reply grid: PING air time, hold 4×ToA, slot 7 at 3×ToA
+    // spacing (hash mod 8), the PONG's own air time (same size as the PING), then one
+    // parked chat frame (§5 v1.19) and slack. 27×ToA ≈ 6.9 s at 30 B, ~12.4 s total;
     // three pending at the 5 s cadence, six at the 2 s walk — RNG_PEND_N holds eight.
-    pd.due_ms = now + 19 * toa + RNG_PARK_MS + 500;
+    pd.due_ms = now + (1 + 4 + 3 * 7 + 1) * toa + RNG_PARK_MS + 500;
     lora_tx_line(buf);                              // ordinary queue: its 'tx' rxlog row is the PING record
     char ln[32]; snprintf(ln, sizeof(ln), "TX #%lu\n", (unsigned long)g_rng_seq);
     range_log_ui(ln);
