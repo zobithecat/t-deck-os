@@ -1800,7 +1800,7 @@ static TxJob            g_txq[TXQ_N];
 static uint8_t          g_txq_head = 0;
 static volatile uint8_t g_txq_n = 0;
 static volatile bool    g_tx_inflight = false;
-static uint32_t g_tx_start_ms = 0, g_tx_toa_ms = 0, g_tx_stale = 0, g_tx_lost = 0;
+static uint32_t g_tx_start_ms = 0, g_tx_toa_ms = 0, g_tx_stale = 0, g_tx_lost = 0, g_tx_deferred = 0;
 static uint32_t         g_tx_gap_until = 0;
 static uint16_t         g_tx_gap_pending = 0;
 
@@ -1850,7 +1850,7 @@ static void lora_tx_pump()
     // A packet that has just landed owns the flag; starting a TX over it would either
     // lose that packet or, worse, let its edge pass for our TX-done. Drain it first —
     // lora_service() runs every loop pass, so this costs one pass, not a frame.
-    if (g_lora_rx_flag) return;
+    if (g_lora_rx_flag) { g_tx_deferred++; return; }   // counted: this is the guard that mattered
     g_tx_gap_pending = j.gap_ms;
     g_tx_toa_ms   = (uint32_t)(lora_radio.getTimeOnAir(j.len) / 1000);
     g_tx_start_ms = millis();
@@ -7632,8 +7632,8 @@ void loop()
             // Dedup sizing evidence, printed where the rx counters already are.
             // widest_hit far below horizon is the argument for keeping the ring at
             // RELAY_SEEN_N; late > 0 is the argument for raising it (both repos).
-            Serial.printf("[tx] stale-edge %lu  lost-edge %lu\n",
-                          (unsigned long)g_tx_stale, (unsigned long)g_tx_lost);
+            Serial.printf("[tx] stale-edge %lu  lost-edge %lu  deferred-for-rx %lu\n",
+                          (unsigned long)g_tx_stale, (unsigned long)g_tx_lost, (unsigned long)g_tx_deferred);
             Serial.printf("[dedup] n=%d held=%u hits=%lu miss=%lu late=%lu "
                           "widest_hit=%.1fs horizon=%.0fs\n",
                           RELAY_SEEN_N,
