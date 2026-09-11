@@ -3005,13 +3005,25 @@ static void book_render_page()
     if (!upto) { while (from < n && !g_rd_seen[from]) from++;
                  if (from < n) { upto = from; while (upto < n && g_rd_seen[upto]) upto++; } }
 
+    // Everything that has arrived is drawn, in its place; a hole is drawn as a hole.
+    // The contiguous-prefix rule above kept text from moving under a reader while a gap
+    // filled in — and on a marginal link it kept nineteen chunks invisible behind one
+    // early loss, until the repair round trip (quiet gap + hold + slot, ~6 s) closed
+    // it. That reads as "nothing until the whole page is here". A gap filling in now
+    // reflows one line at that spot; that is the smaller loss. `from`/`upto` stay
+    // for the hint line, which still says how much is contiguous.
     String out;
-    if (upto <= from) out = g_rd_bq_try ? "응답 없음 - 다시 요청 중..." : "쪽 요청 중...";
+    if (!g_rd_have) out = g_rd_bq_try ? "응답 없음 - 다시 요청 중..." : "쪽 요청 중...";
     else {
-        String t;
-        for (int i = from; i < upto; i++) t += g_rd_chunk[i];
+        String t; int hole = 0;
+        for (int i = 0; i < n; i++) {
+            if (g_rd_seen[i]) {
+                if (hole) { t += (hole == 1) ? "[..빠짐..]" : "[..빠짐 x" + String(hole) + "..]"; hole = 0; }
+                t += g_rd_chunk[i];
+            } else hole++;
+        }
+        if (hole) t += (hole == 1) ? "[..빠짐..]" : "[..빠짐 x" + String(hole) + "..]";
         out = book_reflow(t);
-        if (from) out = "... " + out;      // the start is still on its way
     }
     // Setting the same text again costs a full re-wrap and a repaint of the whole label.
     // Repair traffic for a page already on screen would do that for nothing.
