@@ -1800,6 +1800,7 @@ static TxJob            g_txq[TXQ_N];
 static uint8_t          g_txq_head = 0;
 static volatile uint8_t g_txq_n = 0;
 static volatile bool    g_tx_inflight = false;
+static uint32_t g_tx_start_ms = 0, g_tx_toa_ms = 0, g_tx_stale = 0, g_tx_lost = 0;
 static uint32_t         g_tx_gap_until = 0;
 static uint16_t         g_tx_gap_pending = 0;
 
@@ -1846,7 +1847,13 @@ static void lora_tx_pump()
         }
         rxlog_line("tx", j.len, (int)(lora_radio.getTimeOnAir(j.len) / 1000), 0.0f, d);   // rssi slot = ToA ms
     }
+    // A packet that has just landed owns the flag; starting a TX over it would either
+    // lose that packet or, worse, let its edge pass for our TX-done. Drain it first —
+    // lora_service() runs every loop pass, so this costs one pass, not a frame.
+    if (g_lora_rx_flag) return;
     g_tx_gap_pending = j.gap_ms;
+    g_tx_toa_ms   = (uint32_t)(lora_radio.getTimeOnAir(j.len) / 1000);
+    g_tx_start_ms = millis();
     g_tx_inflight = true;
     int st = lora_radio.startTransmit(j.buf, j.len);
     g_txq_head = (g_txq_head + 1) % TXQ_N;
@@ -1858,10 +1865,39 @@ static void lora_tx_pump()
     }
 }
 
-static void lora_tx_service()                     // the TX-done edge
+// The TX-done edge. One DIO1 flag serves both RX-done and TX-done, so this has two
+// failure modes that both end in a deaf radio, and until now neither was detected:
+//  - a stale RX edge: a packet finished landing right before startTransmit(), its
+//    flag was still up, and this read it as "TX done" — finishTransmit() then
+//    dropped the radio to standby mid-air (our frame cut short) and startReceive()
+//    re-armed it. That is survivable. The other is not:
+//  - a lost TX edge: g_tx_inflight stays true for ever, lora_service() refuses to
+//    drain RX while "a TX is in flight", and every frame after our own transmit is
+//    lost until something else happens to reset the flag. E01 answered all 35 pulls
+//    on 09-11 within 3 s at -47 dBm; the T-Deck logged none of them and not even a
+//    noise row in the 20 s after each pull. That is this hole.
+// Guard both: a done edge earlier than the frame's own air time is stale, and a
+// TX still "in flight" long after its air time is a lost edge — recover and say so.
+static void lora_tx_service()
 {
-    if (!g_tx_inflight || !g_lora_rx_flag) return;
-    g_lora_rx_flag = false;
+    if (!g_tx_inflight) return;
+    uint32_t el = millis() - g_tx_start_ms;
+    if (g_lora_rx_flag) {
+        if (el + 20 < g_tx_toa_ms) {              // cannot be our TX-done yet
+            g_lora_rx_flag = false; g_tx_stale++;
+            Serial.printf("[tx] stale rx edge %lums into a %lums frame - ignored\n",
+                          (unsigned long)el, (unsigned long)g_tx_toa_ms);
+            return;
+        }
+        g_lora_rx_flag = false;
+    } else if (el < g_tx_toa_ms + 1500) {
+        return;                                   // still in the air, no edge yet
+    } else {
+        g_tx_lost++;                              // no edge 1.5 s past air time: lost
+        char d[48]; snprintf(d, sizeof(d), "tx-done edge lost after %lums", (unsigned long)el);
+        rxlog_line("deaf", 0, 0, 0.0f, d);
+        Serial.printf("[tx] %s - forcing RX (lost=%lu)\n", d, (unsigned long)g_tx_lost);
+    }
     lora_radio.finishTransmit();
     lora_radio.startReceive();
     g_tx_inflight = false;
@@ -7596,6 +7632,8 @@ void loop()
             // Dedup sizing evidence, printed where the rx counters already are.
             // widest_hit far below horizon is the argument for keeping the ring at
             // RELAY_SEEN_N; late > 0 is the argument for raising it (both repos).
+            Serial.printf("[tx] stale-edge %lu  lost-edge %lu\n",
+                          (unsigned long)g_tx_stale, (unsigned long)g_tx_lost);
             Serial.printf("[dedup] n=%d held=%u hits=%lu miss=%lu late=%lu "
                           "widest_hit=%.1fs horizon=%.0fs\n",
                           RELAY_SEEN_N,
