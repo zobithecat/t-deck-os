@@ -5696,11 +5696,15 @@ static void range_tx_toggle_cb(lv_event_t *e)
     // cycle the beacon: off -> 5 s (stationary) -> 2 s (walk) -> off. 2 s, not 1 s: the pager
     // holds its PONG ~4x ToA (~1.2 s) to clear the relay's PING-forward, so pings must be
     // spaced longer than that hold or the reply never fires.
-    uint32_t next = (!g_rng_tx) ? 5000 : (g_rng_period == 5000) ? 2000 : 0;
+    // off -> 10 s -> 5 s -> 2 s walk -> off. 10 s exists because the §8 reply grid at
+    // 3×ToA×slot (mod 8) runs to ~6.4 s after a 30 B PING: a 5 s cadence sends PING N+1
+    // before slot 6/7 has answered PING N, and a single-slot responder drops the older
+    // reply. A cadence shorter than the grid measures the responder's queue, not the link.
+    uint32_t next = (!g_rng_tx) ? 10000 : (g_rng_period == 10000) ? 5000 : (g_rng_period == 5000) ? 2000 : 0;
     if (g_rng_tx) { lv_timer_del(g_rng_tx); g_rng_tx = NULL; }
     if (next)     { g_rng_tx = lv_timer_create(range_tx_cb, next, NULL); g_rng_period = next; }
     lv_obj_t *l = lv_obj_get_child(lv_event_get_target(e), 0);
-    if (l) lv_label_set_text(l, next == 0 ? "TX: off" : next == 5000 ? "TX: 5s" : "TX: 2s walk");
+    if (l) lv_label_set_text(l, next == 0 ? "TX: off" : next == 10000 ? "TX: 10s" : next == 5000 ? "TX: 5s" : "TX: 2s walk");
 }
 
 // ---- WiFi/IP coarse location (ip-api.com, free, no key) ----
