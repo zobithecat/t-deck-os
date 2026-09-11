@@ -1144,12 +1144,50 @@ static lv_timer_t *g_wifi_conn_timer;
 static char        g_connect_pass[64];
 static lv_timer_t *g_wifi_autoconn_timer;
 
+// Every AP that ever connected, most recent first. One saved SSID meant home and
+// office overwrote each other and the T-Deck came up blind at whichever it had not
+// seen last. The legacy "ssid"/"pass" keys stay as the MRU entry so nothing that
+// reads them changes; the list is one NVS blob beside them.
+#define KNOWN_AP_N 6
+struct KnownAp { char ssid[33]; char pass[64]; };
+static KnownAp g_known[KNOWN_AP_N];
+static int     g_known_n = 0;
+
+static void known_ap_load()
+{
+    Preferences p; p.begin("tdeckos", true);
+    size_t n = p.getBytesLength("aplist");
+    if (n && n <= sizeof(g_known)) { p.getBytes("aplist", g_known, n); g_known_n = (int)(n / sizeof(KnownAp)); }
+    else {                                        // first boot on this build: adopt the legacy single AP
+        String ssid = p.getString("ssid", ""), pass = p.getString("pass", "");
+        g_known_n = 0;
+        if (ssid.length()) {
+            strncpy(g_known[0].ssid, ssid.c_str(), 32); strncpy(g_known[0].pass, pass.c_str(), 63);
+            g_known_n = 1;
+        }
+    }
+    p.end();
+    for (int i = 0; i < g_known_n; i++) { g_known[i].ssid[32] = 0; g_known[i].pass[63] = 0; }
+}
+
+static int known_ap_find(const char *ssid)
+{
+    for (int i = 0; i < g_known_n; i++) if (!strcmp(g_known[i].ssid, ssid)) return i;
+    return -1;
+}
+
 static void prefs_save_wifi(const char *ssid, const char *pass)
 {
+    KnownAp e = {}; strncpy(e.ssid, ssid, 32); strncpy(e.pass, pass, 63);
+    int i = known_ap_find(ssid);
+    if (i < 0) { i = g_known_n < KNOWN_AP_N ? g_known_n++ : KNOWN_AP_N - 1; }   // new: take a slot (evict eldest)
+    for (int k = i; k > 0; k--) g_known[k] = g_known[k - 1];                      // move to front (MRU)
+    g_known[0] = e;
     Preferences p;
     p.begin("tdeckos", false);
     p.putString("ssid", ssid);
     p.putString("pass", pass);
+    p.putBytes("aplist", g_known, sizeof(KnownAp) * g_known_n);
     p.end();
 }
 
@@ -1164,14 +1202,43 @@ static void prefs_save_bt(bool on)
 // Background poll for the boot-time auto-reconnect (doesn't block startup).
 static void wifi_autoconn_poll(lv_timer_t *t)
 {
-    static int tries = 0;
+    static int  tries = 0;
+    static bool scanned = false;                  // one scan-and-retry per boot, not a loop
     if (WiFi.status() == WL_CONNECTED) {
-        lv_timer_del(t); g_wifi_autoconn_timer = NULL; tries = 0;
+        lv_timer_del(t); g_wifi_autoconn_timer = NULL; tries = 0; scanned = false;
         g_wifi_on = true;
+        int k = known_ap_find(WiFi.SSID().c_str());
+        if (k > 0) prefs_save_wifi(g_known[k].ssid, g_known[k].pass);   // it becomes the MRU
         configTime(9 * 3600, 0, "pool.ntp.org", "time.google.com");
+        Serial.printf("[wifi] up: %s\n", WiFi.SSID().c_str());
         return;
     }
-    if (++tries > 40) { lv_timer_del(t); g_wifi_autoconn_timer = NULL; tries = 0; }  // ~20s
+    if (scanned) {                                // waiting on the scan we started
+        int n = WiFi.scanComplete();
+        if (n == WIFI_SCAN_RUNNING) return;
+        int best = -1, brssi = -999;
+        for (int i = 0; i < n; i++) {
+            int k = known_ap_find(WiFi.SSID(i).c_str());
+            if (k >= 0 && WiFi.RSSI(i) > brssi) { brssi = WiFi.RSSI(i); best = k; }
+        }
+        WiFi.scanDelete();
+        scanned = false;                          // the retry below is the last attempt
+        if (best < 0) { lv_timer_del(t); g_wifi_autoconn_timer = NULL; tries = 0;
+                        Serial.println("[wifi] no known AP in range"); return; }
+        Serial.printf("[wifi] known AP in range: %s (%d dBm), joining\n", g_known[best].ssid, brssi);
+        WiFi.begin(g_known[best].ssid, g_known[best].pass);
+        tries = 0;
+        return;
+    }
+    if (++tries > 40) {                           // ~20 s on the MRU: not here. Which known one is?
+        if (g_known_n > 1) {
+            WiFi.disconnect();
+            WiFi.scanNetworks(true);
+            scanned = true; tries = 0;
+            return;
+        }
+        lv_timer_del(t); g_wifi_autoconn_timer = NULL; tries = 0;
+    }
 }
 
 static void wifi_conn_poll(lv_timer_t *t)
@@ -1213,6 +1280,16 @@ static void open_wifi_connect(int idx)
     strncpy(g_connect_ssid, g_scan_ssid[idx], sizeof(g_connect_ssid) - 1);
     g_connect_ssid[sizeof(g_connect_ssid) - 1] = '\0';
     g_connect_open = g_scan_open[idx];
+    int k = known_ap_find(g_connect_ssid);
+    if (k >= 0 && !g_connect_open) {              // remembered: join with the saved password
+        strncpy(g_connect_pass, g_known[k].pass, sizeof(g_connect_pass) - 1);
+        g_connect_pass[sizeof(g_connect_pass) - 1] = 0;
+        if (g_wifi_status) lv_label_set_text_fmt(g_wifi_status, "Joining %s (saved)...", g_connect_ssid);
+        WiFi.begin(g_connect_ssid, g_connect_pass);
+        g_wifi_msg = g_wifi_status;               // the poll reports into the status line
+        if (!g_wifi_conn_timer) g_wifi_conn_timer = lv_timer_create(wifi_conn_poll, 500, NULL);
+        return;
+    }
 
     lv_obj_clean(g_app_view);          // drop the scan list/status
     g_wifi_list = NULL; g_wifi_status = NULL;
@@ -1285,8 +1362,9 @@ static void wifi_scan_poll(lv_timer_t *t)
         g_scan_ssid[i][sizeof(g_scan_ssid[i]) - 1] = '\0';
         g_scan_open[i] = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
         char buf[64];
-        snprintf(buf, sizeof(buf), "%s  %ddBm%s",
-                 g_scan_ssid[i], WiFi.RSSI(i), g_scan_open[i] ? "" : " *");
+        snprintf(buf, sizeof(buf), "%s  %ddBm%s%s",
+                 g_scan_ssid[i], WiFi.RSSI(i), g_scan_open[i] ? "" : " *",
+                 known_ap_find(g_scan_ssid[i]) >= 0 ? "  " LV_SYMBOL_OK : "");
         lv_obj_t *btn = lv_list_add_btn(g_wifi_list, LV_SYMBOL_WIFI, buf);
         lv_obj_set_style_text_color(btn, lv_color_white(), 0);
         lv_obj_set_style_bg_color(btn, lv_color_hex(0x111111), 0);
@@ -6969,7 +7047,7 @@ static void boot_restore()
 {
     Preferences p;
     p.begin("tdeckos", true);
-    String ssid = p.getString("ssid", "");
+    String ssid = p.getString("ssid", "");       // MRU; the full list is loaded below
     String pass = p.getString("pass", "");
     bool   bt   = p.getBool("bt", false);
     g_kb_bright = p.getUChar("kbl", 127);
@@ -6989,6 +7067,7 @@ static void boot_restore()
       g_alert_seen[sizeof(g_alert_seen) - 1] = 0; }
     g_screen_bright = p.getUChar("bright", 16);
     p.end();
+    known_ap_load();
 
     setKeyboardBrightness(g_kb_bright);   // keyboard backlight on at boot
     if (!g_gps_enabled) gps_set_enabled(false);   // apply saved GPS-off: put the module to backup
