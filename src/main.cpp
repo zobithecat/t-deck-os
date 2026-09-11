@@ -2849,6 +2849,13 @@ static void book_send_bn()
     uint32_t have = 0;
     for (int i = 0; i < g_rd_n && i < 32; i++) if (g_rd_seen[i]) have |= (1u << i);
     lora_tx_line("!BN\t" + String(g_rd_id) + "\t" + b36((uint32_t)g_rd_page) + "\t" + b36(have) + router_pull_suffix('B') + "\n");
+    // A repair request is an "asked" event: the quiet-gap clock restarts here. Without
+    // this the gap that fired the !BN was still elapsed on the very next tick, and the
+    // second repair was followed one second later by a full !BQ — before the router's
+    // 4×ToA hold had even let the repair answer out. E01's log for 09-11 shows exactly
+    // that pair (16:56:19 !BN, 16:56:20 !BQ) and both answered: 43 + 43 chunks for one
+    // page that needed a handful. 18 !BQ to 4 !BN for four pages read, 377 chunks on air.
+    g_rd_last_ms = millis();
     Serial.printf("[book] BN %s p%d have=%s (%d/%d)\n", g_rd_id, g_rd_page,
                   b36(have).c_str(), g_rd_have, g_rd_n);
 }
@@ -2913,8 +2920,14 @@ static void book_tick()
         uint32_t quiet = 4 * toa;
         if (quiet < 3000) quiet = 3000;               // never chase a stream still running
         if ((uint32_t)(now - g_rd_last_ms) < quiet) return;
-        if (g_rd_bn_try >= 2) {                       // two repairs did not close it
-            Serial.println("[book] repair twice, asking for the page again");
+        if (g_rd_bn_try >= 3) {                       // three repairs did not close it
+            // The full page is the expensive answer (every chunk, ~10 s of air for 20),
+            // so it is the last resort, not the third try: the bitmap has been asking for
+            // the same few chunks and they keep dying on a marginal link. Ask once more
+            // with the bitmap? No — three times is the signal the link, not the router,
+            // is the problem, and only a whole new stream (with fresh relay cover, §8
+            // v1.22) changes the odds.
+            Serial.println("[book] repaired three times, asking for the whole page");
             book_send_bq(g_rd_id, g_rd_page);
             return;
         }
