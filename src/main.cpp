@@ -114,6 +114,7 @@ static volatile bool g_lora_rx_flag = false;
 // having heard it, which is why a downlink can appear to lose 40% with a clean link
 // and a clean uplink. These counters are the only way to tell the two apart from here.
 static uint32_t g_rx_ok = 0, g_rx_bad = 0, g_rx_corrupt = 0, g_rx_noise = 0;
+static uint32_t g_rx_crcerr = 0;     // frames the hardware CRC rejected
 // False-lock filter (E00 measurement, 2026-08-20): with the PHY CRC off (D2), a false
 // preamble detection passes the explicit header's 4-bit CRC ~1/16 of the time and
 // delivers random bytes as a "reception". Energy is high but chirp correlation is
@@ -5162,7 +5163,7 @@ static int lora_init()
     if (g_lora_ok) return RADIOLIB_ERR_NONE;
     int st = lora_radio.begin(RF_FREQ_MHZ, RF_BW_KHZ, RF_SF, RF_CR_DENOM, RF_SYNC_WORD, RF_TX_DBM, RF_PREAMBLE, 1.6);
     if (st == RADIOLIB_ERR_NONE) {
-        lora_radio.setCRC(RF_CRC_ON);                // CRC off — matches DX-LR02 (lora_rf.h)
+        lora_radio.setCRC(RF_CRC_ON);                // TX CRC per lora_rf.h; RX follows the header
         lora_radio.setDio2AsRfSwitch(true);          // T-Deck SX1262: DIO2 = TX/RX switch
         lora_radio.setDio1Action(lora_set_rx_flag);
         lora_radio.startReceive();
@@ -5204,6 +5205,12 @@ static void lora_service()            // always-on background RX (called from lo
         // chunk of a stream is ~0.5 s behind this one; none of that work belongs
         // inside the window.
         lora_radio.startReceive();
+        if (st == RADIOLIB_ERR_CRC_MISMATCH) {       // the radio already proved this frame wrong
+            g_rx_crcerr++;                           // (also covers header errors on SX126x)
+            { char d[32]; snprintf(d, sizeof(d), "hw len=%u", (unsigned)rlen);
+              rxlog_line("crcerr", (int)rlen, (int)lora_radio.getRSSI(), lora_radio.getSNR(), d); }
+            continue;
+        }
         if (st != RADIOLIB_ERR_NONE || !pkt.length()) { g_rx_bad++; continue; }
         g_lora_rx_rssi = rs;                         // for the discovery table
         g_rx_rssi_last = rs; g_rx_snr_last = sn;
@@ -7644,12 +7651,12 @@ void loop()
     // with corrupt climbing is the air, and with PHY CRC off nothing else can tell.
     static uint32_t rx_seen = 0, rx_ms = 0;
     if ((uint32_t)(now - rx_ms) > 5000) {
-        uint32_t tot = g_rx_ok + g_rx_corrupt + g_rx_bad + g_rx_noise;
+        uint32_t tot = g_rx_ok + g_rx_corrupt + g_rx_bad + g_rx_noise + g_rx_crcerr;
         if (tot != rx_seen) {
             // noise = false locks (SNR far below the parsed baseline), counted apart so
             // the damage rate measures frames and only frames (E00 §3.4).
-            Serial.printf("[rx] ok %lu  corrupt %lu  noise %lu  readfail %lu  (%lu%% damaged)  last %d dBm %.1f dB\n",
-                          (unsigned long)g_rx_ok, (unsigned long)g_rx_corrupt,
+            Serial.printf("[rx] ok %lu  corrupt %lu  crcerr %lu  noise %lu  readfail %lu  (%lu%% damaged)  last %d dBm %.1f dB\n",
+                          (unsigned long)g_rx_ok, (unsigned long)g_rx_corrupt, (unsigned long)g_rx_crcerr,
                           (unsigned long)g_rx_noise, (unsigned long)g_rx_bad,
                           (unsigned long)(100 * (g_rx_corrupt + g_rx_bad) /
                                           ((g_rx_ok + g_rx_corrupt + g_rx_bad) ? (g_rx_ok + g_rx_corrupt + g_rx_bad) : 1)),
