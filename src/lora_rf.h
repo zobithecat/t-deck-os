@@ -39,7 +39,12 @@
 // ── Misc PHY (must match across nodes) ───────────────────────────────────────
 #define RF_SYNC_WORD    0x12            // LoRa "private" (RadioLib maps →0x1424 on SX126x)
 #define RF_PREAMBLE     8               // symbols
-#define RF_CRC_ON       false           // DX-LR02 runs CRC off
+#define RF_CRC_ON       true            // hardware CRC on TX (2026-09-14). The explicit
+                                        // header carries the CRC-present bit, so every
+                                        // receiver verifies per frame whatever its own
+                                        // setting: enable node by node, no flag day. The
+                                        // DX-LR02 needs AT+CRC1 + restart (vendor guide
+                                        // §5.5.4); until then its OWN frames are unchecked.
 
 // ── Per-node defaults (may be overridden locally) ────────────────────────────
 #define RF_TX_DBM       22              // +22 dBm (max); a node may lower it
