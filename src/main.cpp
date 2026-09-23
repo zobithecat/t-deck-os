@@ -151,6 +151,8 @@ static void gw_push_rx(const String &line);   // BLE gateway hooks (defined with
 static void gw_push_note();
 static void lora_send(const char *text);      // the one chat sender: [SOF]/[TFF] …/[EOF]
 static void range_on_pong(const String &src, const String &orig, int hops);   // Range rides the normal RX path
+static void discovery_poll_cb(lv_timer_t *);
+static void beep_notify();
 static void rxlog_gps_tick();                 // position rows for the SD log (defined with Range)
 
 static void rxlog_line(const char *ev, int len, int rssi, float snr, const char *detail)
@@ -366,6 +368,33 @@ static lv_obj_t     *g_kbtest_log;              // KbTest on-screen key readout
 
 // --- device discovery (live neighbor table, fed by every received R| packet) --
 struct Neighbor { char rid[4]; char name[14]; uint32_t last_ms; int16_t rssi; uint8_t hops; uint16_t count; };
+// Vehicle plane (PROTOCOL.md §5 v1.23): a car-park node with no screen reports cabin
+// heat and battery through relays. Status lives here, not in the chat inbox.
+struct Vehicle {
+    char     rid[4], st[8];            // routing id (= envelope src), status token "P"/"D"+flags
+    float    t_c, rh; int hpa, vbat_mv, nbr; uint32_t up_s;
+    bool     has_t, has_rh, has_hpa, has_vbat;
+    int16_t  rssi; uint8_t hops; uint32_t last_ms;
+    uint32_t awake_until;              // set by our addressed PING's PONG: 30 min of reachability
+};
+#define VEH_N 4
+static Vehicle g_veh[VEH_N];
+static int     g_veh_n = 0;
+static Vehicle *vehicle_find(const char *rid) { for (int i = 0; i < g_veh_n; i++) if (!strcmp(g_veh[i].rid, rid)) return &g_veh[i]; return NULL; }
+// 1-cell LiPo open-circuit voltage -> percent, the curve the spec fixes (§5 !CAR).
+static int vehicle_pct(int mv) {
+    static const int pts[4][2] = {{3270, 0}, {3690, 10}, {3840, 50}, {4200, 100}};
+    if (mv <= pts[0][0]) return 0;
+    if (mv >= pts[3][0]) return 100;
+    for (int i = 0; i < 3; i++)
+        if (mv < pts[i + 1][0]) return pts[i][1] + (mv - pts[i][0]) * (pts[i + 1][1] - pts[i][1]) / (pts[i + 1][0] - pts[i][0]);
+    return 100;
+}
+static bool vehicle_maybe_asleep(const Vehicle &v) {
+    uint32_t now = millis();
+    if (v.awake_until && (int32_t)(v.awake_until - now) > 0) return false;   // we woke it ourselves
+    return v.st[0] == 'P' || (uint32_t)(now - v.last_ms) > 180000;           // parked, or silent past one sleep wake
+}
 static Neighbor      g_neigh[8];
 static int           g_neigh_n = 0;
 static volatile int  g_lora_rx_rssi = 0;        // our RSSI of the packet being dispatched
@@ -4931,6 +4960,46 @@ static void relay_handle_rs(const String &line)
 struct CsLast { char src[4]; float ifft, ps, rtt; uint32_t ms; };
 static CsLast g_cs;
 
+// !CAR\t<id>\t<st>\t<t_c>\t<rh>\t<hpa>\t<vbat_mv>\t<up_s>\t<nbr> — ttl 3 by protocol, so
+// §10's hop arithmetic holds. The id is the routing id and equals the envelope src;
+// the display name (CAR01) arrives separately on HB and lives in the neighbour table.
+static void vehicle_handle_car(const String &line)
+{
+    int t[9], n = 0, at = line.indexOf('\t');
+    while (n < 9 && at >= 0) { t[n++] = at; at = line.indexOf('\t', at + 1); }
+    if (n < 8) return;                                   // type + 8 fields minimum
+    String f[8];
+    for (int i = 0; i < 8; i++) f[i] = (i + 1 < n) ? line.substring(t[i] + 1, t[i + 1]) : line.substring(t[i] + 1);
+    const char *rid = f[0].length() == 3 ? f[0].c_str() : g_rx_src3;
+    Vehicle *v = vehicle_find(rid);
+    if (!v) {
+        int i = g_veh_n < VEH_N ? g_veh_n++ : 0;
+        if (g_veh_n == VEH_N) for (int k = 1; k < VEH_N; k++) if (g_veh[k].last_ms < g_veh[i].last_ms) i = k;
+        v = &g_veh[i]; memset(v, 0, sizeof(Vehicle));
+        strncpy(v->rid, rid, 3);
+    }
+    bool was_hot = strchr(v->st, 'H') != NULL;
+    strncpy(v->st, f[1].c_str(), sizeof(v->st) - 1);    // unknown flag letters are kept and ignored
+    v->has_t    = f[2] != "-"; v->t_c     = v->has_t    ? f[2].toFloat() : 0;
+    v->has_rh   = f[3] != "-"; v->rh      = v->has_rh   ? f[3].toFloat() : 0;
+    v->has_hpa  = f[4] != "-"; v->hpa     = v->has_hpa  ? f[4].toInt()   : 0;
+    v->has_vbat = f[5] != "-"; v->vbat_mv = v->has_vbat ? f[5].toInt()   : 0;
+    v->up_s = (uint32_t)f[6].toInt(); v->nbr = f[7].toInt();
+    v->rssi = (int16_t)g_rx_rssi_last;
+    int h = (int)RELAY_TTL_MESH - (int)g_rx_env_ttl; v->hops = (uint8_t)(h < 0 ? 0 : h);
+    v->last_ms = millis();
+    bool hot = strchr(v->st, 'H') != NULL, low = strchr(v->st, 'L') != NULL;
+    Serial.printf("[car] %s %s t=%s%.1f rh=%s%.0f %dmV(%d%%) up=%lus nbr=%d h%u %ddBm%s%s\n", v->rid, v->st,
+                  v->has_t ? "" : "-", v->t_c, v->has_rh ? "" : "-", v->rh, v->vbat_mv,
+                  v->has_vbat ? vehicle_pct(v->vbat_mv) : -1, (unsigned long)v->up_s, v->nbr,
+                  v->hops, (int)v->rssi, hot ? "  OVERHEAT" : "", low ? "  LOWBAT" : "");
+    if (hot && !was_hot) {                                // a raise, once: a LiPo in a hot cabin
+        beep_notify();
+        if (g_toast) lv_label_set_text_fmt(g_toast, LV_SYMBOL_WARNING " %s 차량 과열 %.0f°C", v->rid, v->t_c);
+    }
+    if (g_disc_lbl) discovery_poll_cb(NULL);
+}
+
 static void lora_l1_dispatch(const String &line)
 {
     int t1 = line.indexOf('\t');
@@ -4941,6 +5010,7 @@ static void lora_l1_dispatch(const String &line)
     if (type == "GD") { g_gq_answered = true; news_data_handle(line); return; }   // v1.5 body chunk
     if (type == "RB") { router_handle_rb(line);   return; }   // v1.11 router beacon
     if (type == "RS") { relay_handle_rs(line);    return; }   // relay health beacon → Range panel
+    if (type == "CAR") { vehicle_handle_car(line); return; }  // v1.23 vehicle plane → Discovery
     if (type == "VA") { voice_handle_va(line);    return; }   // v1.12 voice announce
     if (type == "VN") { voice_handle_vn(line);    return; }   // v1.12 voice repair req
     if (type == "VT") { voice_handle_vt(line);    return; }   // v1.13 voice full text
@@ -5051,9 +5121,31 @@ static void discovery_poll_cb(lv_timer_t *)
                      g_routers[i].ewma, (unsigned long)((now - g_routers[i].last_ms) / 1000));
             rtr += rl;
         }
-    if (!g_neigh_n && !g_routers_n) { lv_label_set_text(g_disc_lbl, "listening...  (no nodes yet)"); return; }
+    // v1.23 vehicles: state, cabin, battery, path, age. 'H' is a LiPo in a hot cabin —
+    // it gets its own line and the warning glyph, not a flag letter.
+    String veh;
+    for (int i = 0; i < g_veh_n; i++) {
+        Vehicle &v = g_veh[i];
+        bool hot = strchr(v.st, 'H') != NULL, low = strchr(v.st, 'L') != NULL;
+        const char *hop = v.hops == 0 ? "direct" : (v.hops == 1 ? "1hop" : "2hop");
+        const char *nm = ""; for (int k = 0; k < g_neigh_n; k++) if (!strcmp(g_neigh[k].rid, v.rid)) nm = g_neigh[k].name;
+        char l1[128], l2[96] = "";
+        char tc[12] = "-", rh[12] = "-", bat[20] = "-";
+        if (v.has_t)    snprintf(tc, sizeof(tc), "%.1f°C", v.t_c);
+        if (v.has_rh)   snprintf(rh, sizeof(rh), "%.0f%%", v.rh);
+        if (v.has_vbat) snprintf(bat, sizeof(bat), "%d%%(%dmV)", vehicle_pct(v.vbat_mv), v.vbat_mv);
+        snprintf(l1, sizeof(l1), LV_SYMBOL_GPS " %s %s  %s  %s %s %s  %s %ddBm  %lus%s\n",
+                 v.rid, nm, v.st[0] == 'D' ? "주행" : "주차", tc, rh, bat, hop, (int)v.rssi,
+                 (unsigned long)((now - v.last_ms) / 1000),
+                 (v.awake_until && (int32_t)(v.awake_until - now) > 0) ? "  깨움" : "");
+        if (hot || low)
+            snprintf(l2, sizeof(l2), "   " LV_SYMBOL_WARNING " %s%s%s\n",
+                     hot ? "!! 과열 !!" : "", (hot && low) ? "  " : "", low ? "배터리 부족" : "");
+        veh += l1; veh += l2;
+    }
+    if (!g_neigh_n && !g_routers_n && !g_veh_n) { lv_label_set_text(g_disc_lbl, "listening...  (no nodes yet)"); return; }
     char hdr[40]; snprintf(hdr, sizeof(hdr), "%d/%d alive\n", alive, g_neigh_n);
-    lv_label_set_text(g_disc_lbl, (rtr + hdr + body).c_str());
+    lv_label_set_text(g_disc_lbl, (rtr + veh + hdr + body).c_str());
 }
 
 // Relay layer in front of the message parser: strip the R| header, drop our own
@@ -5747,6 +5839,11 @@ static void range_on_pong(const String &src, const String &orig, int hops)
              gps_loc_csv().c_str());
     rxlog_line("pong", g_rx_pkt_len, rssi, snr, d);
     if (g_rng_rssi) lv_label_set_text_fmt(g_rng_rssi, "%d dBm  %s %s", rssi, src.c_str(), hoptxt);
+    if (Vehicle *v = vehicle_find(src.c_str())) {           // a car answered: awake for 30 min (§10)
+        v->awake_until = millis() + 30UL * 60UL * 1000UL;
+        if (g_toast) lv_label_set_text_fmt(g_toast, LV_SYMBOL_GPS " %s 깨어남 (30분)", v->rid);
+        Serial.printf("[car] %s awake for 30 min (PONG to our PING)\n", v->rid);
+    }
     char ln[64];
     snprintf(ln, sizeof(ln), "#%ld %s %ddBm %.1f %s%s\n", seq, src.c_str(), rssi, snr, hoptxt, late ? " late" : "");
     range_log_ui(ln);
@@ -5795,6 +5892,27 @@ static void range_poll_cb(lv_timer_t *t)
     if ((uint32_t)(millis() - last_stats) > 1000) { last_stats = millis(); range_update_stats(); }
 }
 
+// v1.21 <dst>: a PING addressed to one node. Only that node answers, whatever its
+// role, and for a sleeping vehicle (v1.23) it is the wake-up that buys 30 min of
+// reachability. The target is the ROUTING id (P01) — the display name (CAR01) is
+// accepted by the car but by nobody else.
+static char g_rng_dst[4] = "";
+static void range_dst_cb(lv_event_t *e)
+{
+    int cur = -1;                                            // cycle: everyone -> each vehicle -> everyone
+    for (int i = 0; i < g_veh_n; i++) if (!strcmp(g_veh[i].rid, g_rng_dst)) cur = i;
+    int next = cur + 1;
+    if (next >= g_veh_n) g_rng_dst[0] = 0; else strncpy(g_rng_dst, g_veh[next].rid, 3);
+    lv_obj_t *l = lv_obj_get_child(lv_event_get_target(e), 0);
+    if (l) lv_label_set_text_fmt(l, "대상: %s", g_rng_dst[0] ? g_rng_dst : "전체");
+}
+static void range_tx_cb(lv_timer_t *t);
+static void range_once_cb(lv_event_t *e)
+{
+    range_tx_cb(NULL);                                       // one PING now, cadence untouched
+    if (g_toast) lv_label_set_text_fmt(g_toast, LV_SYMBOL_UP " PING → %s", g_rng_dst[0] ? g_rng_dst : "전체");
+}
+
 static void range_tx_cb(lv_timer_t *t)
 {
     uint32_t now = millis();
@@ -5804,7 +5922,8 @@ static void range_tx_cb(lv_timer_t *t)
         g_rng_pend[0] = g_rng_pend[--g_rng_pend_n];
     }
     char buf[40];
-    snprintf(buf, sizeof(buf), "PING\t%lu\t%s\n", (unsigned long)g_rng_seq, LORA_SENDER_ID);
+    if (g_rng_dst[0]) snprintf(buf, sizeof(buf), "PING\t%lu\t%s\t%s\n", (unsigned long)g_rng_seq, LORA_SENDER_ID, g_rng_dst);
+    else              snprintf(buf, sizeof(buf), "PING\t%lu\t%s\n",     (unsigned long)g_rng_seq, LORA_SENDER_ID);
     // ToA from the frame we actually put on air (30 B wrapped, not a guessed 48): the
     // responders compute their hold from the received length, so a deadline that uses
     // any other length is wrong by the same factor as the grid it is trying to cover.
@@ -6443,7 +6562,12 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         g_ime.reset();
         g_lora_unread = 0;                 // opened the app → mark all read; RX runs in background
         lv_group_focus_obj(g_lora_input);
-        lv_label_set_text(g_toast, LV_SYMBOL_KEYBOARD " type+Enter to send  -  Kor/Eng btn");
+        {
+            const Vehicle *sleepy = NULL;
+            for (int i = 0; i < g_veh_n; i++) if (vehicle_maybe_asleep(g_veh[i])) { sleepy = &g_veh[i]; break; }
+            if (sleepy) lv_label_set_text_fmt(g_toast, LV_SYMBOL_GPS " %s 수면 중일 수 있음 - Range에서 대상 PING 먼저", sleepy->rid);
+            else        lv_label_set_text(g_toast, LV_SYMBOL_KEYBOARD " type+Enter to send  -  Kor/Eng btn");
+        }
     } else if (strcmp(name, "Range") == 0) {
         lora_init();                       // no radio ownership: PING/PONG ride the normal stack
         g_rng_ok = g_rng_miss = g_rng_late = 0; g_rng_seq = 0;
@@ -6493,6 +6617,20 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         lv_label_set_text(tl, "TX: off");
         lv_obj_add_event_cb(txb, range_tx_toggle_cb, LV_EVENT_CLICKED, NULL);
         lv_group_add_obj(g, txb);
+
+        lv_obj_t *dstb = lv_btn_create(brow);                  // v1.21/v1.23: addressed PING = wake a car
+        lv_obj_t *dl = lv_label_create(dstb);
+        lv_obj_set_style_text_font(dl, &font_kr16, 0);
+        lv_label_set_text_fmt(dl, "대상: %s", g_rng_dst[0] ? g_rng_dst : "전체");
+        lv_obj_add_event_cb(dstb, range_dst_cb, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, dstb);
+
+        lv_obj_t *oneb = lv_btn_create(brow);
+        lv_obj_t *ol = lv_label_create(oneb);
+        lv_obj_set_style_text_font(ol, &font_kr16, 0);
+        lv_label_set_text(ol, "1회");
+        lv_obj_add_event_cb(oneb, range_once_cb, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, oneb);
 
         if (!g_rng_poll) g_rng_poll = lv_timer_create(range_poll_cb, 250, NULL);
         lv_label_set_text(g_toast, LV_SYMBOL_UP " passive: beacons  -  TX: PING/PONG per responder");
