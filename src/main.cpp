@@ -5897,14 +5897,34 @@ static void range_poll_cb(lv_timer_t *t)
 // reachability. The target is the ROUTING id (P01) — the display name (CAR01) is
 // accepted by the car but by nobody else.
 static char g_rng_dst[4] = "";
+// Candidate targets: every vehicle that has beaconed, every node in the Discovery
+// table, and always the known car id — because the car is exactly the node that is
+// NOT beaconing when you need to wake it (asleep, or driving with !CAR off). A list
+// keyed only on received !CAR beacons was empty at the one moment it mattered.
+static int range_dst_candidates(char out[][4], int cap)
+{
+    int n = 0;
+    auto add = [&](const char *rid) {
+        if (!rid || !rid[0] || n >= cap) return;
+        for (int i = 0; i < n; i++) if (!strcmp(out[i], rid)) return;
+        strncpy(out[n], rid, 3); out[n][3] = 0; n++;
+    };
+    add("P01");
+    for (int i = 0; i < g_veh_n; i++) add(g_veh[i].rid);
+    for (int i = 0; i < g_neigh_n; i++) if (strcmp(g_neigh[i].rid, NODE_ID)) add(g_neigh[i].rid);
+    return n;
+}
 static void range_dst_cb(lv_event_t *e)
 {
-    int cur = -1;                                            // cycle: everyone -> each vehicle -> everyone
-    for (int i = 0; i < g_veh_n; i++) if (!strcmp(g_veh[i].rid, g_rng_dst)) cur = i;
+    char c[12][4]; int n = range_dst_candidates(c, 12);
+    int cur = -1;                                            // cycle: everyone -> each candidate -> everyone
+    for (int i = 0; i < n; i++) if (!strcmp(c[i], g_rng_dst)) cur = i;
     int next = cur + 1;
-    if (next >= g_veh_n) g_rng_dst[0] = 0; else strncpy(g_rng_dst, g_veh[next].rid, 3);
+    if (next >= n) g_rng_dst[0] = 0; else strncpy(g_rng_dst, c[next], 3);
+    g_rng_dst[3] = 0;
     lv_obj_t *l = lv_obj_get_child(lv_event_get_target(e), 0);
     if (l) lv_label_set_text_fmt(l, "대상: %s", g_rng_dst[0] ? g_rng_dst : "전체");
+    Serial.printf("[range] dst=%s (%d candidates)\n", g_rng_dst[0] ? g_rng_dst : "*", n);
 }
 static void range_tx_cb(lv_timer_t *t);
 static void range_once_cb(lv_event_t *e)
