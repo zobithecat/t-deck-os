@@ -497,6 +497,10 @@ static lv_obj_t     *g_rng_dist;            // walk-test: big distance-from-base
 static double        g_rng_anchor_lat, g_rng_anchor_lon;   // "base" position set on-site
 static bool          g_rng_has_anchor;
 static uint32_t      g_rng_period;          // current beacon period ms (0=off / 5000 / 2000-walk)
+static char          g_rng_dst[4] = "";     // v1.21 <dst>: addressed PING target (routing id), "" = everyone
+static uint8_t       g_rng_wake_left = 0;   // wake burst: PINGs still to send after the first
+static uint32_t      g_rng_wake_next = 0;
+static void range_tx_cb(lv_timer_t *t);
 static bool          g_time_synced = false; // system clock set from GPS or NTP
 
 // ---- GPS (T-Deck Plus on Serial1 / GPIO44 RX, 43 TX) ----
@@ -5901,7 +5905,6 @@ static void range_poll_cb(lv_timer_t *t)
 // role, and for a sleeping vehicle (v1.23) it is the wake-up that buys 30 min of
 // reachability. The target is the ROUTING id (P01) — the display name (CAR01) is
 // accepted by the car but by nobody else.
-static char g_rng_dst[4] = "";
 // Candidate targets: every vehicle that has beaconed, every node in the Discovery
 // table, and always the known car id — because the car is exactly the node that is
 // NOT beaconing when you need to wake it (asleep, or driving with !CAR off). A list
@@ -5931,13 +5934,10 @@ static void range_dst_cb(lv_event_t *e)
     if (l) lv_label_set_text_fmt(l, "대상: %s", g_rng_dst[0] ? g_rng_dst : "전체");
     Serial.printf("[range] dst=%s (%d candidates)\n", g_rng_dst[0] ? g_rng_dst : "*", n);
 }
-static void range_tx_cb(lv_timer_t *t);
 // A sleeping car listens in an SX1262 RX duty cycle: a single 33 ms preamble (8 symbols
 // at SF9) has to land inside its listen window, and we do not know that window. So
 // "1회" is a wake BURST: up to 3 addressed PINGs 2.5 s apart, stopped by the first
 // PONG from the target. With no target it is one plain PING as before.
-static uint8_t  g_rng_wake_left = 0;
-static uint32_t g_rng_wake_next = 0;
 static void range_once_cb(lv_event_t *e)
 {
     range_tx_cb(NULL);
