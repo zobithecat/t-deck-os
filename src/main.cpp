@@ -5839,6 +5839,7 @@ static void range_on_pong(const String &src, const String &orig, int hops)
              gps_loc_csv().c_str());
     rxlog_line("pong", g_rx_pkt_len, rssi, snr, d);
     if (g_rng_rssi) lv_label_set_text_fmt(g_rng_rssi, "%d dBm  %s %s", rssi, src.c_str(), hoptxt);
+    if (g_rng_dst[0] && src.equals(g_rng_dst)) g_rng_wake_left = 0;   // it answered: stop the burst
     if (Vehicle *v = vehicle_find(src.c_str())) {           // a car answered: awake for 30 min (§10)
         v->awake_until = millis() + 30UL * 60UL * 1000UL;
         if (g_toast) lv_label_set_text_fmt(g_toast, LV_SYMBOL_GPS " %s 깨어남 (30분)", v->rid);
@@ -5889,6 +5890,10 @@ static void range_poll_cb(lv_timer_t *t)
             lv_label_set_text(g_rng_dist, "GPS --");
     }
     range_sweep();
+    if (g_rng_wake_left && (int32_t)(millis() - g_rng_wake_next) >= 0) {   // wake burst continues
+        g_rng_wake_left--; g_rng_wake_next = millis() + 2500;
+        range_tx_cb(NULL);
+    }
     if ((uint32_t)(millis() - last_stats) > 1000) { last_stats = millis(); range_update_stats(); }
 }
 
@@ -5927,10 +5932,18 @@ static void range_dst_cb(lv_event_t *e)
     Serial.printf("[range] dst=%s (%d candidates)\n", g_rng_dst[0] ? g_rng_dst : "*", n);
 }
 static void range_tx_cb(lv_timer_t *t);
+// A sleeping car listens in an SX1262 RX duty cycle: a single 33 ms preamble (8 symbols
+// at SF9) has to land inside its listen window, and we do not know that window. So
+// "1회" is a wake BURST: up to 3 addressed PINGs 2.5 s apart, stopped by the first
+// PONG from the target. With no target it is one plain PING as before.
+static uint8_t  g_rng_wake_left = 0;
+static uint32_t g_rng_wake_next = 0;
 static void range_once_cb(lv_event_t *e)
 {
-    range_tx_cb(NULL);                                       // one PING now, cadence untouched
-    if (g_toast) lv_label_set_text_fmt(g_toast, LV_SYMBOL_UP " PING → %s", g_rng_dst[0] ? g_rng_dst : "전체");
+    range_tx_cb(NULL);
+    if (g_rng_dst[0]) { g_rng_wake_left = 2; g_rng_wake_next = millis() + 2500; }
+    if (g_toast) lv_label_set_text_fmt(g_toast, LV_SYMBOL_UP " PING → %s%s", g_rng_dst[0] ? g_rng_dst : "전체",
+                                       g_rng_dst[0] ? " (깨우기 x3)" : "");
 }
 
 static void range_tx_cb(lv_timer_t *t)
