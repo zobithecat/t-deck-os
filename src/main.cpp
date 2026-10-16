@@ -1122,6 +1122,7 @@ static void build_launcher_ui()
         { LV_SYMBOL_GPS,      "LoRa",              0x34D399 },
         { LV_SYMBOL_UP,       "Range",             0xFBBF24 },
         { LV_SYMBOL_LIST,     "Discovery",         0xA3E635 },
+        { LV_SYMBOL_REFRESH,  "Sweep",             0xF59E0B },
         { LV_SYMBOL_BELL,     "News",              0xFCD34D },
         { LV_SYMBOL_WARNING,  "Alert",             0xF87171 },
         { LV_SYMBOL_FILE,     "Books",             0xA5B4FC },
@@ -1834,6 +1835,7 @@ static TxJob            g_txq[TXQ_N];
 static uint8_t          g_txq_head = 0;
 static volatile uint8_t g_txq_n = 0;
 static volatile bool    g_tx_inflight = false;
+static volatile bool    g_sweep_active = false; // Sweep app: radio owned, every TX muted
 static uint32_t g_tx_start_ms = 0, g_tx_toa_ms = 0, g_tx_stale = 0, g_tx_lost = 0, g_tx_deferred = 0;
 static uint32_t         g_tx_gap_until = 0;
 static uint16_t         g_tx_gap_pending = 0;
@@ -1855,7 +1857,7 @@ static void chan_reserve(uint32_t until_ms)
 
 static void lora_tx_pump()
 {
-    if (!g_lora_ok || g_tx_inflight || !g_txq_n) return;
+    if (!g_lora_ok || g_sweep_active || g_tx_inflight || !g_txq_n) return;   // sweep = receive only
     if (g_tx_gap_until && (int32_t)(millis() - g_tx_gap_until) < 0) return;
     if (g_tx_cr != g_tx_cr_applied) {
         lora_radio.setCodingRate(g_tx_cr);
@@ -5268,8 +5270,188 @@ static int lora_init()
     return st;
 }
 
+// --- Sweep: a receive-only LoRa sniffer for a band we know nothing about -------------
+// Who is on 920–928 MHz in Japan? Our mesh (922.0 / SF9 / private sync) hears none of
+// them, and we may not transmit there on KR settings. So this app OWNS the radio, mutes
+// every transmitter in this firmware, and walks a grid of frequency × bandwidth × SF
+// with the SX1262's channel-activity detector. CAD fires on a LoRa preamble at that
+// SF/BW regardless of sync word — the sync word comes after the preamble — so a hit
+// says "someone uses this setting" even when we cannot decode them. After a hit the
+// radio tries three sync words (0x12 private, 0x34 LoRaWAN/public, 0x2B Meshtastic)
+// for a short receive window; a decoded frame is logged as hex and printable text.
+// Grid (JP, ARIB STD-T108): BW125 920.6–928.0 in 200 kHz steps × SF7–12 (LoRaWAN AS923
+// channels live here), plus BW250 920.625 + 0.25k × SF7–12 (Meshtastic JP slots).
+struct SweepSet { uint32_t khz; uint16_t bw; uint8_t sf; };
+struct SweepHit { uint32_t khz; uint16_t bw; uint8_t sf; uint16_t cad, pkts; int16_t rssi; float snr; uint8_t sync; char tail[25]; uint32_t last_ms; };
+#define SWEEP_HIT_N 32
+static SweepHit g_sw_hit[SWEEP_HIT_N]; static int g_sw_hit_n = 0;
+static int      g_sw_band = 0;              // 0 = JP 920.6–928.0, 1 = KR 920.9–923.3
+static int      g_sw_i = 0, g_sw_n = 0, g_sw_pass = 0;
+static uint8_t  g_sw_state = 0;             // 0 idle/next, 1 waiting on a packet after a CAD hit
+static uint8_t  g_sw_sync_i = 0;
+static uint32_t g_sw_rx_until = 0;
+static lv_obj_t *g_sw_lbl = NULL, *g_sw_hdr = NULL;
+static lv_timer_t *g_sw_timer = NULL;
+static const uint8_t SW_SYNC[3] = { 0x12, 0x34, 0x2B };
+
+static bool sweep_setting(int i, SweepSet &o)
+{
+    static const uint8_t sfs[6] = { 7, 8, 9, 10, 11, 12 };
+    if (g_sw_band == 0) {                               // JP: 38 ch × 6 + 12 slots × 6 = 300
+        if (i < 38 * 6) { o.khz = 920600 + (i / 6) * 200; o.bw = 125; o.sf = sfs[i % 6]; return true; }
+        i -= 38 * 6;
+        if (i < 12 * 6) { o.khz = 920625 + (i / 6) * 250; o.bw = 250; o.sf = sfs[i % 6]; return true; }
+        return false;
+    }
+    if (i < 13 * 6) { o.khz = 920900 + (i / 6) * 200; o.bw = 125; o.sf = sfs[i % 6]; return true; }   // KR: 13 ch × 6
+    return false;
+}
+static int sweep_count() { int n = 0; SweepSet t; while (sweep_setting(n, t)) n++; return n; }
+
+static void sweep_apply(const SweepSet &st, uint8_t sync)
+{
+    lora_radio.standby();
+    lora_radio.setFrequency(st.khz / 1000.0f);
+    lora_radio.setBandwidth((float)st.bw);
+    lora_radio.setSpreadingFactor(st.sf);
+    lora_radio.setSyncWord(sync);
+}
+
+static SweepHit *sweep_hit(const SweepSet &st)
+{
+    for (int i = 0; i < g_sw_hit_n; i++)
+        if (g_sw_hit[i].khz == st.khz && g_sw_hit[i].bw == st.bw && g_sw_hit[i].sf == st.sf) return &g_sw_hit[i];
+    int i = g_sw_hit_n < SWEEP_HIT_N ? g_sw_hit_n++ : 0;
+    if (g_sw_hit_n == SWEEP_HIT_N) for (int k = 1; k < SWEEP_HIT_N; k++) if (g_sw_hit[k].cad < g_sw_hit[i].cad) i = k;
+    memset(&g_sw_hit[i], 0, sizeof(SweepHit));
+    g_sw_hit[i].khz = st.khz; g_sw_hit[i].bw = st.bw; g_sw_hit[i].sf = st.sf;
+    return &g_sw_hit[i];
+}
+
+static void sweep_render()
+{
+    if (!g_sw_lbl) return;
+    SweepSet cur; sweep_setting(g_sw_i, cur);
+    if (g_sw_hdr) lv_label_set_text_fmt(g_sw_hdr, "%s  pass %d  %d/%d  %.1f/%u/SF%u  hits %d",
+                                        g_sw_band ? "KR" : "JP", g_sw_pass, g_sw_i, g_sw_n,
+                                        cur.khz / 1000.0f, cur.bw, cur.sf, g_sw_hit_n);
+    // strongest first: by decoded packets, then CAD count
+    int ord[SWEEP_HIT_N]; for (int i = 0; i < g_sw_hit_n; i++) ord[i] = i;
+    for (int a = 0; a < g_sw_hit_n; a++) for (int b = a + 1; b < g_sw_hit_n; b++) {
+        SweepHit &x = g_sw_hit[ord[a]], &y = g_sw_hit[ord[b]];
+        if (y.pkts > x.pkts || (y.pkts == x.pkts && y.cad > x.cad)) { int t = ord[a]; ord[a] = ord[b]; ord[b] = t; }
+    }
+    String t;
+    uint32_t now = millis();
+    for (int k = 0; k < g_sw_hit_n && k < 14; k++) {
+        SweepHit &h = g_sw_hit[ord[k]];
+        char ln[120];
+        if (h.pkts)
+            snprintf(ln, sizeof(ln), "%.1f %u SF%u  cad%u pkt%u  %ddBm %.0f  sync%02X  %lus\n  %s\n",
+                     h.khz / 1000.0f, h.bw, h.sf, h.cad, h.pkts, h.rssi, h.snr, h.sync,
+                     (unsigned long)((now - h.last_ms) / 1000), h.tail);
+        else
+            snprintf(ln, sizeof(ln), "%.1f %u SF%u  cad%u  %lus\n", h.khz / 1000.0f, h.bw, h.sf, h.cad,
+                     (unsigned long)((now - h.last_ms) / 1000));
+        t += ln;
+    }
+    if (!t.length()) t = "scanning...  (no LoRa preamble seen yet)";
+    lv_label_set_text(g_sw_lbl, t.c_str());
+}
+
+static void sweep_tick(lv_timer_t *)
+{
+    if (!g_sweep_active || !g_lora_ok) return;
+    SweepSet st; if (!sweep_setting(g_sw_i, st)) { g_sw_i = 0; g_sw_pass++; sweep_setting(0, st); }
+    if (g_sw_state == 1) {                              // receive window after a hit
+        if (g_lora_rx_flag) {
+            g_lora_rx_flag = false;
+            uint8_t raw[256]; size_t n = lora_radio.getPacketLength(); if (n > sizeof(raw)) n = sizeof(raw);
+            int rs = lora_radio.readData(raw, n);
+            int rssi = (int)lora_radio.getRSSI(); float snr = lora_radio.getSNR();
+            if (rs == RADIOLIB_ERR_NONE || rs == RADIOLIB_ERR_CRC_MISMATCH) {
+                SweepHit *h = sweep_hit(st);
+                h->pkts++; h->rssi = rssi; h->snr = snr; h->sync = SW_SYNC[g_sw_sync_i]; h->last_ms = millis();
+                int tn = 0; for (size_t i = 0; i < n && tn < 24; i++) h->tail[tn++] = (raw[i] >= 0x20 && raw[i] < 0x7F) ? (char)raw[i] : '.';
+                h->tail[tn] = 0;
+                char hx[64]; int hn = 0; for (size_t i = 0; i < n && i < 24; i++) hn += snprintf(hx + hn, sizeof(hx) - hn, "%02X", raw[i]);
+                char d[150]; snprintf(d, sizeof(d), "f=%lu bw=%u sf=%u sync=%02X len=%u %s hex=%s",
+                                      (unsigned long)st.khz, st.bw, st.sf, SW_SYNC[g_sw_sync_i], (unsigned)n,
+                                      rs == RADIOLIB_ERR_CRC_MISMATCH ? "CRCERR" : "ok", hx);
+                rxlog_line("sweepkt", (int)n, rssi, snr, d);
+                Serial.printf("[sweep] PKT %s %s\n", d, h->tail);
+                sweep_render();
+            }
+            g_sw_state = 0; g_sw_i++;                   // enough from this setting for now
+            return;
+        }
+        if ((int32_t)(millis() - g_sw_rx_until) >= 0) {
+            if (++g_sw_sync_i < 3) {                    // next sync word, same window
+                sweep_apply(st, SW_SYNC[g_sw_sync_i]); lora_radio.startReceive();
+                g_sw_rx_until = millis() + 1500; return;
+            }
+            g_sw_state = 0; g_sw_i++;
+        }
+        return;
+    }
+    // one CAD per tick: a few ms at SF7, ~100 ms at SF12 — the UI stays alive between
+    sweep_apply(st, 0x12);
+    int r = lora_radio.scanChannel();
+    if (r == RADIOLIB_LORA_DETECTED) {
+        SweepHit *h = sweep_hit(st); h->cad++; h->last_ms = millis();
+        char d[64]; snprintf(d, sizeof(d), "f=%lu bw=%u sf=%u", (unsigned long)st.khz, st.bw, st.sf);
+        rxlog_line("sweep", 0, 0, 0.0f, d);
+        Serial.printf("[sweep] CAD %s (cad=%u)\n", d, h->cad);
+        g_sw_sync_i = 0; g_sw_state = 1;
+        lora_radio.startReceive(); g_lora_rx_flag = false;
+        g_sw_rx_until = millis() + 1500;
+        sweep_render();
+        return;
+    }
+    g_sw_i++;
+    if ((g_sw_i % 25) == 0) sweep_render();
+}
+
+static void sweep_start()
+{
+    if (g_sweep_active) return;
+    g_sweep_active = true;                              // mutes HB, pulls, Range, gateway TX
+    g_sw_n = sweep_count(); g_sw_i = 0; g_sw_pass = 0; g_sw_state = 0;
+    Serial.printf("[sweep] start band=%s settings=%d (all TX muted)\n", g_sw_band ? "KR" : "JP", g_sw_n);
+    if (!g_sw_timer) g_sw_timer = lv_timer_create(sweep_tick, 15, NULL);
+}
+static void sweep_stop()
+{
+    if (g_sw_timer) { lv_timer_del(g_sw_timer); g_sw_timer = NULL; }
+    if (!g_sweep_active) return;
+    g_sweep_active = false;
+    // back to the mesh exactly as lora_init() left it
+    lora_radio.standby();
+    lora_radio.setFrequency(RF_FREQ_MHZ); lora_radio.setBandwidth(RF_BW_KHZ);
+    lora_radio.setSpreadingFactor(RF_SF); lora_radio.setSyncWord(RF_SYNC_WORD);
+    lora_radio.setCodingRate(g_tx_cr_applied ? g_tx_cr_applied : RF_CR_DENOM);
+    g_lora_rx_flag = false; lora_radio.startReceive();
+    Serial.println("[sweep] stop - mesh RF restored");
+}
+static void sweep_toggle_cb(lv_event_t *e)
+{
+    lv_obj_t *l = lv_obj_get_child(lv_event_get_target(e), 0);
+    if (g_sweep_active) { sweep_stop();  if (l) lv_label_set_text(l, "Start"); }
+    else                { sweep_start(); if (l) lv_label_set_text(l, "Stop"); }
+}
+static void sweep_band_cb(lv_event_t *e)
+{
+    bool was = g_sweep_active; if (was) sweep_stop();
+    g_sw_band ^= 1; g_sw_hit_n = 0; g_sw_i = 0; g_sw_pass = 0;
+    lv_obj_t *l = lv_obj_get_child(lv_event_get_target(e), 0);
+    if (l) lv_label_set_text(l, g_sw_band ? "Band: KR" : "Band: JP");
+    if (was) sweep_start();
+    sweep_render();
+}
+
 static void lora_service()            // always-on background RX (called from loop())
 {
+    if (g_sweep_active) return;       // the sniffer owns the radio and every TX is muted
     if (!g_lora_ok) return;
     lora_tx_service();                          // a TX-done edge is not a packet
     lora_tx_pump();                             // ...and a freed channel may start the next
@@ -5336,7 +5518,7 @@ static void lora_service()            // always-on background RX (called from lo
 static uint32_t g_hb_last = 0;
 static void lora_hb_tick()
 {
-    if (!g_lora_ok) return;
+    if (!g_lora_ok || g_sweep_active) return;
     if (g_crexp) return;   // the CR experiment's block boundary IS 30 s of our silence —
                            // a beacon landing inside that window erases the label
     // v1.15: yield to announced streams — but never defer past one own period. That
@@ -5862,7 +6044,7 @@ static uint32_t g_rxlog_gps_ms = 0;
 static void rxlog_gps_tick()
 {
     if (!g_rxlog_on) return;
-    uint32_t per = g_rng_poll ? 5000 : 60000;
+    uint32_t per = (g_rng_poll || g_sweep_active) ? 5000 : 60000;
     if ((uint32_t)(millis() - g_rxlog_gps_ms) < per) return;
     g_rxlog_gps_ms = millis();
     int   sats = g_gps.satellites.isValid() ? (int)g_gps.satellites.value() : 0;
@@ -6667,6 +6849,30 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
 
         if (!g_rng_poll) g_rng_poll = lv_timer_create(range_poll_cb, 250, NULL);
         lv_label_set_text(g_toast, LV_SYMBOL_UP " passive: beacons  -  TX: PING/PONG per responder");
+    } else if (strcmp(name, "Sweep") == 0) {
+        lora_init();
+        g_sw_hdr = lv_label_create(parent);
+        lv_obj_set_style_text_color(g_sw_hdr, lv_color_hex(0xF59E0B), 0);
+        lv_label_set_text(g_sw_hdr, "LoRa sniffer  -  RX only, mesh TX muted while running");
+        g_sw_lbl = lv_label_create(parent);
+        lv_obj_set_width(g_sw_lbl, lv_pct(100));
+        lv_obj_set_style_text_font(g_sw_lbl, &font_kr16, 0);
+        lv_label_set_long_mode(g_sw_lbl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_flex_grow(g_sw_lbl, 1);
+        sweep_render();
+        lv_obj_t *brow = lv_obj_create(parent);
+        lv_obj_remove_style_all(brow);
+        lv_obj_set_width(brow, lv_pct(100)); lv_obj_set_height(brow, LV_SIZE_CONTENT);
+        lv_obj_clear_flag(brow, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(brow, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(brow, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_t *sb = lv_btn_create(brow); lv_obj_t *sl = lv_label_create(sb);
+        lv_label_set_text(sl, g_sweep_active ? "Stop" : "Start");
+        lv_obj_add_event_cb(sb, sweep_toggle_cb, LV_EVENT_CLICKED, NULL); lv_group_add_obj(g, sb);
+        lv_obj_t *bb = lv_btn_create(brow); lv_obj_t *bl2 = lv_label_create(bb);
+        lv_label_set_text(bl2, g_sw_band ? "Band: KR" : "Band: JP");
+        lv_obj_add_event_cb(bb, sweep_band_cb, LV_EVENT_CLICKED, NULL); lv_group_add_obj(g, bb);
+        lv_label_set_text(g_toast, LV_SYMBOL_REFRESH " CAD sweep: freq x BW x SF, then 3 sync words. SD rows: sweep / sweepkt");
     } else if (strcmp(name, "Discovery") == 0) {
         lora_init();                          // background RX feeds g_neigh; no radio ownership
         lv_obj_t *hdr = lv_label_create(parent);
@@ -6864,6 +7070,7 @@ static void go_home()
     if (g_rng_tx)          { lv_timer_del(g_rng_tx);          g_rng_tx = NULL; }
     g_rng_dist = NULL;     // objects belong to the app view being torn down
     g_rng_rssi = NULL; g_rng_stats = NULL; g_rng_log = NULL;   // range_on_pong runs app-open or not
+    sweep_stop(); g_sw_lbl = NULL; g_sw_hdr = NULL;             // leaving Sweep hands the radio back
     if (g_gps_ui)          { lv_timer_del(g_gps_ui);          g_gps_ui = NULL; }
     if (g_disc_timer)      { lv_timer_del(g_disc_timer);      g_disc_timer = NULL; }
     g_disc_lbl = NULL;
