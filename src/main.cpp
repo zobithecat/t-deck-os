@@ -1836,6 +1836,7 @@ static uint8_t          g_txq_head = 0;
 static volatile uint8_t g_txq_n = 0;
 static volatile bool    g_tx_inflight = false;
 static volatile bool    g_sweep_active = false; // Sweep app: radio owned, every TX muted
+static bool             g_tx_mute = false;      // Settings "송신 금지": abroad, nothing leaves this radio
 static uint32_t g_tx_start_ms = 0, g_tx_toa_ms = 0, g_tx_stale = 0, g_tx_lost = 0, g_tx_deferred = 0;
 static uint32_t         g_tx_gap_until = 0;
 static uint16_t         g_tx_gap_pending = 0;
@@ -1858,6 +1859,7 @@ static void chan_reserve(uint32_t until_ms)
 static void lora_tx_pump()
 {
     if (!g_lora_ok || g_sweep_active || g_tx_inflight || !g_txq_n) return;   // sweep = receive only
+    if (g_tx_mute) { g_txq_n = 0; return; }                                   // abroad: drop, never send
     if (g_tx_gap_until && (int32_t)(millis() - g_tx_gap_until) < 0) return;
     if (g_tx_cr != g_tx_cr_applied) {
         lora_radio.setCodingRate(g_tx_cr);
@@ -6559,6 +6561,20 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         }, LV_EVENT_CLICKED, NULL);
         lv_group_add_obj(g, gwb);
 
+        // Abroad (JP/EU/US bands differ and KR 22 dBm is not legal there): receive only.
+        lv_obj_t *mtb  = lv_btn_create(parent);
+        lv_obj_t *mtbl = lv_label_create(mtb);
+        lv_obj_set_style_text_font(mtbl, &font_kr16, 0);
+        lv_label_set_text_fmt(mtbl, LV_SYMBOL_WARNING " 송신 금지(해외): %s", g_tx_mute ? "켬" : "끔");
+        lv_obj_add_event_cb(mtb, [](lv_event_t *e) {
+            g_tx_mute = !g_tx_mute;
+            Preferences p; p.begin("tdeckos", false); p.putBool("txmute", g_tx_mute); p.end();
+            lv_label_set_text_fmt(lv_obj_get_child(lv_event_get_target(e), 0),
+                                  LV_SYMBOL_WARNING " 송신 금지(해외): %s", g_tx_mute ? "켬" : "끔");
+            Serial.printf("[tx] mute=%d\n", (int)g_tx_mute);
+        }, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, mtb);
+
         // Receive-path proof with no peer TX in existence: inject the golden 700C note
         // as if E00 sent it — assembly, playback and the decode-RTF measurement.
         lv_obj_t *vlb  = lv_btn_create(parent);
@@ -7503,6 +7519,7 @@ static void boot_restore()
     g_voice_fx    = p.getBool("vfx", true);
     g_rxlog_on    = p.getBool("rxlog", true);
     g_gw_on       = p.getBool("blegw", false);
+    g_tx_mute     = p.getBool("txmute", false);
     g_beep_vol  = p.getUChar("beepvol", 7);
     g_gps_enabled = p.getBool("gpsen", true);
     book_load();
