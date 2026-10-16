@@ -5396,9 +5396,17 @@ static void sweep_tick(lv_timer_t *)
         }
         return;
     }
-    // one CAD per tick: a few ms at SF7, ~100 ms at SF12 — the UI stays alive between
+    // one CAD per tick: a few ms at SF7, ~100 ms at SF12 — the UI stays alive between.
+    // Osaka 2026-10-16, first run with RadioLib's default CAD (2 symbols, detPeak 22):
+    // 116 hits in 9 min spread evenly over 86 of 300 settings, 80 % at SF10-12, a flat
+    // 13/min, nothing decoded — the fingerprint of the detector firing on noise, not
+    // of anyone transmitting. Semtech AN1200.48 numbers for 4 symbols, and a hit only
+    // counts when a second CAD confirms it: noise rarely passes twice in a row.
     sweep_apply(st, 0x12);
-    int r = lora_radio.scanChannel();
+    static const uint8_t peak[6] = { 22, 22, 23, 24, 25, 28 };     // SF7..SF12, detMin 10
+    uint8_t pk = peak[st.sf - 7];
+    int r = lora_radio.scanChannel(4, pk, 10);
+    if (r == RADIOLIB_LORA_DETECTED) r = lora_radio.scanChannel(4, pk, 10);   // confirm
     if (r == RADIOLIB_LORA_DETECTED) {
         SweepHit *h = sweep_hit(st); h->cad++; h->last_ms = millis();
         char d[64]; snprintf(d, sizeof(d), "f=%lu bw=%u sf=%u", (unsigned long)st.khz, st.bw, st.sf);
