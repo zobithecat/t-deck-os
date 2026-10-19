@@ -141,6 +141,7 @@ static File     g_rxlog_f;
 static bool     g_rxlog_open = false, g_rxlog_failed = false;
 static char     g_rxlog_path[48] = "";
 static uint32_t g_rxlog_retry_ms = 0;
+static bool     g_rxlog_nosd_off = true;    // Settings/NVS "rxlognosd": no card at boot -> logging off, no retries, no buffer
 static char    *g_rxlog_buf = NULL;
 static uint32_t g_rxlog_n = 0, g_rxlog_flush_ms = 0, g_rxlog_drop = 0;
 static uint8_t  g_rxlog_mirror = 0;         // first lines also to Serial: format sample
@@ -191,6 +192,11 @@ static void rxlog_open_file()
     // Do NOT latch the failure: a card seated after boot, or a one-off bus conflict
     // with the display, used to disable logging for the whole session. Retry slowly.
     if (!sd_init()) {
+        if (g_rxlog_nosd_off) {                  // the common case abroad / on the desk: no card, so be quiet
+            g_rxlog_failed = true; g_rxlog_n = 0;
+            Serial.println("[rxlog] no SD - logging off for this boot (Settings: SD 없으면 로깅 안 함)");
+            return;
+        }
         if ((uint32_t)(millis() - g_rxlog_retry_ms) > 30000) {
             g_rxlog_retry_ms = millis();
             Serial.println("[rxlog] no SD yet - retrying every 30 s");
@@ -6555,6 +6561,19 @@ static void build_app_content(lv_obj_t *parent, const char *name, lv_group_t *g)
         }, LV_EVENT_CLICKED, NULL);
         lv_group_add_obj(g, rlb);
 
+        lv_obj_t *nsb  = lv_btn_create(parent);
+        lv_obj_t *nsbl = lv_label_create(nsb);
+        lv_obj_set_style_text_font(nsbl, &font_kr16, 0);
+        lv_label_set_text_fmt(nsbl, LV_SYMBOL_SD_CARD " SD 없으면 로깅 안 함: %s", g_rxlog_nosd_off ? "켬" : "끔 (30초마다 재시도)");
+        lv_obj_add_event_cb(nsb, [](lv_event_t *e) {
+            g_rxlog_nosd_off = !g_rxlog_nosd_off;
+            Preferences p; p.begin("tdeckos", false); p.putBool("rxlognosd", g_rxlog_nosd_off); p.end();
+            if (!g_rxlog_nosd_off) g_rxlog_failed = false;      // allow the retry path again
+            lv_label_set_text_fmt(lv_obj_get_child(lv_event_get_target(e), 0),
+                                  LV_SYMBOL_SD_CARD " SD 없으면 로깅 안 함: %s", g_rxlog_nosd_off ? "켬" : "끔 (30초마다 재시도)");
+        }, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(g, nsb);
+
         // BLE gateway (docs/BLE_GATEWAY.md): the phone as this node's UI. Starting it
         // turns Wi-Fi off; stopping takes a reboot (the BLE lib has no clean teardown).
         lv_obj_t *gwb  = lv_btn_create(parent);
@@ -7526,6 +7545,7 @@ static void boot_restore()
     g_voice_codec = p.getUChar("vcodec", 1) ? 1 : 0;
     g_voice_fx    = p.getBool("vfx", true);
     g_rxlog_on    = p.getBool("rxlog", true);
+    g_rxlog_nosd_off = p.getBool("rxlognosd", true);
     g_gw_on       = p.getBool("blegw", false);
     g_tx_mute     = p.getBool("txmute", false);
     g_beep_vol  = p.getUChar("beepvol", 7);
