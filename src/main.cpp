@@ -4631,10 +4631,14 @@ static void gw_tick()
     if ((uint32_t)(millis() - g_gw_st_ms) > 2000) {   // status, human-readable on purpose
         g_gw_st_ms = millis();
         char st[120];
-        snprintf(st, sizeof(st), "rssi=%d snr=%.1f home=%s txq=%u ok=%lu bad=%lu noise=%lu mtu=%u",
+        // time=<epoch>/<src>/<age_s> is beyond BLE_LINK §2.5 (apps MUST tolerate unknown
+        // keys); it is what the native app's status screen renders for Profile B and what
+        // the T-Deck can now say since v1.25. Proposed for BLE_LINK v1.7.
+        snprintf(st, sizeof(st), "rssi=%d snr=%.1f home=%s txq=%u ok=%lu bad=%lu noise=%lu mtu=%u time=%ld/%c/%lu",
                  g_rx_rssi_last, g_rx_snr_last, g_home >= 0 ? g_routers[g_home].id : "-",
                  (unsigned)g_txq_n, (unsigned long)g_rx_ok, (unsigned long)g_rx_corrupt,
-                 (unsigned long)g_rx_noise, (unsigned)g_gw_mtu);
+                 (unsigned long)g_rx_noise, (unsigned)g_gw_mtu,
+                 g_clk_src == '-' ? 0L : (long)time(NULL), g_clk_src, (unsigned long)clock_age_s());
         g_gw_st->setValue((const uint8_t *)st, strlen(st));
         g_gw_st->notify();
     }
