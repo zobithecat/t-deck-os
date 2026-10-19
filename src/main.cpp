@@ -508,6 +508,22 @@ static uint8_t       g_rng_wake_left = 0;   // wake burst: PINGs still to send a
 static uint32_t      g_rng_wake_next = 0;
 static void range_tx_cb(lv_timer_t *t);
 static bool          g_time_synced = false; // system clock set from GPS or NTP
+// Time plane (PROTOCOL.md §5 v1.25). Where our clock came from and how stale it is;
+// quality G > N > P > R decides adoption, and an adopted clock inherits the age it
+// arrived with so a copy is always older than its source (the rule that stops two
+// relayed clocks adopting each other for ever).
+static char          g_clk_src = '-';       // 'G' GNSS, 'N' NTP, 'P' phone/BLE, 'R' relayed (!TM), '-' none
+static uint32_t      g_clk_set_ms = 0;      // millis() when the clock was last set from its source
+static uint32_t      g_clk_inherit_s = 0;   // for 'R': the age_s the adopted !TM carried
+static uint32_t      g_tm_last_ms = 0;      // last !TM we transmitted
+static bool          g_tm_demand = false;   // a clock just arrived: one !TM soon (60 s cap)
+static int clock_rank(char c) { return c == 'G' ? 3 : c == 'N' ? 2 : c == 'P' ? 1 : c == 'R' ? 0 : -1; }
+static uint32_t clock_age_s() { return g_clk_src == '-' ? 0 : g_clk_inherit_s + (millis() - g_clk_set_ms) / 1000; }
+static void clock_set_from(char src, uint32_t inherit_s)
+{
+    g_clk_src = src; g_clk_set_ms = millis(); g_clk_inherit_s = inherit_s; g_time_synced = true;
+    if (g_tm_last_ms == 0 || (uint32_t)(millis() - g_tm_last_ms) > 60000) g_tm_demand = true;
+}
 
 // ---- GPS (T-Deck Plus on Serial1 / GPIO44 RX, 43 TX) ----
 // The Plus ships with EITHER a u-blox M10 OR a Quectel L76K (both NMEA, both 9600
@@ -4578,7 +4594,7 @@ static void gw_tick()
                 if (!g_time_synced || diff > 5 || diff < -5) {
                     struct timeval tv; tv.tv_sec = e; tv.tv_usec = 0;
                     settimeofday(&tv, NULL);
-                    g_time_synced = true;
+                    clock_set_from('P', 0);
                     rxlog_rtc_mark("ble");
                 } else Serial.printf("[gw] clock already within %lds\n", diff);
             }
@@ -5014,6 +5030,56 @@ static void vehicle_handle_car(const String &line)
     if (g_disc_lbl) discovery_poll_cb(NULL);
 }
 
+// !TM\t<id>\t<epoch_s>\t<src>\t<age_s>\t<tz> — adopt by quality, never by recency; an
+// adopted clock is re-reported as 'R' with the age it arrived with plus our own.
+static void time_handle_tm(const String &line)
+{
+    int t[6], n = 0, at = line.indexOf('\t');
+    while (n < 6 && at >= 0) { t[n++] = at; at = line.indexOf('\t', at + 1); }
+    if (n < 4) return;
+    String f[5];
+    for (int i = 0; i < 5 && i < n; i++) f[i] = (i + 1 < n) ? line.substring(t[i] + 1, t[i + 1]) : line.substring(t[i] + 1);
+    long epoch = f[1].toInt(); char src = f[2].length() ? f[2][0] : '-'; uint32_t age = (uint32_t)f[3].toInt();
+    if (epoch < 1700000000L || clock_rank(src) < 0) return;      // '-' is never a transmit state
+    int offered = clock_rank(src) == 0 ? 0 : clock_rank(src);     // what we would become: R = rank 0
+    int mine = clock_rank(g_clk_src);
+    bool adopt = (mine < 0) || (offered > mine) || (offered == mine && age < clock_age_s());
+    // an 'R' offer can only beat our own 'R' by age; any direct source we hold beats it
+    if (src == 'R' && mine > 0) adopt = false;
+    Serial.printf("[tm] %s epoch=%ld src=%c age=%lus tz=%s -> %s (ours %c age %lus)\n", g_rx_src3, epoch, src,
+                  (unsigned long)age, n > 4 ? f[4].c_str() : "-", adopt ? "ADOPT" : "keep", g_clk_src,
+                  (unsigned long)clock_age_s());
+    if (!adopt) return;
+    struct timeval tv; tv.tv_sec = epoch; tv.tv_usec = 0;
+    settimeofday(&tv, NULL);
+    clock_set_from('R', age);                                     // inherited, never reset
+    char d[32]; snprintf(d, sizeof(d), "tm:%s", g_rx_src3);
+    rxlog_rtc_mark(d);
+}
+
+// Transmit side: 600 s + jitter while we hold a clock, one on demand when it was just
+// set (60 s cap), §8a beacon-class deferral like HB. epoch is read when the frame is
+// built, which on this firmware is when it is queued — the queue drains within
+// seconds, well inside the second-resolution budget the spec allows.
+static void time_tm_tick()
+{
+    if (!g_lora_ok || g_sweep_active || g_tx_mute || g_clk_src == '-') return;
+    uint32_t now = millis();
+    if ((int32_t)(now - g_chan_resv) < 0 && (uint32_t)(now - g_tm_last_ms) < 1200000) return;   // §8a: yield, one period max
+    uint32_t period = 600000 + (esp_random() % 10001);
+    bool due = g_tm_last_ms ? (uint32_t)(now - g_tm_last_ms) >= period : now > 30000;
+    if (g_tm_demand && (g_tm_last_ms == 0 || (uint32_t)(now - g_tm_last_ms) >= 60000)) due = true;
+    if (!due) return;
+    g_tm_demand = false; g_tm_last_ms = now;
+    time_t tnow = time(NULL);
+    char tz[8]; strftime(tz, sizeof(tz), "%z", localtime(&tnow));      // "+0900" from configTime's offset
+    char line[48];
+    snprintf(line, sizeof(line), "!TM\t%s\t%ld\t%c\t%lu\t%s\n", NODE_ID, (long)time(NULL), g_clk_src,
+             (unsigned long)clock_age_s(), tz[0] ? tz : "-");
+    lora_tx_ttl(String(line), RELAY_TTL_MESH);
+    Serial.printf("[tm] tx %s", line);
+}
+
 static void lora_l1_dispatch(const String &line)
 {
     int t1 = line.indexOf('\t');
@@ -5025,6 +5091,7 @@ static void lora_l1_dispatch(const String &line)
     if (type == "RB") { router_handle_rb(line);   return; }   // v1.11 router beacon
     if (type == "RS") { relay_handle_rs(line);    return; }   // relay health beacon → Range panel
     if (type == "CAR") { vehicle_handle_car(line); return; }  // v1.23 vehicle plane → Discovery
+    if (type == "TM")  { time_handle_tm(line);     return; }  // v1.25 time plane → clock adoption
     if (type == "VA") { voice_handle_va(line);    return; }   // v1.12 voice announce
     if (type == "VN") { voice_handle_vn(line);    return; }   // v1.12 voice repair req
     if (type == "VT") { voice_handle_vt(line);    return; }   // v1.13 voice full text
@@ -5158,7 +5225,8 @@ static void discovery_poll_cb(lv_timer_t *)
         veh += l1; veh += l2;
     }
     if (!g_neigh_n && !g_routers_n && !g_veh_n) { lv_label_set_text(g_disc_lbl, "listening...  (no nodes yet)"); return; }
-    char hdr[40]; snprintf(hdr, sizeof(hdr), "%d/%d alive\n", alive, g_neigh_n);
+    char hdr[64]; snprintf(hdr, sizeof(hdr), "%d/%d alive   clock %c age %lus\n", alive, g_neigh_n,
+                           g_clk_src, (unsigned long)clock_age_s());
     lv_label_set_text(g_disc_lbl, (rtr + veh + hdr + body).c_str());
 }
 
@@ -6273,7 +6341,7 @@ static void gps_time_sync()
     tmv.tm_sec  = g_gps.time.second();
     struct timeval tv; tv.tv_sec = utc_to_epoch(&tmv); tv.tv_usec = 0;  // GPS is UTC
     settimeofday(&tv, NULL);
-    g_time_synced = true;
+    clock_set_from('G', 0);
     rxlog_rtc_mark("gps");
     Serial.printf("GPS time sync %04d-%02d-%02d %02d:%02d:%02d UTC\n",
                   g_gps.date.year(), g_gps.date.month(), g_gps.date.day(),
@@ -8021,6 +8089,8 @@ void loop()
     // telemetry is exactly that shape). The sender-side fix belongs to the sender; this
     // is the receiver refusing to stay open forever. 20 s is ~30x a chunk's air gap.
     rxframe_tick();              // v1.19: per-sender frames expire on their own idle timers
+    if (g_clk_src == '-' && time(NULL) > 1700000000) { clock_set_from('N', 0); rxlog_rtc_mark("ntp"); }   // SNTP landed
+    time_tm_tick();              // v1.25 !TM: hand our clock to the nodes that have none
     rxlog_gps_tick();            // position rows: 5 s in Range, 60 s otherwise, 'nofix' when searching
     rxlog_console();             // 'l' list, 'd' dump the SD log over USB, 'x' stop
     rxlog_dump_tick();           // ~2 KB per pass so LVGL and the watchdog stay happy
