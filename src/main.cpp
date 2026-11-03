@@ -4988,6 +4988,8 @@ static void relay_handle_rs(const String &line)
     r.drop  = (uint32_t)(n > 5 ? line.substring(t[4] + 1, t[5]) : line.substring(t[4] + 1)).toInt();
     r.rssi  = (int16_t)g_rx_rssi_last;
     r.last_ms = millis();
+    Serial.printf("[rs] %s up=%lus heard=%lu fwd=%lu drop=%lu %ddBm\n", r.id, (unsigned long)r.up_s,
+                  (unsigned long)r.heard, (unsigned long)r.fwd, (unsigned long)r.drop, (int)r.rssi);
 }
 
 // "CS ifft=0.63m ps=0.60m rtt=12.4m" — the P10 anchor's channel-sounding distance
