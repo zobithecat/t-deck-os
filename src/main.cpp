@@ -151,6 +151,8 @@ static bool          g_sd_ok;      // declared here: the log console probes the 
 static void gw_push_rx(const String &line);   // BLE gateway hooks (defined with the module)
 static void gw_push_note();
 static void lora_send(const char *text);      // the one chat sender: [SOF]/[TFF] …/[EOF]
+static bool chat_dispatch_text(const char *text);   // "@P01 …" → !MSG (v1.27), else lora_send
+static String b36(uint32_t n);
 static void range_on_pong(const String &src, const String &orig, int hops);   // Range rides the normal RX path
 static void discovery_poll_cb(lv_timer_t *);
 static void beep_notify();
@@ -4613,7 +4615,7 @@ static void gw_tick()
             // "[TFF] " sender prefix, so a router that parses chat by framing — E01 —
             // dropped every phone line. lora_send() also owns the UTF-8 60 B split
             // and the '!' escape, so the phone gets one policy, not a second copy.
-            lora_send(t.c_str());
+            chat_dispatch_text(t.c_str());               // "@P01 …" = addressed !MSG, "@@" = chat
             Serial.printf("[gw] tx: %s\n", t.c_str());
         }
     }
@@ -5084,6 +5086,160 @@ static void time_tm_tick()
     Serial.printf("[tm] tx %s", line);
 }
 
+// --- Addressed messages !MSG / !ACK (PROTOCOL.md §5 v1.27) ---------------------------
+// The first thing in this protocol that can say "it reached that person". One frame,
+// ≤ 40 B text, a per-sender mid that stays the same across up to three sends (each
+// a new pktid, so §7 dedup never eats a retry), and a receipt the destination sends
+// after the §8 hold with a ttl that honours link margin (v1.22). Riding the flood:
+// no routing, no new envelope field.
+#define AMSG_N 4
+struct AMsg { char dst[4]; char mid[6]; char text[44]; uint8_t tries; uint32_t next_ms, deadline_ms; uint8_t state; };  // state 0 free 1 sent 2 delivered 3 undelivered
+static AMsg     g_amsg[AMSG_N];
+static uint32_t g_amsg_ctr = 0;                       // persisted: a reboot must not reuse a live mid
+struct AShown { char src[4]; char mid[6]; };
+static AShown   g_ashown[32]; static int g_ashown_i = 0;  // (src, mid) already displayed: retries are ACKed again, shown once
+struct AAck { char dst[4]; char mid[6]; uint32_t due_ms; uint8_t ttl; };
+static AAck     g_aack[8]; static int g_aack_n = 0;   // receipts waiting out the §8 hold
+static void beep_alert(int sev);
+
+static uint32_t amsg_toa_ms() { return (uint32_t)(lora_radio.getTimeOnAir(73) / 1000); }   // ≈ 73 B with envelope
+static uint32_t amsg_rtt_ms() { uint32_t t = amsg_toa_ms(); const int R = 2; return 2 * (2 + (9 * (2 * R - 1)) / 2) * t + 4 * t; }   // §5: ≈ 17 s at SF9
+
+static void amsg_meta(const char *mid, const char *dst, const char *state, uint8_t tries)
+{
+    char m[64]; snprintf(m, sizeof(m), "M %s %s %s %u/3", mid, dst, state, (unsigned)tries);
+    gw_push_rx(String(m));                               // the phone sees the receipt as a meta line
+    char ln[80]; snprintf(ln, sizeof(ln), LV_SYMBOL_RIGHT "%s #%s %s", dst, mid,
+                          !strcmp(state, "delivered") ? "수신확인" : !strcmp(state, "undelivered") ? "미전달" : "전송");
+    lora_log_print(" ", String(ln) + (strcmp(state, "sent") ? "" : " " + String((int)tries) + "/3"));
+    rxlog_line("amsg", 0, 0, 0.0f, m);
+    Serial.printf("[amsg] %s\n", m);
+}
+
+static void amsg_put_on_air(AMsg &m)
+{
+    String f = String("!MSG\t") + m.dst + "\t" + m.mid + "\t" + m.text + "\n";
+    lora_tx_ttl(f, RELAY_TTL_MESH);
+    m.state = 1; m.deadline_ms = millis() + amsg_rtt_ms();
+    amsg_meta(m.mid, m.dst, "sent", m.tries);
+}
+
+static bool amsg_send(const char *dst, const char *text)
+{
+    if (g_tx_mute || g_sweep_active) return false;
+    int slot = -1;
+    for (int i = 0; i < AMSG_N; i++) if (g_amsg[i].state == 0 || g_amsg[i].state >= 2) { slot = i; break; }
+    if (slot < 0) { lora_log_print(" ", "주소지정 메시지 4개 대기 중 - 잠시 후"); return false; }
+    AMsg &m = g_amsg[slot]; memset(&m, 0, sizeof(m));
+    strncpy(m.dst, dst, 3);
+    { Preferences p; p.begin("tdeckos", false); g_amsg_ctr = p.getUInt("amid", 0) + 1; p.putUInt("amid", g_amsg_ctr); p.end(); }
+    strncpy(m.mid, b36(g_amsg_ctr).c_str(), 5);
+    // ≤ 40 B on a UTF-8 boundary; the spec wants longer refused, the keyboard user wants it cut — cut, and say so
+    int n = strlen(text); if (n > 40) { n = 40; while (n > 0 && ((uint8_t)text[n] & 0xC0) == 0x80) n--; }
+    memcpy(m.text, text, n); m.text[n] = 0;
+    for (int i = 0; i < n; i++) if (m.text[i] == '\n') m.text[i] = ' ';
+    m.tries = 1;
+    amsg_put_on_air(m);
+    return true;
+}
+
+static void amsg_tick()
+{
+    uint32_t now = millis();
+    for (int i = 0; i < AMSG_N; i++) {
+        AMsg &m = g_amsg[i];
+        if (m.state != 1) continue;
+        if (m.next_ms && (int32_t)(now - m.next_ms) >= 0) {       // backoff over: resend, same mid
+            m.next_ms = 0; m.tries++; amsg_put_on_air(m);
+        } else if (!m.next_ms && (int32_t)(now - m.deadline_ms) >= 0) {
+            if (m.tries >= 3) { m.state = 3; amsg_meta(m.mid, m.dst, "undelivered", m.tries); continue; }
+            uint32_t t = amsg_toa_ms();
+            m.next_ms = now + (relay_hash(String(NODE_ID)) % 8) * t + (esp_random() % (t + 1));
+        }
+    }
+    for (int i = 0; i < g_aack_n; ) {                              // receipts due after the §8 hold
+        if ((int32_t)(now - g_aack[i].due_ms) < 0) { i++; continue; }
+        if (!g_tx_mute && !g_sweep_active)
+            lora_tx_ttl(String("!ACK\t") + g_aack[i].dst + "\t" + g_aack[i].mid + "\n", g_aack[i].ttl);
+        Serial.printf("[amsg] ACK -> %s #%s ttl%u\n", g_aack[i].dst, g_aack[i].mid, g_aack[i].ttl);
+        g_aack[i] = g_aack[--g_aack_n];
+    }
+}
+
+static void amsg_handle_msg(const String &line)       // !MSG\t<dst>\t<mid>\t<text>
+{
+    int t1 = line.indexOf('\t'), t2 = t1 > 0 ? line.indexOf('\t', t1 + 1) : -1, t3 = t2 > 0 ? line.indexOf('\t', t2 + 1) : -1;
+    if (t3 < 0) return;
+    String dst = line.substring(t1 + 1, t2), mid = line.substring(t2 + 1, t3), text = line.substring(t3 + 1);
+    if (!dst.equals(NODE_ID)) return;                             // not for us: parse nothing, show nothing
+    // receipt, every time, after the hold; ttl = hops+1, ≥ 2 when the link is marginal (v1.22)
+    int hops = (int)RELAY_TTL_MESH - (int)g_rx_env_ttl; if (hops < 0) hops = 0;
+    uint8_t ttl = (uint8_t)(hops + 1);
+    if (g_rx_rssi_last < -95 || g_rx_snr_last < 5.0f) ttl = ttl < 2 ? 2 : ttl;
+    if (ttl > RELAY_TTL_MESH) ttl = RELAY_TTL_MESH;
+    if (g_aack_n < 8) {
+        AAck &a = g_aack[g_aack_n++]; memset(&a, 0, sizeof(a));
+        strncpy(a.dst, g_rx_src3, 3); strncpy(a.mid, mid.c_str(), 5);
+        a.due_ms = millis() + 4 * (uint32_t)(lora_radio.getTimeOnAir(g_rx_pkt_len) / 1000); a.ttl = ttl;
+    }
+    for (int i = 0; i < 32; i++)                                  // shown once per (src, mid)
+        if (!strcmp(g_ashown[i].src, g_rx_src3) && !strcmp(g_ashown[i].mid, mid.c_str())) return;
+    AShown &sh = g_ashown[g_ashown_i]; g_ashown_i = (g_ashown_i + 1) % 32;
+    memset(&sh, 0, sizeof(sh)); strncpy(sh.src, g_rx_src3, 3); strncpy(sh.mid, mid.c_str(), 5);
+    text.replace("[NL]", "\n");
+    lora_emit_msg(String(LV_SYMBOL_ENVELOPE " [") + g_rx_src3 + "→나] " + text);
+    beep_notify();
+}
+
+static void amsg_handle_ack(const String &line)       // !ACK\t<dst>\t<mid>   (dst = the original sender = us)
+{
+    int t1 = line.indexOf('\t'), t2 = t1 > 0 ? line.indexOf('\t', t1 + 1) : -1;
+    if (t2 < 0) return;
+    if (!line.substring(t1 + 1, t2).equals(NODE_ID)) return;
+    String mid = line.substring(t2 + 1); mid.trim();
+    for (int i = 0; i < AMSG_N; i++)
+        if (g_amsg[i].state && !strcmp(g_amsg[i].mid, mid.c_str()) && !strcmp(g_amsg[i].dst, g_rx_src3)) {
+            if (g_amsg[i].state != 2) { g_amsg[i].state = 2; amsg_meta(g_amsg[i].mid, g_amsg[i].dst, "delivered", g_amsg[i].tries); }
+            return;                                               // a late receipt still counts (§5)
+        }
+}
+
+// Chat text goes one of three ways: "@P01 hi" → one addressed !MSG; "@@P01 hi" → the
+// broadcast chat "@P01 hi" (one '@' stripped, BLE_LINK §3 reserved forms); else L2.
+static bool chat_dispatch_text(const char *text)
+{
+    const char *t = text; while (*t == ' ') t++;
+    if (t[0] == '@' && t[1] == '@') { lora_send(t + 1); return true; }
+    if (t[0] == '@' && isupper((unsigned char)t[1]) && isxdigit((unsigned char)t[2]) && isxdigit((unsigned char)t[3]) && t[4] == ' ') {
+        char dst[4] = { t[1], t[2], t[3], 0 };
+        if (!strcmp(dst, NODE_ID)) { lora_log_print(" ", "자기 자신에게는 보낼 수 없음"); return false; }
+        return amsg_send(dst, t + 5);
+    }
+    lora_send(text); return true;
+}
+
+// !SOS\t<id>\t<alarm>\t<lat>\t<lon>\t<batt>\t<text> (v1.26): shown loud, once per (id, alarm)
+static void sos_handle(const String &line)
+{
+    static char last_id[4] = "", last_alarm = 0;
+    int t[7], n = 0, at = line.indexOf('\t');
+    while (n < 7 && at >= 0) { t[n++] = at; at = line.indexOf('\t', at + 1); }
+    if (n < 3) return;
+    String f[6];
+    for (int i = 0; i < 6 && i < n; i++) f[i] = (i + 1 < n) ? line.substring(t[i] + 1, t[i + 1]) : line.substring(t[i] + 1);
+    char alarm = f[1].length() ? f[1][0] : '?';
+    bool repeat = !strcmp(last_id, f[0].c_str()) && last_alarm == alarm;
+    strncpy(last_id, f[0].c_str(), 3); last_alarm = alarm;
+    char hdr[96];
+    snprintf(hdr, sizeof(hdr), LV_SYMBOL_WARNING " SOS %s/%c  %s,%s  batt %s", f[0].c_str(), alarm,
+             f[2].c_str(), f[3].c_str(), f[4].c_str());
+    Serial.printf("[sos] %s %s%s\n", hdr, f[5].c_str(), repeat ? " (repeat)" : "");
+    if (repeat) return;
+    lora_emit_msg(String(hdr) + "\n" + f[5]);
+    if (g_toast) lv_label_set_text(g_toast, hdr);
+    beep_alert(9);
+}
+
 static void lora_l1_dispatch(const String &line)
 {
     int t1 = line.indexOf('\t');
@@ -5096,6 +5252,11 @@ static void lora_l1_dispatch(const String &line)
     if (type == "RS") { relay_handle_rs(line);    return; }   // relay health beacon → Range panel
     if (type == "CAR") { vehicle_handle_car(line); return; }  // v1.23 vehicle plane → Discovery
     if (type == "TM")  { time_handle_tm(line);     return; }  // v1.25 time plane → clock adoption
+    if (type == "MSG") { amsg_handle_msg(line);    return; }  // v1.27 addressed message → receipt + inbox
+    if (type == "ACK") { amsg_handle_ack(line);    return; }  // v1.27 receipt → delivered
+    if (type == "SOS") { sos_handle(line);         return; }  // v1.26 distress call → loud
+    if (type == "EM")  { Serial.printf("[em] %s (SOS profile switch not implemented on this node yet)\n", line.c_str());
+                         if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_WARNING " !EM 수신 - SOS 프로필 미지원"); return; }
     if (type == "VA") { voice_handle_va(line);    return; }   // v1.12 voice announce
     if (type == "VN") { voice_handle_vn(line);    return; }   // v1.12 voice repair req
     if (type == "VT") { voice_handle_vt(line);    return; }   // v1.13 voice full text
@@ -5676,7 +5837,7 @@ static void lora_send_cb(lv_event_t *e)
         msg = lv_textarea_get_text(g_lora_input);
     }
     lv_textarea_set_text(g_lora_input, "");
-    lora_send(msg.c_str());
+    chat_dispatch_text(msg.c_str());
 }
 
 // --- Korean input (두벌식 IME) for the LoRa message box ----------------------
@@ -5715,7 +5876,7 @@ static bool lora_kr_handle_key(uint32_t key)
         g_lora_compose = "";
         g_ime.reset();
         if (g_lora_input) lv_textarea_set_text(g_lora_input, "");
-        lora_send(msg.c_str());
+        chat_dispatch_text(msg.c_str());
         return true;
     }
     g_lora_compose += g_ime.commit_all();            // any other key -> commit, then raw
@@ -6076,6 +6237,10 @@ static void range_on_pong(const String &src, const String &orig, int hops)
     // older than the last 16, is another node's Range test and is ignored.
     int p2 = orig.indexOf('\t', 5);
     long seq = (p2 > 0 ? orig.substring(5, p2) : orig.substring(5)).toInt();
+    // v1.26: PONG\t<seq>\t<id>[\t<rssi>\t<snr>] — the responder's receive margin, if it says
+    int rr = 0; float rs = 0; bool have_rr = false;
+    { int p3 = p2 > 0 ? orig.indexOf('\t', p2 + 1) : -1, p4 = p3 > 0 ? orig.indexOf('\t', p3 + 1) : -1;
+      if (p4 > 0) { rr = orig.substring(p3 + 1, p4).toInt(); rs = orig.substring(p4 + 1).toFloat(); have_rr = (rr != 0); } }
     if (!g_rng_seq || seq < 0 || (uint32_t)seq >= g_rng_seq) return;
     if ((uint32_t)seq + 16 < g_rng_seq) return;
     range_sweep();
@@ -6109,8 +6274,8 @@ static void range_on_pong(const String &src, const String &orig, int hops)
     Serial.printf("[range] PONG #%ld %s %s %d dBm %.1f dB%s\n", seq, src.c_str(), hoptxt, rssi, snr,
                   late ? "  LATE" : "");
     char d[96];
-    snprintf(d, sizeof(d), "%s h%d seq %ld%s %s", src.c_str(), hops, seq, late ? " late" : "",
-             gps_loc_csv().c_str());
+    snprintf(d, sizeof(d), "%s h%d seq %ld%s %s%s%s", src.c_str(), hops, seq, late ? " late" : "",
+             gps_loc_csv().c_str(), have_rr ? " rr=" : "", have_rr ? (String(rr) + "/" + String(rs, 1)).c_str() : "");
     rxlog_line("pong", g_rx_pkt_len, rssi, snr, d);
     if (g_rng_rssi) lv_label_set_text_fmt(g_rng_rssi, "%d dBm  %s %s", rssi, src.c_str(), hoptxt);
     if (g_rng_dst[0] && src.equals(g_rng_dst)) g_rng_wake_left = 0;   // it answered: stop the burst
@@ -8095,6 +8260,7 @@ void loop()
     rxframe_tick();              // v1.19: per-sender frames expire on their own idle timers
     if (g_clk_src == '-' && time(NULL) > 1700000000) { clock_set_from('N', 0); rxlog_rtc_mark("ntp"); }   // SNTP landed
     time_tm_tick();              // v1.25 !TM: hand our clock to the nodes that have none
+    amsg_tick();                 // v1.27: retries with backoff, receipts after the §8 hold
     rxlog_gps_tick();            // position rows: 5 s in Range, 60 s otherwise, 'nofix' when searching
     rxlog_console();             // 'l' list, 'd' dump the SD log over USB, 'x' stop
     rxlog_dump_tick();           // ~2 KB per pass so LVGL and the watchdog stay happy
