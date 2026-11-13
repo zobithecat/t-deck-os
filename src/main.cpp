@@ -141,6 +141,7 @@ static File     g_rxlog_f;
 static bool     g_rxlog_open = false, g_rxlog_failed = false;
 static char     g_rxlog_path[48] = "";
 static uint32_t g_rxlog_retry_ms = 0;
+static bool     g_tx_mute = false;          // Settings "송신 금지": abroad, nothing leaves this radio (serial 'm' toggles)
 static bool     g_rxlog_nosd_off = true;    // Settings/NVS "rxlognosd": no card at boot -> logging off, no retries, no buffer
 static char    *g_rxlog_buf = NULL;
 static uint32_t g_rxlog_n = 0, g_rxlog_flush_ms = 0, g_rxlog_drop = 0;
@@ -283,8 +284,12 @@ static void rxlog_console()
                           SD.cardType() == CARD_SDHC ? "SDHC" : "SD",
                           SD.cardSize() / (1024ULL * 1024ULL),
                           SD.exists("/logs") ? "present" : "will be created");
+    } else if (c == 'm' || c == 'M') {           // toggle the TX mute without the screen
+        g_tx_mute = !g_tx_mute;
+        Preferences p; p.begin("tdeckos", false); p.putBool("txmute", g_tx_mute); p.end();
+        Serial.printf("[tx] mute=%d (serial)\n", (int)g_tx_mute);
     } else if (c == '?') {
-        Serial.println("[log] l=list  d=dump current  d<n>=dump rx-boot<n>  x=stop  s=probe SD");
+        Serial.println("[log] l=list  d=dump current  d<n>=dump rx-boot<n>  x=stop  s=probe SD  m=toggle TX mute");
     }
 }
 
@@ -1860,7 +1865,7 @@ static uint8_t          g_txq_head = 0;
 static volatile uint8_t g_txq_n = 0;
 static volatile bool    g_tx_inflight = false;
 static volatile bool    g_sweep_active = false; // Sweep app: radio owned, every TX muted
-static bool             g_tx_mute = false;      // Settings "송신 금지": abroad, nothing leaves this radio
+static uint32_t         g_tx_sent = 0, g_tx_muted = 0;   // frames handed to the radio / dropped by the mute
 static uint32_t g_tx_start_ms = 0, g_tx_toa_ms = 0, g_tx_stale = 0, g_tx_lost = 0, g_tx_deferred = 0;
 static uint32_t         g_tx_gap_until = 0;
 static uint16_t         g_tx_gap_pending = 0;
@@ -1883,7 +1888,13 @@ static void chan_reserve(uint32_t until_ms)
 static void lora_tx_pump()
 {
     if (!g_lora_ok || g_sweep_active || g_tx_inflight || !g_txq_n) return;   // sweep = receive only
-    if (g_tx_mute) { g_txq_n = 0; return; }                                   // abroad: drop, never send
+    if (g_tx_mute) {                                                          // abroad: drop, never send
+        g_tx_muted += g_txq_n; g_txq_n = 0;
+        // Silent drops read as "TX is broken" (2026-11-13: the Osaka switch was still
+        // on a month later). Say so wherever the user is looking.
+        if (g_toast) lv_label_set_text(g_toast, LV_SYMBOL_WARNING " 송신 금지(해외) 켜짐 - 설정에서 끄세요");
+        return;
+    }
     if (g_tx_gap_until && (int32_t)(millis() - g_tx_gap_until) < 0) return;
     if (g_tx_cr != g_tx_cr_applied) {
         lora_radio.setCodingRate(g_tx_cr);
@@ -1917,6 +1928,7 @@ static void lora_tx_pump()
     g_tx_toa_ms   = (uint32_t)(lora_radio.getTimeOnAir(j.len) / 1000);
     g_tx_start_ms = millis();
     g_tx_inflight = true;
+    g_tx_sent++;
     int st = lora_radio.startTransmit(j.buf, j.len);
     g_txq_head = (g_txq_head + 1) % TXQ_N;
     g_txq_n--;
@@ -8329,7 +8341,8 @@ void loop()
             // Dedup sizing evidence, printed where the rx counters already are.
             // widest_hit far below horizon is the argument for keeping the ring at
             // RELAY_SEEN_N; late > 0 is the argument for raising it (both repos).
-            Serial.printf("[tx] stale-edge %lu  lost-edge %lu  deferred-for-rx %lu\n",
+            Serial.printf("[tx] mute=%d sweep=%d sent=%lu muted-drops=%lu  stale-edge %lu  lost-edge %lu  deferred-for-rx %lu\n",
+                          (int)g_tx_mute, (int)g_sweep_active, (unsigned long)g_tx_sent, (unsigned long)g_tx_muted,
                           (unsigned long)g_tx_stale, (unsigned long)g_tx_lost, (unsigned long)g_tx_deferred);
             Serial.printf("[dedup] n=%d held=%u hits=%lu miss=%lu late=%lu "
                           "widest_hit=%.1fs horizon=%.0fs\n",
