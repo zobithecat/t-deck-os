@@ -6188,6 +6188,24 @@ static String range_passive_text()
                  (unsigned long)r.drop, (unsigned long)((now - r.last_ms) / 1000));
         t += ln;
     }
+    // Endpoints: a node that only sends HB (no !RB, no !RS) was in Discovery but not
+    // here, so a plain node looked absent from the app that is meant to test its link.
+    // List every Discovery neighbour heard in the last 10 min that the two loops above
+    // did not already show; a relay row counts only while its own beacon is fresh.
+    for (int i = 0; i < g_neigh_n; i++) {
+        Neighbor &n = g_neigh[i];
+        uint32_t age = (now - n.last_ms) / 1000;
+        if (age > 600 || !strcmp(n.rid, NODE_ID)) continue;
+        bool shown = false;
+        for (int k = 0; k < g_routers_n; k++) if (!strcmp(g_routers[k].id, n.rid)) shown = true;
+        for (int k = 0; k < g_relays_n; k++)
+            if (!strcmp(g_relays[k].id, n.rid) && (now - g_relays[k].last_ms) < 660000) shown = true;
+        if (shown) continue;
+        char ln[72];
+        snprintf(ln, sizeof(ln), " %s%s%s %ddBm %s %lus\n", n.rid, n.name[0] ? " " : "", n.name,
+                 (int)n.rssi, n.hops == 0 ? "direct" : (n.hops == 1 ? "1hop" : "2hop"), (unsigned long)age);
+        t += ln;
+    }
     if (g_cs.ms && (now - g_cs.ms) < 600000) {
         char ln[64];
         snprintf(ln, sizeof(ln), LV_SYMBOL_GPS "%s CS %.2fm/%.2fm rtt %.1f  %lus\n", g_cs.src,
