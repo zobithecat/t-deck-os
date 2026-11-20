@@ -5518,6 +5518,10 @@ static int lora_init()
     if (st == RADIOLIB_ERR_NONE) {
         lora_radio.setCRC(RF_CRC_ON);                // TX CRC per lora_rf.h; RX follows the header
         lora_radio.setDio2AsRfSwitch(true);          // T-Deck SX1262: DIO2 = TX/RX switch
+        // RadioLib's begin() leaves the PA over-current limit at 60 mA, which clamps the output
+        // near +13 dBm whatever RF_TX_DBM says (measured conducted, 2026-11-20: settings 14, 17
+        // and 22 all gave the same level). 140 mA is the SX1262's own default and what +22 dBm needs.
+        lora_radio.setCurrentLimit(140.0);
         lora_radio.setDio1Action(lora_set_rx_flag);
         lora_radio.startReceive();
         g_lora_ok = true;
